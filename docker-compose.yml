@@ -1,0 +1,47 @@
+version: "3.8"
+
+services:
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: sdlc_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.18
+    container_name: sdlc_neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/password1234
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    container_name: sdlc_postgres
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=sdlc
+      - POSTGRES_PASSWORD=sdlc1234
+      - POSTGRES_DB=sdlc_knowledge
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  neo4j_data:
+  neo4j_logs:
+  postgres_data:

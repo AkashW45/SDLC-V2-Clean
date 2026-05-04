@@ -1,0 +1,35 @@
+# Core
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+
+# LangGraph — agent orchestration
+langgraph
+langchain
+langchain-groq
+
+# AI / LLM
+groq
+
+# HTTP
+requests
+httpx
+
+# Knowledge Layer
+qdrant-client
+neo4j
+psycopg2-binary
+sentence-transformers
+gitpython
+
+# AST parsing
+tree-sitter
+
+# Testing
+pytest
+pytest-cov
+
+# Utils
+jinja2
+pyyaml
