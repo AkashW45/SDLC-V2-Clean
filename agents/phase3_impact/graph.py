@@ -3,15 +3,25 @@ Phase 3 — Impact Analysis LangGraph Agent
 Uses INTERRUPT for human approval before code generation begins.
 """
 
-
 import json
-from typing import TypedDict, Annotated
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-from agents.phase3_impact.impact_analyzer import run_impact_analysis
 import sys
 import os
+from typing import TypedDict
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
+from agents.phase3_impact.impact_analyzer import run_impact_analysis
+
+# -----------------------------------------
+# SHARED memory — must be module-level
+# so start and resume use the SAME instance
+# -----------------------------------------
+_memory = MemorySaver()
+_graph = None  # built once, reused
+
 
 # -----------------------------------------
 # State Definition
@@ -30,11 +40,8 @@ class ImpactState(TypedDict):
 # -----------------------------------------
 
 def analyze_impact(state: ImpactState) -> ImpactState:
-    """Run full impact analysis and store report in state."""
     print("[Node] analyze_impact — running...")
-
     report = run_impact_analysis(state["requirement"])
-
     return {
         **state,
         "impact_report": report,
@@ -43,30 +50,29 @@ def analyze_impact(state: ImpactState) -> ImpactState:
 
 
 def human_approval_gate(state: ImpactState) -> ImpactState:
-    """
-    LangGraph INTERRUPT node.
-    Pipeline pauses here — human reviews impact report and approves/rejects.
-    Human response is injected via graph.update_state() when they respond.
-    """
     print("[Node] human_approval_gate — INTERRUPTED, waiting for human...")
 
-    # This node just marks the state as waiting
-    # LangGraph INTERRUPT will pause execution here
+    human_input = interrupt("Waiting for human approval of impact report")
+
+    approved = False
+    feedback = ""
+
+    if isinstance(human_input, dict):
+        approved = human_input.get("approved") or human_input.get("human_approved") or False
+        feedback = human_input.get("feedback", "")
+
     return {
         **state,
-        "status": "AWAITING_HUMAN_APPROVAL"
+        "human_approved": approved,
+        "human_feedback": feedback,
+        "status": "WAITING_FOR_APPROVAL"
     }
 
 
 def process_approval(state: ImpactState) -> ImpactState:
-    """Process human decision after INTERRUPT resumes."""
     print(f"[Node] process_approval — human_approved={state.get('human_approved')}")
-
     if state.get("human_approved"):
-        return {
-            **state,
-            "status": "APPROVED_FOR_CODE_GENERATION"
-        }
+        return {**state, "status": "APPROVED_FOR_CODE_GENERATION"}
     else:
         return {
             **state,
@@ -79,63 +85,49 @@ def process_approval(state: ImpactState) -> ImpactState:
 
 
 def route_after_approval(state: ImpactState) -> str:
-    """Route based on human decision."""
-    if state.get("human_approved"):
-        return "approved"
-    return "rejected"
+    return "approved" if state.get("human_approved") else "rejected"
 
 
 # -----------------------------------------
-# Build Graph
+# Build Graph ONCE
 # -----------------------------------------
 
-def build_phase3_graph():
-    from langgraph.types import interrupt
+def get_graph():
+    """Returns singleton graph with shared memory."""
+    global _graph
+    if _graph is not None:
+        return _graph
 
     builder = StateGraph(ImpactState)
 
-    # Add nodes
     builder.add_node("analyze_impact", analyze_impact)
     builder.add_node("human_approval_gate", human_approval_gate)
     builder.add_node("process_approval", process_approval)
 
-    # Add edges
     builder.set_entry_point("analyze_impact")
     builder.add_edge("analyze_impact", "human_approval_gate")
-
-    # INTERRUPT at human_approval_gate
     builder.add_edge("human_approval_gate", "process_approval")
 
     builder.add_conditional_edges(
         "process_approval",
         route_after_approval,
-        {
-            "approved": END,
-            "rejected": END
-        }
+        {"approved": END, "rejected": END}
     )
 
-    # Compile with memory checkpointer for INTERRUPT support
-    memory = MemorySaver()
-    graph = builder.compile(
-        checkpointer=memory,
+    _graph = builder.compile(
+        checkpointer=_memory,
         interrupt_before=["human_approval_gate"]
     )
 
-    return graph
+    return _graph
 
 
 # -----------------------------------------
-# FastAPI Endpoint Helpers
+# FastAPI / CLI Helpers
 # -----------------------------------------
 
 def start_impact_analysis(requirement: str, thread_id: str) -> dict:
-    """
-    Start Phase 3 analysis.
-    Returns impact report and pauses at human approval gate.
-    """
-    graph = build_phase3_graph()
-
+    graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
 
     initial_state = {
@@ -146,7 +138,6 @@ def start_impact_analysis(requirement: str, thread_id: str) -> dict:
         "status": "STARTED"
     }
 
-    # Run until INTERRUPT
     result = graph.invoke(initial_state, config)
 
     return {
@@ -158,21 +149,13 @@ def start_impact_analysis(requirement: str, thread_id: str) -> dict:
 
 
 def resume_with_approval(thread_id: str, approved: bool, feedback: str = "") -> dict:
-    """
-    Resume Phase 3 after human approves or rejects.
-    Called from dashboard when human clicks Approve/Reject.
-    """
-    graph = build_phase3_graph()
-
+    graph = get_graph()  # same graph, same _memory
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Inject human decision into state
+    # Inject human decision into existing checkpoint
     graph.update_state(
         config,
-        {
-            "human_approved": approved,
-            "human_feedback": feedback
-        }
+        {"human_approved": approved, "human_feedback": feedback}
     )
 
     # Resume from INTERRUPT
@@ -185,9 +168,19 @@ def resume_with_approval(thread_id: str, approved: bool, feedback: str = "") -> 
         "message": "Approved — ready for code generation" if approved else "Rejected — pipeline stopped"
     }
 
+def resume_impact_analysis(graph, config, approved: bool, feedback: str = ""):
+    print(f"\n--- Resuming Phase 3 (approved={approved}) ---")
+
+    result = graph.invoke(
+        Command(resume={"approved": approved, "feedback": feedback}),
+        config
+    )
+
+    print(f"Final status: {result['status']}")
+    return result
 
 # -----------------------------------------
-# Test
+# CLI Test
 # -----------------------------------------
 
 if __name__ == "__main__":
@@ -204,3 +197,4 @@ if __name__ == "__main__":
     print("\n--- Simulating Human Approval ---")
     final = resume_with_approval(thread_id, approved=True, feedback="Looks good")
     print(f"Final status: {final['status']}")
+    print(f"Message: {final['message']}")
