@@ -198,6 +198,38 @@ def run_pipeline(requirement: str):
     result6 = resume_delivery(graph6, config6, approved=True)
     print(f"[Pipeline] Phase 6 complete — {result6['status']}")
 
+    
+    # ─────────────────────────────────────────
+    # PHASE 7 — Deployment
+    # ─────────────────────────────────────────
+    print("\n" + "─"*60)
+    print("PHASE 7 — DEPLOYMENT")
+    print("─"*60)
+
+    from agents.phase7_deployment.deployment_agent import run_deployment, resume_deployment
+
+    graph7, config7, result7 = run_deployment(
+        requirement=requirement,
+        runbook=result2['runbook'],
+        pr_urls=result6.get('pr_urls', []),
+        affected_repos=result3['impact_report'].get('affected_repos', []),
+        thread_id="pipeline-phase7"
+    )
+
+    print(f"\n[Pipeline] Phase 7 paused — status: {result7['status']}")
+    print(f"  Deploy sequence: {[s['repo'] for s in result7['deploy_sequence']]}")
+    print(f"  Feature flags: {[f['flag_name'] for f in result7['feature_flags']]}")
+
+    print("\n[Pipeline] ⏸ Awaiting production deployment approval...")
+    input("[Pipeline] Press Enter to approve Phase 7 deployment...")
+
+    result7 = resume_deployment(graph7, config7, approved=True, feedback="Approved for production")
+    print(f"[Pipeline] Phase 7 complete — {result7['status']}")
+
+    if result7['status'] not in ("DEPLOYMENT_COMPLETE", "ROLLED_BACK"):
+        print("[Pipeline] ❌ Phase 7 failed — pipeline stopped")
+        return
+
     # ─────────────────────────────────────────
     # SUMMARY
     # ─────────────────────────────────────────
@@ -212,6 +244,10 @@ def run_pipeline(requirement: str):
     print(f"PRs created: {result6.get('pr_urls', [])}")
     print(f"Final status: {result6['status']}")
     print("\nReady for Phase 7 — Deployment")
+    print(f"Deployed repos: {[r['repo'] for r in result7['deploy_results']]}")
+    print(f"Feature flags: {[f['flag_name'] for f in result7['feature_flags'] if f['enabled']]}")
+    print(f"Monitoring status: {result7['monitoring_results'].get('metrics', {}).get('health_check')}")
+    print(f"Rollback triggered: {result7['rollback_triggered']}")
 
     return {
         "brd": result1['brd'],
