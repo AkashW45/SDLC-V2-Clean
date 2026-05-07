@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SDLC V2 — Control Tower</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #090c10;
+  --surface: #0d1117;
+  --surface2: #161b22;
+  --surface3: #1c2330;
+  --border: #21262d;
+  --accent: #00ff88;
+  --blue: #0099ff;
+  --danger: #ff4757;
+  --warn: #f0a500;
+  --text: #e6edf3;
+  --text2: #8b949e;
+  --text3: #484f58;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'JetBrains Mono',monospace; min-height:100vh; }
+
+/* Header */
+.header { background:var(--surface); border-bottom:1px solid var(--border); padding:14px 28px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:100; }
+.logo { font-family:'Syne',sans-serif; font-size:18px; font-weight:800; }
+.logo span { color:var(--accent); }
+.status-dot { width:8px; height:8px; border-radius:50%; background:var(--accent); animation:blink 2s infinite; display:inline-block; margin-right:6px; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+/* Launch */
+.launch { background:var(--surface); border-bottom:1px solid var(--border); padding:20px 28px; }
+.launch-row { display:flex; gap:12px; }
+.req-input { flex:1; background:var(--surface3); border:1px solid var(--border); border-radius:6px; padding:12px; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:12px; resize:none; height:60px; }
+.req-input:focus { outline:none; border-color:var(--accent); }
+.launch-btn { background:var(--accent); color:#090c10; border:none; padding:0 24px; border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:700; cursor:pointer; height:60px; white-space:nowrap; }
+.launch-btn:hover { background:#00cc6e; }
+.launch-btn:disabled { opacity:0.4; cursor:not-allowed; }
+
+/* Pipeline bar */
+.pipeline-bar { background:var(--surface); border-bottom:1px solid var(--border); padding:12px 28px; display:flex; gap:6px; overflow-x:auto; }
+.phase-chip { display:flex; align-items:center; gap:6px; padding:5px 12px; border-radius:20px; font-size:10px; border:1px solid var(--border); white-space:nowrap; cursor:pointer; transition:all 0.15s; }
+.phase-chip.active { border-color:var(--accent); background:rgba(0,255,136,0.08); color:var(--accent); }
+.phase-chip.done { border-color:var(--accent); background:rgba(0,255,136,0.05); }
+.phase-chip.waiting { border-color:var(--warn); background:rgba(240,165,0,0.08); color:var(--warn); }
+.phase-chip.error { border-color:var(--danger); color:var(--danger); }
+.phase-dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+
+/* Main layout */
+.main { display:grid; grid-template-columns:280px 1fr; min-height:calc(100vh - 180px); }
+
+/* Sidebar */
+.sidebar { background:var(--surface); border-right:1px solid var(--border); padding:20px; overflow-y:auto; }
+.sidebar-label { font-size:9px; letter-spacing:2px; text-transform:uppercase; color:var(--text3); margin-bottom:10px; }
+.pipeline-item { padding:10px 12px; border-radius:6px; margin-bottom:4px; cursor:pointer; border:1px solid transparent; transition:all 0.12s; }
+.pipeline-item:hover { background:var(--surface2); }
+.pipeline-item.active { background:rgba(0,255,136,0.05); border-color:rgba(0,255,136,0.2); }
+.pipeline-item-id { font-size:10px; color:var(--accent); margin-bottom:3px; }
+.pipeline-item-req { font-size:10px; color:var(--text2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pipeline-item-status { font-size:9px; color:var(--text3); margin-top:3px; }
+.no-pipelines { font-size:11px; color:var(--text3); text-align:center; padding:20px; }
+
+/* Content */
+.content { padding:28px; overflow-y:auto; }
+.empty-state { text-align:center; padding:80px 40px; color:var(--text3); }
+.empty-icon { font-size:48px; margin-bottom:16px; opacity:0.3; }
+.empty-title { font-family:'Syne',sans-serif; font-size:20px; color:var(--text2); margin-bottom:8px; }
+
+/* Phase card */
+.phase-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:20px; margin-bottom:16px; }
+.phase-card.waiting { border-color:rgba(240,165,0,0.3); background:rgba(240,165,0,0.03); }
+.phase-card.done { border-color:rgba(0,255,136,0.2); }
+.phase-card.error { border-color:rgba(255,71,87,0.3); }
+.phase-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+.phase-title { font-family:'Syne',sans-serif; font-size:15px; font-weight:700; }
+.phase-badge { font-size:9px; padding:3px 8px; border-radius:3px; font-weight:700; text-transform:uppercase; }
+.badge-waiting { background:rgba(240,165,0,0.15); color:var(--warn); }
+.badge-done { background:rgba(0,255,136,0.12); color:var(--accent); }
+.badge-running { background:rgba(0,153,255,0.12); color:var(--blue); animation:blink 1s infinite; }
+.badge-error { background:rgba(255,71,87,0.12); color:var(--danger); }
+
+/* Data display */
+.data-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:12px; }
+.data-item { background:var(--surface2); border-radius:5px; padding:10px 12px; }
+.data-label { font-size:8px; color:var(--text3); letter-spacing:1.5px; text-transform:uppercase; margin-bottom:4px; }
+.data-value { font-size:12px; color:var(--text); }
+.data-value.accent { color:var(--accent); font-size:22px; font-family:'Syne',sans-serif; font-weight:800; }
+.data-value.warn { color:var(--warn); }
+.data-value.danger { color:var(--danger); }
+
+/* Jira tickets */
+.ticket-list { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.ticket-chip { background:var(--surface3); border:1px solid var(--border); border-radius:4px; padding:3px 8px; font-size:10px; color:var(--blue); }
+
+/* Approval zone */
+.approval-zone { margin-top:16px; padding-top:16px; border-top:1px solid var(--border); }
+.approval-label { font-size:9px; color:var(--text3); letter-spacing:1.5px; text-transform:uppercase; margin-bottom:10px; }
+.feedback-input { width:100%; background:var(--surface2); border:1px solid var(--border); border-radius:5px; padding:8px 12px; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:11px; margin-bottom:10px; }
+.feedback-input:focus { outline:none; border-color:var(--blue); }
+.approval-btns { display:flex; gap:10px; }
+.btn-approve { background:var(--accent); color:#090c10; border:none; padding:10px 24px; border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:700; cursor:pointer; }
+.btn-approve:hover { background:#00cc6e; }
+.btn-approve:disabled { opacity:0.4; cursor:not-allowed; }
+.btn-reject { background:transparent; color:var(--danger); border:1px solid var(--danger); padding:10px 24px; border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:12px; cursor:pointer; }
+.btn-reject:hover { background:rgba(255,71,87,0.08); }
+
+/* PR links */
+.pr-link { display:inline-flex; align-items:center; gap:6px; background:var(--surface2); border:1px solid var(--border); border-radius:5px; padding:8px 12px; color:var(--blue); font-size:11px; text-decoration:none; margin-top:8px; }
+.pr-link:hover { border-color:var(--blue); }
+
+/* Toast */
+.toast { position:fixed; bottom:24px; right:24px; background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:10px 16px; font-size:11px; z-index:9999; display:none; max-width:300px; }
+.toast.success { border-color:var(--accent); color:var(--accent); }
+.toast.error { border-color:var(--danger); color:var(--danger); }
+.toast.info { border-color:var(--blue); color:var(--blue); }
+
+/* Spinner */
+.spinner { width:16px; height:16px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; display:inline-block; }
+@keyframes spin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">SDLC <span>V2</span> Control Tower</div>
+  <div style="display:flex;align-items:center;gap:16px">
+    <span style="font-size:10px;color:var(--text2)">
+      <span class="status-dot"></span>API: <span id="api-status">checking...</span>
+    </span>
+    <span style="font-size:10px;color:var(--text2)" id="poll-time"></span>
+  </div>
+</div>
+
+<div class="launch">
+  <div class="launch-row">
+    <textarea class="req-input" id="req-input" placeholder="Enter business requirement here..."></textarea>
+    <button class="launch-btn" id="launch-btn" onclick="launchPipeline()">▶ Launch Pipeline</button>
+  </div>
+</div>
+
+<div class="pipeline-bar" id="pipeline-bar">
+  <div style="font-size:10px;color:var(--text3);padding:5px">No active pipelines</div>
+</div>
+
+<div class="main">
+  <aside class="sidebar">
+    <div class="sidebar-label">Active Pipelines</div>
+    <div id="pipeline-list"></div>
+  </aside>
+  <main class="content" id="content"></main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = 'http://localhost:8001';
+let activePipelines = {};  // thread_id -> pipeline data
+let selectedThread = null;
+let pollInterval = null;
+
+const PHASES = [
+  { key: 'WAITING_PHASE_1_APPROVAL', label: 'Phase 1 — Discovery', num: 1 },
+  { key: 'WAITING_PHASE_2_APPROVAL', label: 'Phase 2 — Planning', num: 2 },
+  { key: 'WAITING_PHASE_3_APPROVAL', label: 'Phase 3 — Impact', num: 3 },
+  { key: 'WAITING_PHASE_6_APPROVAL', label: 'Phase 6 — Delivery', num: 6 },
+  { key: 'WAITING_PHASE_7_APPROVAL', label: 'Phase 7 — Deploy', num: 7 },
+];
+
+// ── API calls ──────────────────────────────────────────────────────────────
+
+async function checkHealth() {
+  try {
+    const r = await fetch(`${API}/health`);
+    const d = await r.json();
+    document.getElementById('api-status').textContent = d.status === 'ok' ? 'connected' : 'degraded';
+    document.getElementById('api-status').style.color = d.status === 'ok' ? 'var(--accent)' : 'var(--warn)';
+  } catch {
+    document.getElementById('api-status').textContent = 'offline';
+    document.getElementById('api-status').style.color = 'var(--danger)';
+  }
+}
+
+async function launchPipeline() {
+  const req = document.getElementById('req-input').value.trim();
+  if (!req) { showToast('Enter a requirement first', 'error'); return; }
+
+  const btn = document.getElementById('launch-btn');
+  btn.disabled = true;
+  btn.textContent = '...';
+
+  try {
+    const r = await fetch(`${API}/pipeline/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requirement: req })
+    });
+    const d = await r.json();
+
+    if (d.thread_id) {
+      activePipelines[d.thread_id] = {
+        thread_id: d.thread_id,
+        requirement: req,
+        status: 'STARTING',
+        phase: 1,
+        current_state: {},
+        pr_urls: []
+      };
+      selectedThread = d.thread_id;
+      showToast(`Pipeline started: ${d.thread_id}`, 'success');
+      renderSidebar();
+      renderContent();
+    } else {
+      showToast('Failed to start pipeline', 'error');
+    }
+  } catch(e) {
+    showToast('Cannot reach API: ' + e.message, 'error');
+  }
+
+  btn.disabled = false;
+  btn.textContent = '▶ Launch Pipeline';
+}
+
+async function pollAll() {
+  for (const tid of Object.keys(activePipelines)) {
+    try {
+      const r = await fetch(`${API}/pipeline/status/${tid}`);
+      if (r.ok) {
+        const d = await r.json();
+        activePipelines[tid] = { ...activePipelines[tid], ...d };
+      }
+    } catch {}
+  }
+  document.getElementById('poll-time').textContent =
+    'Last poll: ' + new Date().toLocaleTimeString();
+  renderSidebar();
+  renderPipelineBar();
+  if (selectedThread) renderContent();
+}
+
+async function approvePipeline(threadId, approved) {
+  const feedback = document.getElementById('feedback-' + threadId)?.value || '';
+
+  try {
+    const r = await fetch(`${API}/pipeline/approve/${threadId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ approved, feedback })
+    });
+    const d = await r.json();
+    showToast(approved ? '✓ Approved — pipeline continuing' : '✗ Rejected', approved ? 'success' : 'error');
+    setTimeout(pollAll, 1000);
+  } catch(e) {
+    showToast('Approval failed: ' + e.message, 'error');
+  }
+}
+
+// ── Render ─────────────────────────────────────────────────────────────────
+
+function renderSidebar() {
+  const el = document.getElementById('pipeline-list');
+  const threads = Object.keys(activePipelines);
+
+  if (!threads.length) {
+    el.innerHTML = '<div class="no-pipelines">No pipelines yet.<br>Launch one above.</div>';
+    return;
+  }
+
+  el.innerHTML = threads.map(tid => {
+    const p = activePipelines[tid];
+    const isSelected = tid === selectedThread;
+    const statusColor = p.status?.includes('WAITING') ? 'var(--warn)' :
+                        p.status === 'PIPELINE_COMPLETE' ? 'var(--accent)' :
+                        p.status === 'ERROR' ? 'var(--danger)' : 'var(--blue)';
+    return `
+      <div class="pipeline-item ${isSelected ? 'active' : ''}" onclick="selectThread('${tid}')">
+        <div class="pipeline-item-id">${tid}</div>
+        <div class="pipeline-item-req">${p.requirement?.substring(0, 45)}...</div>
+        <div class="pipeline-item-status" style="color:${statusColor}">${p.status || 'starting'}</div>
+      </div>`;
+  }).join('');
+}
+
+function renderPipelineBar() {
+  if (!selectedThread) return;
+  const p = activePipelines[selectedThread];
+  if (!p) return;
+
+  const phases = [
+    { label: '01 Discovery', waitKey: 'WAITING_PHASE_1_APPROVAL', runKey: 'PHASE_1_RUNNING' },
+    { label: '02 Planning', waitKey: 'WAITING_PHASE_2_APPROVAL', runKey: 'PHASE_2_RUNNING' },
+    { label: '03 Impact', waitKey: 'WAITING_PHASE_3_APPROVAL', runKey: 'PHASE_3_RUNNING' },
+    { label: '04 Codegen', runKey: 'PHASE_4_RUNNING' },
+    { label: '05 Validate', runKey: 'PHASE_5_RUNNING' },
+    { label: '06 Delivery', waitKey: 'WAITING_PHASE_6_APPROVAL', runKey: 'PHASE_6_RUNNING' },
+    { label: '07 Deploy', waitKey: 'WAITING_PHASE_7_APPROVAL', runKey: 'PHASE_7_RUNNING' },
+  ];
+
+  const status = p.status || '';
+  const phaseNum = p.phase || 1;
+
+  document.getElementById('pipeline-bar').innerHTML = phases.map((ph, i) => {
+    const num = i + 1;
+    let cls = '';
+    let dot = '○';
+
+    if (status === ph.runKey) { cls = 'active'; dot = '●'; }
+    else if (status === ph.waitKey) { cls = 'waiting'; dot = '⏸'; }
+    else if (num < phaseNum || status === 'PIPELINE_COMPLETE') { cls = 'done'; dot = '✓'; }
+    else if (status === 'ERROR') { cls = 'error'; dot = '✗'; }
+
+    return `<div class="phase-chip ${cls}"><span class="phase-dot"></span>${ph.label}</div>`;
+  }).join('');
+}
+
+function renderContent() {
+  const el = document.getElementById('content');
+
+  if (!selectedThread) {
+    el.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">🚀</div>
+        <div class="empty-title">Launch a Pipeline</div>
+        <div style="font-size:11px;color:var(--text3)">Enter a requirement above and click Launch</div>
+      </div>`;
+    return;
+  }
+
+  const p = activePipelines[selectedThread];
+  if (!p) return;
+
+  const status = p.status || '';
+  const state = p.current_state || {};
+  const isWaiting = status.includes('WAITING');
+  const isRunning = status.includes('RUNNING');
+  const isComplete = status === 'PIPELINE_COMPLETE';
+  const isError = status === 'ERROR';
+
+  let html = `
+    <div style="margin-bottom:20px">
+      <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:800">Pipeline Status</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:4px">${selectedThread}</div>
+    </div>`;
+
+  // Status banner
+  const bannerColor = isWaiting ? 'var(--warn)' : isComplete ? 'var(--accent)' :
+                      isError ? 'var(--danger)' : 'var(--blue)';
+  const bannerIcon = isWaiting ? '⏸' : isComplete ? '✅' : isError ? '❌' : '⚙';
+
+  html += `
+    <div style="background:var(--surface);border:1px solid ${bannerColor}33;border-radius:8px;padding:16px;margin-bottom:20px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:20px">${bannerIcon}</span>
+        <div>
+          <div style="font-size:13px;font-weight:700;color:${bannerColor}">${status}</div>
+          <div style="font-size:10px;color:var(--text2);margin-top:2px">${p.requirement?.substring(0,80)}</div>
+        </div>
+      </div>
+    </div>`;
+
+  // ── PHASE 1 ──────────────────────────────────────────────────────────────
+  if (state.brd?.title || state.prd || state.adr) {
+    const needsApproval = status === 'WAITING_PHASE_1_APPROVAL';
+    html += sectionHeader('01', 'Discovery — BRD / PRD / ADR', needsApproval);
+
+    if (state.brd?.title) {
+      html += dataRow('BRD Title', state.brd.title);
+      if (state.brd.business_objectives?.length) {
+        html += dataRow('Business Objectives',
+          state.brd.business_objectives.map(o => `• ${o}`).join('<br>'));
+      }
+      if (state.brd.risks?.length) {
+        html += dataRow('Risks', state.brd.risks.map(r => `• ${r}`).join('<br>'), 'warn');
+      }
+    }
+
+    if (state.prd?.functional_requirements?.length) {
+      html += subHeader('PRD — Functional Requirements');
+      state.prd.functional_requirements.forEach(r => {
+        html += reqCard(r.id, r.title, r.description, r.priority,
+                        r.acceptance_criteria || []);
+      });
+    }
+
+    if (state.adr?.decisions?.length) {
+      html += subHeader('Architecture Decision Records');
+      state.adr.decisions.forEach(d => {
+        html += adrCard(d.id, d.title, d.decision, d.consequences || []);
+      });
+    }
+
+    if (needsApproval) html += approvalZone(selectedThread);
+    html += sectionClose();
+  }
+
+  // ── PHASE 2 ──────────────────────────────────────────────────────────────
+  if (state.sprint_plan || state.runbook) {
+    const needsApproval = status === 'WAITING_PHASE_2_APPROVAL';
+    const epics = state.sprint_plan?.epics || [];
+    const tickets = state.jira_tickets || [];
+    html += sectionHeader('02', 'Planning — Sprint Plan + Runbook', needsApproval);
+
+    if (tickets.length) {
+      html += subHeader('Jira Tickets Created');
+      html += `<div class="ticket-list">${tickets.map(t =>
+        `<span class="ticket-chip">${t}</span>`).join('')}</div><br>`;
+    }
+
+    if (epics.length) {
+      html += subHeader('Sprint Plan — Epics & Stories');
+      epics.forEach(epic => {
+        html += epicCard(epic);
+      });
+    }
+
+    if (state.runbook?.deployment_sequence?.length) {
+      html += subHeader('Deployment Runbook');
+      state.runbook.deployment_sequence.forEach(step => {
+        html += runbookStep(step);
+      });
+      if (state.runbook.rollback_steps?.length) {
+        html += dataRow('Rollback Steps',
+          state.runbook.rollback_steps.map(s => `• ${s}`).join('<br>'), 'warn');
+      }
+    }
+
+    if (needsApproval) html += approvalZone(selectedThread);
+    html += sectionClose();
+  }
+
+  // ── PHASE 3 ──────────────────────────────────────────────────────────────
+  if (state.impact_report?.affected_files) {
+    const needsApproval = status === 'WAITING_PHASE_3_APPROVAL';
+    const risk = state.impact_report.risk_assessment?.risk_level || '';
+    const riskColor = risk === 'high' ? 'var(--danger)' :
+                      risk === 'medium' ? 'var(--warn)' : 'var(--accent)';
+
+    html += sectionHeader('03', 'Impact Analysis', needsApproval);
+    html += dataRow('Risk Level',
+      `<span style="color:${riskColor};font-weight:700;font-size:14px">${risk.toUpperCase()}</span>`);
+    html += dataRow('Recommendation',
+      state.impact_report.risk_assessment?.recommendation || '');
+
+    if (state.impact_report.risk_assessment?.risk_reasons?.length) {
+      html += dataRow('Risk Reasons',
+        state.impact_report.risk_assessment.risk_reasons.map(r => `• ${r}`).join('<br>'),
+        'warn');
+    }
+
+    if (state.impact_report.risk_assessment?.breaking_changes?.length) {
+      html += dataRow('Breaking Changes',
+        state.impact_report.risk_assessment.breaking_changes.map(r =>
+          `• ${r}`).join('<br>'), 'danger');
+    }
+
+    if (state.impact_report.affected_files?.length) {
+      html += subHeader('Affected Files');
+      state.impact_report.affected_files.forEach(f => {
+        html += `
+          <div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
+            <div style="font-size:11px;color:var(--blue);margin-bottom:4px">${f.file_path}</div>
+            <div style="font-size:9px;color:var(--text3)">Repo: ${f.repo_name} | Score: ${f.relevance_score}</div>
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">
+              ${(f.matched_symbols||[]).map(s =>
+                `<span style="font-size:9px;padding:2px 6px;background:var(--surface3);border-radius:3px;color:var(--text2)">${s.name} (${s.type})</span>`
+              ).join('')}
+            </div>
+          </div>`;
+      });
+    }
+
+    if (needsApproval) html += approvalZone(selectedThread);
+    html += sectionClose();
+  }
+
+  // ── PHASE 4+5 ────────────────────────────────────────────────────────────
+  if (state.generated_changes?.length) {
+    html += sectionHeader('04+05', 'Code Generation + Validation', false);
+
+    state.generated_changes.forEach(change => {
+      html += `
+        <div style="background:var(--surface2);border-radius:6px;padding:14px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div style="font-size:11px;color:var(--blue);font-weight:700">${change.file_path}</div>
+            <div style="font-size:9px;color:var(--accent)">✓ validated</div>
+          </div>
+          <div style="font-size:10px;color:var(--text2);margin-bottom:8px">${change.change_summary || ''}</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            ${(change.new_symbols_added||[]).map(s =>
+              `<span style="font-size:9px;padding:2px 6px;background:rgba(0,255,136,0.1);border-radius:3px;color:var(--accent)">+ ${s}</span>`
+            ).join('')}
+            ${(change.existing_symbols_modified||[]).map(s =>
+              `<span style="font-size:9px;padding:2px 6px;background:rgba(0,153,255,0.1);border-radius:3px;color:var(--blue)">~ ${s}</span>`
+            ).join('')}
+          </div>
+          <details style="margin-top:10px">
+            <summary style="font-size:9px;color:var(--text3);cursor:pointer">View generated code</summary>
+            <pre style="font-size:9px;background:var(--surface3);padding:10px;border-radius:4px;margin-top:6px;overflow-x:auto;white-space:pre-wrap;color:var(--text2);max-height:300px;overflow-y:auto">${esc(change.content||'')}</pre>
+          </details>
+        </div>`;
+    });
+
+    if (state.test_files?.length) {
+      html += subHeader('Generated Tests');
+      state.test_files.forEach(tf => {
+        html += `
+          <div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
+            <div style="font-size:10px;color:var(--blue);margin-bottom:4px">${tf.test_file_path}</div>
+            <div style="font-size:9px;color:var(--text2)">${tf.test_count || 0} tests — covers: ${(tf.tests_cover||[]).join(', ')}</div>
+          </div>`;
+      });
+    }
+
+    html += sectionClose();
+  }
+
+  // ── PHASE 6 ──────────────────────────────────────────────────────────────
+  if (p.pr_urls?.length || state.pr_urls?.length) {
+    const needsApproval = status === 'WAITING_PHASE_6_APPROVAL';
+    const urls = p.pr_urls?.length ? p.pr_urls : state.pr_urls;
+    html += sectionHeader('06', 'Delivery — GitHub PR', needsApproval);
+    urls.forEach(url => {
+      html += `<a class="pr-link" href="${url}" target="_blank">🔗 View PR on GitHub — ${url}</a><br>`;
+    });
+    html += dataRow('Status', 'PR created and ready for review');
+    if (needsApproval) html += approvalZone(selectedThread);
+    html += sectionClose();
+  }
+
+  // ── PHASE 7 ──────────────────────────────────────────────────────────────
+  if (status.includes('PHASE_7') || status === 'DEPLOYMENT_COMPLETE' ||
+      status === 'WAITING_PHASE_7_APPROVAL') {
+    const needsApproval = status === 'WAITING_PHASE_7_APPROVAL';
+    html += sectionHeader('07', 'Deployment', needsApproval);
+
+    if (state.deploy_sequence?.length) {
+      html += subHeader('Deploy Sequence');
+      state.deploy_sequence.forEach(s => {
+        html += `
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface2);border-radius:5px;margin-bottom:4px">
+            <span style="color:var(--accent);font-size:11px;font-weight:700">${s.step}</span>
+            <span style="font-size:11px">${s.repo}</span>
+            <span style="font-size:9px;color:var(--text3);margin-left:auto">${s.type}</span>
+          </div>`;
+      });
+    }
+
+    if (state.feature_flags?.length) {
+      html += subHeader('Feature Flags');
+      state.feature_flags.forEach(f => {
+        const enabled = f.enabled;
+        html += `
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface2);border-radius:5px;margin-bottom:4px">
+            <span style="font-size:11px;color:var(--blue)">${f.flag_name}</span>
+            <span style="margin-left:auto;font-size:9px;padding:2px 6px;border-radius:3px;background:${enabled ? 'rgba(0,255,136,0.1)' : 'rgba(72,79,88,0.3)'};color:${enabled ? 'var(--accent)' : 'var(--text3)'}">${enabled ? 'ENABLED' : 'DISABLED'}</span>
+          </div>`;
+      });
+    }
+
+    if (state.monitoring_results?.metrics) {
+      html += subHeader('Post-Deploy Metrics');
+      const m = state.monitoring_results.metrics;
+      html += dataRow('Error Rate', `${m.error_rate * 100}%`,
+                      m.error_rate > 0.05 ? 'danger' : '');
+      html += dataRow('Avg Latency', `${m.avg_latency_ms}ms`);
+      html += dataRow('Health Check', m.health_check);
+    }
+
+    if (needsApproval) html += approvalZone(selectedThread);
+    html += sectionClose();
+  }
+
+  // Running indicator
+  if (isRunning) {
+    html += `
+      <div style="display:flex;align-items:center;gap:10px;padding:20px;color:var(--text2);font-size:12px">
+        <div class="spinner"></div>
+        <span>${status.replace(/_/g,' ')}...</span>
+      </div>`;
+  }
+
+  // Error
+  if (isError && p.error) {
+    html += `
+      <div style="background:rgba(255,71,87,0.07);border:1px solid rgba(255,71,87,0.3);border-radius:8px;padding:16px;margin-top:16px">
+        <div style="color:var(--danger);font-size:12px;font-weight:700;margin-bottom:8px">❌ Error</div>
+        <div style="font-size:11px;color:var(--text2)">${p.error}</div>
+      </div>`;
+  }
+
+  // Complete
+  if (isComplete) {
+    html += `
+      <div style="background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.3);border-radius:8px;padding:20px;margin-top:16px;text-align:center">
+        <div style="font-size:32px;margin-bottom:8px">🎉</div>
+        <div style="font-family:'Syne',sans-serif;font-size:18px;color:var(--accent);font-weight:800">Pipeline Complete</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:6px">All 7 phases completed successfully</div>
+      </div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+// ── UI Component helpers ──────────────────────────────────────────────────
+
+function sectionHeader(num, title, needsApproval) {
+  return `
+    <div style="background:var(--surface);border:1px solid ${needsApproval ? 'rgba(240,165,0,0.4)' : 'var(--border)'};border-radius:8px;padding:20px;margin-bottom:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="background:var(--surface3);border-radius:6px;padding:4px 10px;font-size:10px;color:var(--text2);font-weight:700">${num}</div>
+          <div style="font-family:'Syne',sans-serif;font-size:15px;font-weight:700">${title}</div>
+        </div>
+        <span style="font-size:9px;padding:3px 8px;border-radius:3px;font-weight:700;background:${needsApproval ? 'rgba(240,165,0,0.15)' : 'rgba(0,255,136,0.1)'};color:${needsApproval ? 'var(--warn)' : 'var(--accent)'}">
+          ${needsApproval ? '⏸ AWAITING APPROVAL' : '✓ DONE'}
+        </span>
+      </div>`;
+}
+
+function sectionClose() {
+  return `</div>`;
+}
+
+function subHeader(title) {
+  return `<div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--text3);margin:14px 0 8px">${title}</div>`;
+}
+
+function dataRow(label, value, colorClass='') {
+  const color = colorClass === 'warn' ? 'var(--warn)' :
+                colorClass === 'danger' ? 'var(--danger)' :
+                colorClass === 'accent' ? 'var(--accent)' : 'var(--text)';
+  return `
+    <div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
+      <div style="font-size:8px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">${label}</div>
+      <div style="font-size:11px;color:${color};line-height:1.6">${value}</div>
+    </div>`;
+}
+
+function reqCard(id, title, desc, priority, ac) {
+  const pColor = priority === 'High' || priority === 'Critical' ? 'var(--danger)' :
+                 priority === 'Medium' ? 'var(--warn)' : 'var(--accent)';
+  return `
+    <div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px;border-left:3px solid ${pColor}">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span style="font-size:9px;color:var(--blue);font-weight:700">${id||''}</span>
+        <span style="font-size:11px;font-weight:700">${title||''}</span>
+        <span style="margin-left:auto;font-size:8px;color:${pColor}">${priority||''}</span>
+      </div>
+      <div style="font-size:10px;color:var(--text2);margin-bottom:6px">${desc||''}</div>
+      ${ac.length ? `<div style="font-size:9px;color:var(--text3)">AC: ${ac.map(a=>`• ${a}`).join(' ')}</div>` : ''}
+    </div>`;
+}
+
+function adrCard(id, title, decision, consequences) {
+  return `
+    <div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span style="font-size:9px;color:var(--blue)">${id||''}</span>
+        <span style="font-size:11px;font-weight:700">${title||''}</span>
+      </div>
+      <div style="font-size:10px;color:var(--text2);margin-bottom:6px">${decision||''}</div>
+      ${consequences.length ? `<div style="font-size:9px;color:var(--text3)">${consequences.map(c=>`• ${c}`).join('<br>')}</div>` : ''}
+    </div>`;
+}
+
+function epicCard(epic) {
+  return `
+    <div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px">
+      <div style="font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px">📋 ${epic.title||''}</div>
+      <div style="font-size:10px;color:var(--text2);margin-bottom:8px">${epic.description||''}</div>
+      ${(epic.stories||[]).map(s => `
+        <div style="background:var(--surface3);border-radius:4px;padding:8px 10px;margin-bottom:4px;margin-left:12px">
+          <div style="font-size:10px;font-weight:700;margin-bottom:3px">📌 ${s.title||''}</div>
+          <div style="font-size:9px;color:var(--text2)">${s.description||''}</div>
+          <div style="font-size:9px;color:var(--text3);margin-top:4px">${(s.acceptance_criteria||[]).map(a=>`• ${a}`).join(' ')}</div>
+        </div>`).join('')}
+    </div>`;
+}
+
+function runbookStep(step) {
+  return `
+    <div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px;display:flex;gap:12px;align-items:flex-start">
+      <span style="color:var(--accent);font-weight:700;font-size:13px;min-width:20px">${step.step}</span>
+      <div>
+        <div style="font-size:11px;margin-bottom:3px">${step.repo||''} — ${step.action||''}</div>
+        ${step.command ? `<code style="font-size:9px;color:var(--text3);background:var(--surface3);padding:2px 6px;border-radius:3px">${step.command}</code>` : ''}
+      </div>
+    </div>`;
+}
+
+function approvalZone(threadId) {
+  return `
+    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
+      <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px">Human Review Required</div>
+      <input class="feedback-input" id="feedback-${threadId}" placeholder="Optional feedback or notes...">
+      <div style="display:flex;gap:10px">
+        <button class="btn-approve" onclick="approvePipeline('${threadId}', true)">✓ Approve & Continue</button>
+        <button class="btn-reject" onclick="approvePipeline('${threadId}', false)">✗ Reject</button>
+      </div>
+    </div>`;
+}
+
+function esc(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}  
+
+function selectThread(tid) {
+  selectedThread = tid;
+  renderSidebar();
+  renderPipelineBar();
+  renderContent();
+}
+
+function showToast(msg, type='info') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = `toast ${type}`;
+  t.style.display = 'block';
+  setTimeout(() => { t.style.display = 'none'; }, 3000);
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+checkHealth();
+setInterval(checkHealth, 30000);
+setInterval(pollAll, 3000);
+renderContent();
+renderSidebar();
+</script>
+</body>
+</html>

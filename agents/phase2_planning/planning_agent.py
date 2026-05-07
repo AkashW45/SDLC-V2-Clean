@@ -12,6 +12,10 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from groq import Groq
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from api.jira_client import fetch_jira_metadata
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,6 +32,7 @@ class PlanningState(TypedDict):
     brd: dict
     prd: dict
     sprint_plan: dict
+    jira_tickets: list
     runbook: dict
     human_feedback: str
     approved: bool
@@ -105,7 +110,117 @@ Requirement: {state['requirement']}
     print(f"  ✅ Sprint plan generated: {len(epics)} epics, {total_stories} stories")
     return {**state, "sprint_plan": sprint_plan, "status": "SPRINT_PLAN_GENERATED"}
 
+def create_jira_tickets(state: PlanningState) -> PlanningState:
+    """Create Jira epics and stories from sprint plan."""
+    print("\n[Phase 2] Creating Jira tickets...")
 
+    try:
+        import os
+        import base64
+        import httpx
+
+        from api.jira_client import fetch_jira_metadata
+
+        project_key = os.getenv("JIRA_PROJECT_KEY", "DEV")
+        jira_meta = fetch_jira_metadata(project_key)
+
+        email = os.getenv("JIRA_EMAIL")
+        token = os.getenv("JIRA_API_TOKEN")
+        domain = os.getenv("JIRA_BASE_URL")
+        credentials = base64.b64encode(f"{email}:{token}".encode()).decode()
+        headers = {
+            "Authorization": f"Basic {credentials}",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+
+        epics = state["sprint_plan"].get("epics", [])
+        created_tickets = []
+
+        for epic in epics:
+            # Create Epic
+            try:
+                epic_resp = httpx.post(
+                    f"https://{domain}/rest/api/3/issue",
+                    headers=headers,
+                    json={"fields": {
+                        "project": {"key": project_key},
+                        "summary": epic["title"],
+                        "description": {
+                            "type": "doc", "version": 1,
+                            "content": [{"type": "paragraph", "content": [
+                                {"type": "text", "text": epic.get("description", "")}
+                            ]}]
+                        },
+                        "issuetype": {"id": jira_meta["issue_types"].get("Epic", "")},
+                        "priority": {"id": jira_meta["priorities"].get("Medium", "")},
+                        "labels": ["ai-generated", "sdlc-v2"]
+                    }},
+                    timeout=15
+                )
+                if epic_resp.status_code == 201:
+                    epic_key = epic_resp.json()["key"]
+                    created_tickets.append(epic_key)
+                    print(f"  ✅ Epic: {epic_key} — {epic['title']}")
+                else:
+                    print(f"  ⚠️  Epic failed: {epic_resp.text[:100]}")
+                    continue
+
+            except Exception as e:
+                print(f"  ⚠️  Epic error: {e}")
+                continue
+
+            # Create Stories under Epic
+            for story in epic.get("stories", []):
+                try:
+                    ac_text = "\n".join(
+                        f"- {ac}" for ac in story.get("acceptance_criteria", [])
+                    )
+                    full_desc = (
+                        f"{story.get('description', '')}"
+                        f"\n\nAcceptance Criteria:\n{ac_text}"
+                    )
+
+                    story_resp = httpx.post(
+                        f"https://{domain}/rest/api/3/issue",
+                        headers=headers,
+                        json={"fields": {
+                            "project": {"key": project_key},
+                            "summary": story["title"],
+                            "description": {
+                                "type": "doc", "version": 1,
+                                "content": [{"type": "paragraph", "content": [
+                                    {"type": "text", "text": full_desc}
+                                ]}]
+                            },
+                            "issuetype": {"id": jira_meta["issue_types"].get("Story", "")},
+                            "priority": {"id": jira_meta["priorities"].get("Medium", "")},
+                            "labels": ["ai-generated", "sdlc-v2"]
+                        }},
+                        timeout=15
+                    )
+
+                    if story_resp.status_code == 201:
+                        story_key = story_resp.json()["key"]
+                        created_tickets.append(story_key)
+                        print(f"    ✅ Story: {story_key} — {story['title']}")
+                    else:
+                        print(f"    ⚠️  Story failed: {story_resp.text[:100]}")
+
+                except Exception as e:
+                    print(f"    ⚠️  Story error: {e}")
+
+        print(f"\n  ✅ Total tickets created: {len(created_tickets)}")
+        return {
+            **state,
+            "jira_tickets": created_tickets,
+            "status": "JIRA_TICKETS_CREATED"
+        }
+
+    except Exception as e:
+        print(f"  ⚠️  Jira creation skipped: {e}")
+        return {**state, "jira_tickets": [], "status": "JIRA_SKIPPED"}
+    
 def generate_runbook(state: PlanningState) -> PlanningState:
     print("\n[Phase 2] Generating runbook...")
 
@@ -204,12 +319,14 @@ def build_planning_graph():
     builder = StateGraph(PlanningState)
 
     builder.add_node("generate_sprint_plan", generate_sprint_plan)
+    builder.add_node("create_jira_tickets", create_jira_tickets)
     builder.add_node("generate_runbook", generate_runbook)
     builder.add_node("human_approval_gate", human_approval_gate)
     builder.add_node("process_approval", process_approval)
 
     builder.set_entry_point("generate_sprint_plan")
-    builder.add_edge("generate_sprint_plan", "generate_runbook")
+    builder.add_edge("generate_sprint_plan", "create_jira_tickets")
+    builder.add_edge("create_jira_tickets", "generate_runbook")
     builder.add_edge("generate_runbook", "human_approval_gate")
     builder.add_edge("human_approval_gate", "process_approval")
 

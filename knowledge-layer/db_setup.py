@@ -96,6 +96,19 @@ def setup_postgres():
         );
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            project_id VARCHAR(64) PRIMARY KEY,
+            project_name VARCHAR(255) NOT NULL,
+            description TEXT,
+            domain VARCHAR(100),
+            tech_stack JSONB,
+            repos JSONB,
+            owner_team VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_symbols_repo ON symbols(repo_name);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(symbol_name);")
@@ -122,6 +135,14 @@ def setup_qdrant():
     )
 
     print("[Qdrant] Creating collections...")
+
+    #project embeddings — one per project, for high-level project search and discovery
+    if not client.collection_exists("project_embeddings"):
+        client.create_collection(
+            collection_name="project_embeddings",
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+        )
+        print("[Qdrant] ✅ Created collection: project_embeddings")
 
     # Code embeddings — for semantic search across files and functions
     if not client.collection_exists("code_embeddings"):
