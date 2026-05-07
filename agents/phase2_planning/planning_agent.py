@@ -19,8 +19,12 @@ from api.jira_client import fetch_jira_metadata
 from dotenv import load_dotenv
 
 load_dotenv()
+from openai import OpenAI
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com"
+)
 
 
 # -----------------------------------------
@@ -45,9 +49,11 @@ class PlanningState(TypedDict):
 
 def call_llm(prompt: str) -> dict:
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model="deepseek-v4-pro",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000
+        stream=False,
+        reasoning_effort="high",
+        extra_body={"thinking": {"type": "enabled"}}
     )
     content = response.choices[0].message.content.strip()
     if content.startswith("```"):

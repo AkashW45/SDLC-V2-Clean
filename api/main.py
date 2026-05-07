@@ -2,7 +2,7 @@
 SDLC Automation Platform V2 — FastAPI HTTP Layer
 Exposes the LangGraph pipeline as HTTP endpoints.
 """
-
+import io
 import os
 import uuid
 import asyncio
@@ -13,6 +13,17 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from langgraph.types import Command
+from fastapi.responses import JSONResponse, HTMLResponse, Response
+from api.runbook_export import (
+    export_runbook_excel,
+    export_brd_markdown,
+    export_prd_markdown,
+    export_adr_markdown,
+    export_architecture_markdown,
+    export_sprint_plan_markdown,
+    export_impact_markdown
+)
+import zipfile
 
 load_dotenv()
 
@@ -165,17 +176,16 @@ def pipeline_start(req: StartRequest, background_tasks: BackgroundTasks):
 
 @app.get("/pipeline/status/{thread_id}")
 def pipeline_status(thread_id: str):
-    """Get current pipeline state."""
     if thread_id not in pipeline_store:
         raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
 
     entry = pipeline_store[thread_id]
 
-    # Build clean response without internal graph objects
     return {
         "thread_id": thread_id,
         "phase": entry["phase"],
         "status": entry["status"],
+        "sub_stage": entry.get("sub_stage", ""),
         "requirement": entry["requirement"],
         "pr_urls": entry.get("pr_urls", []),
         "error": entry.get("error"),
@@ -253,6 +263,131 @@ def pipeline_delete(thread_id: str):
     del pipeline_store[thread_id]
     return {"message": f"Pipeline {thread_id} removed"}
 
+# ── DOWNLOAD ENDPOINTS ─────────────────────────────────────────────
+
+def _get_pipeline_or_404(thread_id: str):
+    if thread_id not in pipeline_store:
+        raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
+    return pipeline_store[thread_id]
+
+
+@app.get("/pipeline/{thread_id}/download/brd")
+def download_brd(thread_id: str):
+    entry = _get_pipeline_or_404(thread_id)
+    md = export_brd_markdown(entry["current_state"].get("brd", {}))
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=BRD_{thread_id}.md"}
+    )
+
+
+@app.get("/pipeline/{thread_id}/download/prd")
+def download_prd(thread_id: str):
+    entry = _get_pipeline_or_404(thread_id)
+    md = export_prd_markdown(entry["current_state"].get("prd", {}))
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=PRD_{thread_id}.md"}
+    )
+
+
+@app.get("/pipeline/{thread_id}/download/adr")
+def download_adr(thread_id: str):
+    entry = _get_pipeline_or_404(thread_id)
+    md = export_adr_markdown(entry["current_state"].get("adr", {}))
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=ADR_{thread_id}.md"}
+    )
+
+
+@app.get("/pipeline/{thread_id}/download/architecture")
+def download_architecture(thread_id: str):
+    entry = _get_pipeline_or_404(thread_id)
+    md = export_architecture_markdown(entry["current_state"].get("architecture", {}))
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=Architecture_{thread_id}.md"}
+    )
+
+
+@app.get("/pipeline/{thread_id}/download/sprint-plan")
+def download_sprint_plan(thread_id: str):
+    entry = _get_pipeline_or_404(thread_id)
+    md = export_sprint_plan_markdown(
+        entry["current_state"].get("sprint_plan", {}),
+        entry["current_state"].get("jira_tickets", [])
+    )
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=SprintPlan_{thread_id}.md"}
+    )
+
+
+@app.get("/pipeline/{thread_id}/download/impact")
+def download_impact(thread_id: str):
+    entry = _get_pipeline_or_404(thread_id)
+    md = export_impact_markdown(entry["current_state"].get("impact_report", {}))
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=ImpactReport_{thread_id}.md"}
+    )
+
+
+@app.get("/pipeline/{thread_id}/download/runbook")
+def download_runbook(thread_id: str):
+    """Excel runbook — full enterprise format."""
+    entry = _get_pipeline_or_404(thread_id)
+    xlsx_bytes = export_runbook_excel(entry)
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=Runbook_{thread_id}.xlsx"}
+    )
+
+
+@app.get("/pipeline/{thread_id}/download/all")
+def download_all(thread_id: str):
+    """ZIP containing every artifact."""
+    entry = _get_pipeline_or_404(thread_id)
+    state = entry["current_state"]
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"01_BRD.md",          export_brd_markdown(state.get("brd", {})))
+        z.writestr(f"02_PRD.md",          export_prd_markdown(state.get("prd", {})))
+        z.writestr(f"03_ADR.md",          export_adr_markdown(state.get("adr", {})))
+        z.writestr(f"04_Architecture.md", export_architecture_markdown(state.get("architecture", {})))
+        z.writestr(f"05_SprintPlan.md",   export_sprint_plan_markdown(
+            state.get("sprint_plan", {}),
+            state.get("jira_tickets", [])
+        ))
+        z.writestr(f"06_ImpactReport.md", export_impact_markdown(state.get("impact_report", {})))
+        z.writestr(f"07_Runbook.xlsx",    export_runbook_excel(entry))
+
+        # Generated code files
+        for change in state.get("generated_changes", []):
+            fname = change.get("file_path", "unknown.txt").replace("/", "_").replace("\\", "_")
+            z.writestr(f"08_code/{fname}", change.get("content", ""))
+
+        # Test files
+        for test in state.get("test_files", []):
+            fname = test.get("test_file_path", "test.py").replace("/", "_").replace("\\", "_")
+            z.writestr(f"09_tests/{fname}", test.get("content", ""))
+
+    buf.seek(0)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=Pipeline_{thread_id}_FullPackage.zip"}
+    )
+
 
 # ── Knowledge Layer Endpoints ─────────────────────────────────────────────────
 @app.post("/knowledge/index")
@@ -319,7 +454,6 @@ def knowledge_repos():
 
 # ── Background Tasks ──────────────────────────────────────────────────────────
 def run_phase1(thread_id: str, requirement: str):
-    """Run Phase 1 until INTERRUPT."""
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -329,28 +463,57 @@ def run_phase1(thread_id: str, requirement: str):
         )
 
         pipeline_store[thread_id]["status"] = "PHASE_1_RUNNING"
+        pipeline_store[thread_id]["sub_stage"] = "Generating BRD..."
 
         graph = build_discovery_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p1"}}
 
         initial_state = DiscoveryState(
             requirement=requirement,
-            brd={}, prd={}, adr={},
+            brd={}, prd={}, adr={}, architecture={},
             human_feedback="", approved=False,
             status="STARTED"
         )
 
-        result = graph.invoke(initial_state, config)
+        # Stream node by node so we can save state after each
+        for chunk in graph.stream(initial_state, config, stream_mode="updates"):
+            for node_name, node_state in chunk.items():
 
-        pipeline_store[thread_id].update({
-            "phase": 1,
-            "status": "WAITING_PHASE_1_APPROVAL",
-            "graph": graph,
-            "config": config,
-            "current_state": result
-        })
+                # Save state after each node completes
+                current = pipeline_store[thread_id].get("current_state", {})
+                current.update(node_state)
+                pipeline_store[thread_id]["current_state"] = current
+
+                if node_name == "generate_brd":
+                    pipeline_store[thread_id]["sub_stage"] = "BRD Done — Generating PRD..."
+                    pipeline_store[thread_id]["status"] = "PHASE_1_BRD_DONE"
+
+                elif node_name == "generate_prd":
+                    pipeline_store[thread_id]["sub_stage"] = "PRD Done — Generating ADR..."
+                    pipeline_store[thread_id]["status"] = "PHASE_1_PRD_DONE"
+
+                elif node_name == "generate_adr":
+                    pipeline_store[thread_id]["sub_stage"] = "ADR Done — Generating Architecture..."
+                    pipeline_store[thread_id]["status"] = "PHASE_1_ADR_DONE"
+
+                elif node_name == "generate_architecture":
+                    pipeline_store[thread_id]["sub_stage"] = "Architecture Done — Awaiting Approval"
+                    pipeline_store[thread_id]["status"] = "WAITING_PHASE_1_APPROVAL"
+
+                elif node_name == "__interrupt__":
+                    pipeline_store[thread_id]["status"] = "WAITING_PHASE_1_APPROVAL"
+                    pipeline_store[thread_id]["graph"] = graph
+                    pipeline_store[thread_id]["config"] = config
+                    return
+
+        # If we exit stream without interrupt (shouldn't happen)
+        pipeline_store[thread_id]["status"] = "WAITING_PHASE_1_APPROVAL"
+        pipeline_store[thread_id]["graph"] = graph
+        pipeline_store[thread_id]["config"] = config
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         pipeline_store[thread_id].update({
             "status": "ERROR",
             "error": f"Phase 1 error: {str(e)}"

@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SDLC V2 — Control Tower</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<!-- ADD THESE TWO LINES HERE -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:false, theme:'dark', themeVariables:{primaryColor:'#1a4a8a',primaryTextColor:'#e6edf3',edgeLabelBackground:'#161b22',lineColor:'#2E86DE'}});</script>
 <style>
 :root {
   --bg: #090c10;
@@ -338,9 +341,15 @@ function renderContent() {
   const isError = status === 'ERROR';
 
   let html = `
-    <div style="margin-bottom:20px">
-      <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:800">Pipeline Status</div>
-      <div style="font-size:11px;color:var(--text2);margin-top:4px">${selectedThread}</div>
+    <div style="margin-bottom:20px;display:flex;justify-content:space-between;align-items:flex-start">
+      <div>
+        <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:800">Pipeline Status</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:4px">${selectedThread}</div>
+      </div>
+      <a href="${API}/pipeline/${selectedThread}/download/all" target="_blank"
+         style="background:var(--accent);color:#090c10;padding:8px 14px;border-radius:6px;font-size:11px;font-weight:700;text-decoration:none">
+        ⬇ Download Full Package
+      </a>
     </div>`;
 
   // Status banner
@@ -359,69 +368,216 @@ function renderContent() {
       </div>
     </div>`;
 
-  // ── PHASE 1 ──────────────────────────────────────────────────────────────
-  if (state.brd?.title || state.prd || state.adr) {
+  // ── PHASE 1 — BRD/PRD/ADR/Architecture ──────────────────────
+  if (state.brd?.title || state.prd || state.adr || state.architecture) {
     const needsApproval = status === 'WAITING_PHASE_1_APPROVAL';
-    html += sectionHeader('01', 'Discovery — BRD / PRD / ADR', needsApproval);
+    
+    // Show sub-stage progress if still running
+    const subStage = p.sub_stage || '';
+    const brdDone = !!state.brd?.title;
+    const prdDone = !!(state.prd?.functional_requirements?.length);
+    const adrDone = !!(state.adr?.decisions?.length);
+    const archDone = !!(state.architecture?.nodes?.length);
 
+    html += sectionHeader('01', 'Discovery — BRD / PRD / ADR / Architecture', needsApproval);
+
+    // Progress indicator while running
+    if (status.includes('PHASE_1') && !needsApproval) {
+      html += `<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+        ${[
+          ['📋 BRD', brdDone],
+          ['📄 PRD', prdDone],
+          ['🏛 ADR', adrDone],
+          ['🏗 Architecture', archDone]
+        ].map(([label, done]) => `
+          <div style="padding:4px 12px;border-radius:20px;font-size:10px;border:1px solid ${done ? 'var(--accent)' : 'var(--border)'};color:${done ? 'var(--accent)' : 'var(--text3)'};background:${done ? 'rgba(0,255,136,0.05)' : 'transparent'}">
+            ${done ? '✓' : '○'} ${label}
+          </div>`).join('')}
+        ${subStage ? `<div style="font-size:10px;color:var(--warn);padding:4px 0"><span class="spinner" style="width:10px;height:10px;margin-right:6px"></span>${subStage}</div>` : ''}
+      </div>`;
+    }
+
+    // BRD
     if (state.brd?.title) {
-      html += dataRow('BRD Title', state.brd.title);
-      if (state.brd.business_objectives?.length) {
-        html += dataRow('Business Objectives',
-          state.brd.business_objectives.map(o => `• ${o}`).join('<br>'));
+      html += subHeaderWithDownload('📋 Business Requirements (BRD)', 'brd');
+      html += dataRow('Title', state.brd.title);
+      if (state.brd.business_objectives?.length)
+        html += dataRow('Objectives', state.brd.business_objectives.map(o=>`• ${o}`).join('<br>'));
+      if (state.brd.scope?.in_scope?.length)
+        html += dataRow('In Scope', state.brd.scope.in_scope.map(s=>`• ${s}`).join('<br>'));
+      if (state.brd.scope?.out_of_scope?.length)
+        html += dataRow('Out of Scope', state.brd.scope.out_of_scope.map(s=>`• ${s}`).join('<br>'));
+      if (state.brd.stakeholders?.length)
+        html += dataRow('Stakeholders', state.brd.stakeholders.map(s=>`• ${s}`).join('<br>'));
+      if (state.brd.risks?.length)
+        html += dataRow('Risks', state.brd.risks.map(r=>`• ${r}`).join('<br>'), 'warn');
+    }
+
+    // PRD
+    if (state.prd) {
+      html += subHeaderWithDownload('📄 Product Requirements (PRD)', 'prd');
+      if (state.prd.product_vision || state.prd.productVision) {
+        html += dataRow('Product Vision', state.prd.product_vision || state.prd.productVision || '');
       }
-      if (state.brd.risks?.length) {
-        html += dataRow('Risks', state.brd.risks.map(r => `• ${r}`).join('<br>'), 'warn');
+
+      const frs = state.prd.functional_requirements || state.prd.functionalRequirements || [];
+      if (frs.length) {
+        html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:10px 0 6px">
+          Functional Requirements (${frs.length})
+        </div>`;
+        frs.forEach(r => {
+          html += reqCard(r.id, r.title, r.description, r.priority, r.acceptance_criteria || r.acceptanceCriteria || []);
+        });
+      }
+
+      const nfrs = state.prd.non_functional_requirements || state.prd.nonFunctionalRequirements || state.prd.nfr || [];
+      if (nfrs.length) {
+        html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:14px 0 6px">
+          Non-Functional Requirements (${nfrs.length})
+        </div>`;
+        nfrs.forEach(r => {
+          html += `<div style="background:var(--surface2);border-radius:6px;padding:10px 14px;margin-bottom:6px;border-left:3px solid var(--blue)">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <span style="font-size:9px;color:var(--blue);font-weight:700">${r.id||''}</span>
+              <span style="font-size:11px;font-weight:700">${r.title||r.name||''}</span>
+              <span style="margin-left:auto;font-size:8px;color:var(--text3)">${r.priority||''}</span>
+            </div>
+            <div style="font-size:10px;color:var(--text2)">${r.description||''}</div>
+          </div>`;
+        });
+      }
+
+      const trs = state.prd.technical_requirements || state.prd.technicalRequirements || [];
+      if (trs.length) {
+        html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:14px 0 6px">
+          Technical Requirements (${trs.length})
+        </div>`;
+        trs.forEach(r => {
+          html += `<div style="background:var(--surface2);border-radius:6px;padding:10px 14px;margin-bottom:6px;border-left:3px solid var(--warn)">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <span style="font-size:9px;color:var(--warn);font-weight:700">${r.id||''}</span>
+              <span style="font-size:11px;font-weight:700">${r.title||r.name||''}</span>
+            </div>
+            <div style="font-size:10px;color:var(--text2)">${r.description||''}</div>
+          </div>`;
+        });
       }
     }
 
-    if (state.prd?.functional_requirements?.length) {
-      html += subHeader('PRD — Functional Requirements');
-      state.prd.functional_requirements.forEach(r => {
-        html += reqCard(r.id, r.title, r.description, r.priority,
-                        r.acceptance_criteria || []);
-      });
-    }
-
+    // ADR
     if (state.adr?.decisions?.length) {
-      html += subHeader('Architecture Decision Records');
+      html += subHeaderWithDownload('🏛 Architecture Decisions (ADR)', 'adr');
       state.adr.decisions.forEach(d => {
         html += adrCard(d.id, d.title, d.decision, d.consequences || []);
       });
     }
 
+    // Architecture
+    if (state.architecture?.nodes?.length) {
+      html += subHeaderWithDownload('🏗 Architecture Design', 'architecture');
+      const arch = state.architecture;
+
+      // Stats row
+      html += `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px">
+        ${[
+          ['System', arch.system_name || 'Untitled'],
+          ['Style', arch.architecture_style || '—'],
+          ['Deployment', arch.deployment_model || '—'],
+          ['Components', arch.nodes?.length || 0]
+        ].map(([l,v]) => `
+          <div style="background:var(--surface2);border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:8px;color:var(--text3);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px">${l}</div>
+            <div style="font-size:12px;font-weight:700;color:var(--accent)">${v}</div>
+          </div>`).join('')}
+      </div>`;
+
+      // Use pre-generated mermaid from backend
+      if (arch.mermaid) {
+        html += `<div style="background:var(--surface2);border-radius:8px;padding:16px;margin-bottom:12px;overflow-x:auto">
+          <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px">Architecture Diagram</div>
+          <div class="mermaid">${arch.mermaid}</div>
+        </div>`;
+      }
+
+      // Component cards
+      html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:10px 0 6px">Components</div>`;
+      arch.nodes.forEach(n => {
+        const typeColor = n.type==='database'?'var(--accent)':n.type==='external'?'#9b59b6':n.type==='queue'?'var(--warn)':'var(--blue)';
+        html += `<div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px;border-left:3px solid ${typeColor}">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <span style="font-size:9px;font-weight:700;padding:2px 6px;border-radius:3px;background:var(--surface3);color:${typeColor}">${n.id}</span>
+            <span style="font-size:12px;font-weight:700">${n.name}</span>
+            <span style="margin-left:auto;font-size:8px;color:var(--text3);padding:2px 6px;border:1px solid var(--border);border-radius:3px">${n.type} · ${n.zone}</span>
+          </div>
+          <div style="font-size:10px;color:var(--text2);margin-bottom:6px">${n.description||''}</div>
+          ${n.tech_stack?.length ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:4px">
+            ${n.tech_stack.map(t=>`<span style="font-size:9px;padding:2px 6px;background:rgba(0,153,255,0.1);border-radius:3px;color:var(--blue)">${t}</span>`).join('')}
+          </div>` : ''}
+          ${n.responsibilities?.length ? `<div style="font-size:9px;color:var(--text3);margin-top:4px">
+            ${n.responsibilities.map(r=>`<div style="margin-bottom:2px">▸ ${r}</div>`).join('')}
+          </div>` : ''}
+        </div>`;
+      });
+
+      if (arch.security_considerations?.length) {
+        html += `<div style="background:rgba(255,71,87,0.05);border:1px solid rgba(255,71,87,0.2);border-radius:6px;padding:12px;margin-top:8px">
+          <div style="font-size:9px;color:var(--danger);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px">🔒 Security Considerations</div>
+          ${arch.security_considerations.map(s=>`<div style="font-size:10px;color:var(--text2);margin-bottom:4px">• ${s}</div>`).join('')}
+        </div>`;
+      }
+    }
     if (needsApproval) html += approvalZone(selectedThread);
     html += sectionClose();
   }
-
-  // ── PHASE 2 ──────────────────────────────────────────────────────────────
+  // ── PHASE 2 — Sprint Plan / Jira / Runbook ──────────────────
   if (state.sprint_plan || state.runbook) {
     const needsApproval = status === 'WAITING_PHASE_2_APPROVAL';
     const epics = state.sprint_plan?.epics || [];
     const tickets = state.jira_tickets || [];
-    html += sectionHeader('02', 'Planning — Sprint Plan + Runbook', needsApproval);
+    html += sectionHeader('02', 'Planning — Sprint + Runbook', needsApproval);
 
     if (tickets.length) {
-      html += subHeader('Jira Tickets Created');
-      html += `<div class="ticket-list">${tickets.map(t =>
-        `<span class="ticket-chip">${t}</span>`).join('')}</div><br>`;
+      const jiraBase = 'https://wissen-team-tqg48t7b.atlassian.net/browse';
+      html += subHeaderWithDownload(`🎫 Jira Tickets (${tickets.length})`, 'sprint-plan');
+      html += `<div class="ticket-list">
+        ${tickets.map(t => `
+          <a href="${jiraBase}/${t}" target="_blank"
+             style="font-size:10px;padding:3px 8px;border-radius:4px;background:var(--surface3);border:1px solid var(--border);color:var(--blue);text-decoration:none;display:inline-flex;align-items:center;gap:4px">
+            🔗 ${t}
+          </a>`).join('')}
+      </div><br>`;
     }
 
     if (epics.length) {
-      html += subHeader('Sprint Plan — Epics & Stories');
-      epics.forEach(epic => {
-        html += epicCard(epic);
-      });
+      html += subHeader(`📋 Sprint Plan — ${epics.length} Epics`);
+      epics.forEach(epic => { html += epicCard(epic); });
     }
 
-    if (state.runbook?.deployment_sequence?.length) {
-      html += subHeader('Deployment Runbook');
-      state.runbook.deployment_sequence.forEach(step => {
-        html += runbookStep(step);
-      });
-      if (state.runbook.rollback_steps?.length) {
-        html += dataRow('Rollback Steps',
-          state.runbook.rollback_steps.map(s => `• ${s}`).join('<br>'), 'warn');
+    if (state.runbook) {
+      html += subHeaderWithDownload('🚀 Deployment Runbook', 'runbook', 'xlsx');
+      const rb = state.runbook;
+      if (rb.feature) html += dataRow('Feature', rb.feature);
+
+      if (rb.deployment_sequence?.length) {
+        html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:10px 0 6px">Deployment Steps</div>`;
+        rb.deployment_sequence.forEach(s => {
+          html += runbookStep(s);
+        });
+      }
+
+      if (rb.rollback_steps?.length) {
+        html += dataRow('Rollback Steps', rb.rollback_steps.map(s=>`• ${s}`).join('<br>'), 'warn');
+      }
+
+      if (rb.feature_flags?.length) {
+        html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:10px 0 6px">Feature Flags</div>`;
+        rb.feature_flags.forEach(f => {
+          html += `<div style="background:var(--surface2);border-radius:5px;padding:8px 12px;margin-bottom:4px;font-size:10px">
+            <code style="color:var(--blue)">${f.flag_name}</code>
+            <span style="color:var(--text3);margin-left:8px">default: ${f.default}</span>
+            <span style="color:var(--accent);margin-left:8px">enable_after_deploy: ${f.enable_after_deploy}</span>
+          </div>`;
+        });
       }
     }
 
@@ -429,44 +585,29 @@ function renderContent() {
     html += sectionClose();
   }
 
-  // ── PHASE 3 ──────────────────────────────────────────────────────────────
+  // ── PHASE 3 — Impact ────────────────────────────────────────
   if (state.impact_report?.affected_files) {
     const needsApproval = status === 'WAITING_PHASE_3_APPROVAL';
     const risk = state.impact_report.risk_assessment?.risk_level || '';
-    const riskColor = risk === 'high' ? 'var(--danger)' :
-                      risk === 'medium' ? 'var(--warn)' : 'var(--accent)';
+    const riskColor = risk === 'high' ? 'var(--danger)' : risk === 'medium' ? 'var(--warn)' : 'var(--accent)';
 
     html += sectionHeader('03', 'Impact Analysis', needsApproval);
-    html += dataRow('Risk Level',
-      `<span style="color:${riskColor};font-weight:700;font-size:14px">${risk.toUpperCase()}</span>`);
-    html += dataRow('Recommendation',
-      state.impact_report.risk_assessment?.recommendation || '');
-
-    if (state.impact_report.risk_assessment?.risk_reasons?.length) {
-      html += dataRow('Risk Reasons',
-        state.impact_report.risk_assessment.risk_reasons.map(r => `• ${r}`).join('<br>'),
-        'warn');
-    }
+    html += subHeaderWithDownload('Risk Assessment', 'impact');
+    html += dataRow('Risk Level', `<span style="color:${riskColor};font-weight:700;font-size:14px">${risk.toUpperCase()}</span>`);
+    html += dataRow('Recommendation', state.impact_report.risk_assessment?.recommendation || '');
 
     if (state.impact_report.risk_assessment?.breaking_changes?.length) {
       html += dataRow('Breaking Changes',
-        state.impact_report.risk_assessment.breaking_changes.map(r =>
-          `• ${r}`).join('<br>'), 'danger');
+        state.impact_report.risk_assessment.breaking_changes.map(r=>`• ${r}`).join('<br>'), 'danger');
     }
 
     if (state.impact_report.affected_files?.length) {
-      html += subHeader('Affected Files');
+      html += subHeader(`Affected Files (${state.impact_report.affected_files.length})`);
       state.impact_report.affected_files.forEach(f => {
-        html += `
-          <div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
-            <div style="font-size:11px;color:var(--blue);margin-bottom:4px">${f.file_path}</div>
-            <div style="font-size:9px;color:var(--text3)">Repo: ${f.repo_name} | Score: ${f.relevance_score}</div>
-            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">
-              ${(f.matched_symbols||[]).map(s =>
-                `<span style="font-size:9px;padding:2px 6px;background:var(--surface3);border-radius:3px;color:var(--text2)">${s.name} (${s.type})</span>`
-              ).join('')}
-            </div>
-          </div>`;
+        html += `<div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
+          <div style="font-size:11px;color:var(--blue);margin-bottom:4px">${f.file_path}</div>
+          <div style="font-size:9px;color:var(--text3)">Repo: ${f.repo_name} | Score: ${f.relevance_score}</div>
+        </div>`;
       });
     }
 
@@ -474,135 +615,111 @@ function renderContent() {
     html += sectionClose();
   }
 
-  // ── PHASE 4+5 ────────────────────────────────────────────────────────────
+  // ── PHASE 4+5 — Code + Tests ────────────────────────────────
   if (state.generated_changes?.length) {
     html += sectionHeader('04+05', 'Code Generation + Validation', false);
 
     state.generated_changes.forEach(change => {
-      html += `
-        <div style="background:var(--surface2);border-radius:6px;padding:14px;margin-bottom:12px">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-            <div style="font-size:11px;color:var(--blue);font-weight:700">${change.file_path}</div>
-            <div style="font-size:9px;color:var(--accent)">✓ validated</div>
-          </div>
-          <div style="font-size:10px;color:var(--text2);margin-bottom:8px">${change.change_summary || ''}</div>
-          <div style="display:flex;gap:6px;flex-wrap:wrap">
-            ${(change.new_symbols_added||[]).map(s =>
-              `<span style="font-size:9px;padding:2px 6px;background:rgba(0,255,136,0.1);border-radius:3px;color:var(--accent)">+ ${s}</span>`
-            ).join('')}
-            ${(change.existing_symbols_modified||[]).map(s =>
-              `<span style="font-size:9px;padding:2px 6px;background:rgba(0,153,255,0.1);border-radius:3px;color:var(--blue)">~ ${s}</span>`
-            ).join('')}
-          </div>
-          <details style="margin-top:10px">
-            <summary style="font-size:9px;color:var(--text3);cursor:pointer">View generated code</summary>
-            <pre style="font-size:9px;background:var(--surface3);padding:10px;border-radius:4px;margin-top:6px;overflow-x:auto;white-space:pre-wrap;color:var(--text2);max-height:300px;overflow-y:auto">${esc(change.content||'')}</pre>
-          </details>
-        </div>`;
+      html += `<div style="background:var(--surface2);border-radius:6px;padding:14px;margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="font-size:11px;color:var(--blue);font-weight:700">${change.file_path}</div>
+          <div style="font-size:9px;color:var(--accent)">✓ validated</div>
+        </div>
+        <div style="font-size:10px;color:var(--text2);margin-bottom:8px">${change.change_summary || ''}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${(change.new_symbols_added||[]).map(s => `<span style="font-size:9px;padding:2px 6px;background:rgba(0,255,136,0.1);border-radius:3px;color:var(--accent)">+ ${s}</span>`).join('')}
+          ${(change.existing_symbols_modified||[]).map(s => `<span style="font-size:9px;padding:2px 6px;background:rgba(0,153,255,0.1);border-radius:3px;color:var(--blue)">~ ${s}</span>`).join('')}
+        </div>
+        <details style="margin-top:10px">
+          <summary style="font-size:9px;color:var(--text3);cursor:pointer">View generated code</summary>
+          <pre style="font-size:9px;background:var(--surface3);padding:10px;border-radius:4px;margin-top:6px;overflow-x:auto;white-space:pre-wrap;color:var(--text2);max-height:300px;overflow-y:auto">${esc(change.content||'')}</pre>
+        </details>
+      </div>`;
     });
 
     if (state.test_files?.length) {
-      html += subHeader('Generated Tests');
+      html += subHeader(`Generated Tests (${state.test_files.length})`);
       state.test_files.forEach(tf => {
-        html += `
-          <div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
-            <div style="font-size:10px;color:var(--blue);margin-bottom:4px">${tf.test_file_path}</div>
-            <div style="font-size:9px;color:var(--text2)">${tf.test_count || 0} tests — covers: ${(tf.tests_cover||[]).join(', ')}</div>
-          </div>`;
+        html += `<div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
+          <div style="font-size:10px;color:var(--blue);margin-bottom:4px">${tf.test_file_path}</div>
+          <div style="font-size:9px;color:var(--text2)">${tf.test_count || 0} tests — covers: ${(tf.tests_cover||[]).join(', ')}</div>
+        </div>`;
       });
     }
 
     html += sectionClose();
   }
 
-  // ── PHASE 6 ──────────────────────────────────────────────────────────────
+  // ── PHASE 6 — Delivery ──────────────────────────────────────
   if (p.pr_urls?.length || state.pr_urls?.length) {
     const needsApproval = status === 'WAITING_PHASE_6_APPROVAL';
     const urls = p.pr_urls?.length ? p.pr_urls : state.pr_urls;
     html += sectionHeader('06', 'Delivery — GitHub PR', needsApproval);
     urls.forEach(url => {
-      html += `<a class="pr-link" href="${url}" target="_blank">🔗 View PR on GitHub — ${url}</a><br>`;
+      html += `<a class="pr-link" href="${url}" target="_blank">🔗 ${url}</a><br>`;
     });
-    html += dataRow('Status', 'PR created and ready for review');
     if (needsApproval) html += approvalZone(selectedThread);
     html += sectionClose();
   }
 
-  // ── PHASE 7 ──────────────────────────────────────────────────────────────
-  if (status.includes('PHASE_7') || status === 'DEPLOYMENT_COMPLETE' ||
-      status === 'WAITING_PHASE_7_APPROVAL') {
+  // ── PHASE 7 — Deployment ────────────────────────────────────
+  if (status.includes('PHASE_7') || status === 'DEPLOYMENT_COMPLETE' || status === 'WAITING_PHASE_7_APPROVAL') {
     const needsApproval = status === 'WAITING_PHASE_7_APPROVAL';
     html += sectionHeader('07', 'Deployment', needsApproval);
 
     if (state.deploy_sequence?.length) {
       html += subHeader('Deploy Sequence');
       state.deploy_sequence.forEach(s => {
-        html += `
-          <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface2);border-radius:5px;margin-bottom:4px">
-            <span style="color:var(--accent);font-size:11px;font-weight:700">${s.step}</span>
-            <span style="font-size:11px">${s.repo}</span>
-            <span style="font-size:9px;color:var(--text3);margin-left:auto">${s.type}</span>
-          </div>`;
+        html += `<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface2);border-radius:5px;margin-bottom:4px">
+          <span style="color:var(--accent);font-weight:700;font-size:11px">${s.step}</span>
+          <span style="font-size:11px">${s.repo}</span>
+          <span style="font-size:9px;color:var(--text3);margin-left:auto">${s.type}</span>
+        </div>`;
       });
     }
 
     if (state.feature_flags?.length) {
       html += subHeader('Feature Flags');
       state.feature_flags.forEach(f => {
-        const enabled = f.enabled;
-        html += `
-          <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface2);border-radius:5px;margin-bottom:4px">
-            <span style="font-size:11px;color:var(--blue)">${f.flag_name}</span>
-            <span style="margin-left:auto;font-size:9px;padding:2px 6px;border-radius:3px;background:${enabled ? 'rgba(0,255,136,0.1)' : 'rgba(72,79,88,0.3)'};color:${enabled ? 'var(--accent)' : 'var(--text3)'}">${enabled ? 'ENABLED' : 'DISABLED'}</span>
-          </div>`;
+        html += `<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface2);border-radius:5px;margin-bottom:4px">
+          <span style="font-size:11px;color:var(--blue)">${f.flag_name}</span>
+          <span style="margin-left:auto;font-size:9px;padding:2px 6px;border-radius:3px;background:${f.enabled ? 'rgba(0,255,136,0.1)' : 'rgba(72,79,88,0.3)'};color:${f.enabled ? 'var(--accent)' : 'var(--text3)'}">${f.enabled ? 'ENABLED' : 'DISABLED'}</span>
+        </div>`;
       });
-    }
-
-    if (state.monitoring_results?.metrics) {
-      html += subHeader('Post-Deploy Metrics');
-      const m = state.monitoring_results.metrics;
-      html += dataRow('Error Rate', `${m.error_rate * 100}%`,
-                      m.error_rate > 0.05 ? 'danger' : '');
-      html += dataRow('Avg Latency', `${m.avg_latency_ms}ms`);
-      html += dataRow('Health Check', m.health_check);
     }
 
     if (needsApproval) html += approvalZone(selectedThread);
     html += sectionClose();
   }
 
-  // Running indicator
   if (isRunning) {
-    html += `
-      <div style="display:flex;align-items:center;gap:10px;padding:20px;color:var(--text2);font-size:12px">
-        <div class="spinner"></div>
-        <span>${status.replace(/_/g,' ')}...</span>
-      </div>`;
+    html += `<div style="display:flex;align-items:center;gap:10px;padding:20px;color:var(--text2);font-size:12px">
+      <div class="spinner"></div><span>${status.replace(/_/g,' ')}...</span>
+    </div>`;
   }
 
-  // Error
   if (isError && p.error) {
-    html += `
-      <div style="background:rgba(255,71,87,0.07);border:1px solid rgba(255,71,87,0.3);border-radius:8px;padding:16px;margin-top:16px">
-        <div style="color:var(--danger);font-size:12px;font-weight:700;margin-bottom:8px">❌ Error</div>
-        <div style="font-size:11px;color:var(--text2)">${p.error}</div>
-      </div>`;
+    html += `<div style="background:rgba(255,71,87,0.07);border:1px solid rgba(255,71,87,0.3);border-radius:8px;padding:16px;margin-top:16px">
+      <div style="color:var(--danger);font-size:12px;font-weight:700;margin-bottom:8px">❌ Error</div>
+      <div style="font-size:11px;color:var(--text2)">${p.error}</div>
+    </div>`;
   }
 
-  // Complete
   if (isComplete) {
-    html += `
-      <div style="background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.3);border-radius:8px;padding:20px;margin-top:16px;text-align:center">
-        <div style="font-size:32px;margin-bottom:8px">🎉</div>
-        <div style="font-family:'Syne',sans-serif;font-size:18px;color:var(--accent);font-weight:800">Pipeline Complete</div>
-        <div style="font-size:11px;color:var(--text2);margin-top:6px">All 7 phases completed successfully</div>
-      </div>`;
+    html += `<div style="background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.3);border-radius:8px;padding:20px;margin-top:16px;text-align:center">
+      <div style="font-size:32px;margin-bottom:8px">🎉</div>
+      <div style="font-family:'Syne',sans-serif;font-size:18px;color:var(--accent);font-weight:800">Pipeline Complete</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:6px">All phases completed successfully</div>
+    </div>`;
   }
 
   el.innerHTML = html;
+  if (html.includes('class="mermaid"') && window.mermaid) {
+    setTimeout(() => mermaid.run(), 50);
+  }
 }
 
-// ── UI Component helpers ──────────────────────────────────────────────────
+// ── UI Helpers ──────────────────────────────────────────────────────
 
 function sectionHeader(num, title, needsApproval) {
   return `
@@ -618,92 +735,90 @@ function sectionHeader(num, title, needsApproval) {
       </div>`;
 }
 
-function sectionClose() {
-  return `</div>`;
-}
+function sectionClose() { return `</div>`; }
 
 function subHeader(title) {
   return `<div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--text3);margin:14px 0 8px">${title}</div>`;
 }
 
+function subHeaderWithDownload(title, key, ext='md') {
+  return `<div style="display:flex;justify-content:space-between;align-items:center;margin:14px 0 8px">
+    <div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--text3)">${title}</div>
+    <a href="${API}/pipeline/${selectedThread}/download/${key}" target="_blank"
+       style="font-size:9px;color:var(--accent);text-decoration:none;padding:3px 8px;border:1px solid var(--accent);border-radius:4px">
+      ⬇ ${ext.toUpperCase()}
+    </a>
+  </div>`;
+}
+
 function dataRow(label, value, colorClass='') {
-  const color = colorClass === 'warn' ? 'var(--warn)' :
-                colorClass === 'danger' ? 'var(--danger)' :
-                colorClass === 'accent' ? 'var(--accent)' : 'var(--text)';
-  return `
-    <div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
-      <div style="font-size:8px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">${label}</div>
-      <div style="font-size:11px;color:${color};line-height:1.6">${value}</div>
-    </div>`;
+  const color = colorClass==='warn'?'var(--warn)':colorClass==='danger'?'var(--danger)':colorClass==='accent'?'var(--accent)':'var(--text)';
+  return `<div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
+    <div style="font-size:8px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">${label}</div>
+    <div style="font-size:11px;color:${color};line-height:1.6">${value}</div>
+  </div>`;
 }
 
 function reqCard(id, title, desc, priority, ac) {
-  const pColor = priority === 'High' || priority === 'Critical' ? 'var(--danger)' :
-                 priority === 'Medium' ? 'var(--warn)' : 'var(--accent)';
-  return `
-    <div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px;border-left:3px solid ${pColor}">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <span style="font-size:9px;color:var(--blue);font-weight:700">${id||''}</span>
-        <span style="font-size:11px;font-weight:700">${title||''}</span>
-        <span style="margin-left:auto;font-size:8px;color:${pColor}">${priority||''}</span>
-      </div>
-      <div style="font-size:10px;color:var(--text2);margin-bottom:6px">${desc||''}</div>
-      ${ac.length ? `<div style="font-size:9px;color:var(--text3)">AC: ${ac.map(a=>`• ${a}`).join(' ')}</div>` : ''}
-    </div>`;
+  const pColor = priority==='High'||priority==='Critical'?'var(--danger)':priority==='Medium'?'var(--warn)':'var(--accent)';
+  return `<div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px;border-left:3px solid ${pColor}">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+      <span style="font-size:9px;color:var(--blue);font-weight:700">${id||''}</span>
+      <span style="font-size:11px;font-weight:700">${title||''}</span>
+      <span style="margin-left:auto;font-size:8px;color:${pColor}">${priority||''}</span>
+    </div>
+    <div style="font-size:10px;color:var(--text2);margin-bottom:6px">${desc||''}</div>
+    ${ac.length ? `<div style="font-size:9px;color:var(--text3)"><strong>AC:</strong> ${ac.map(a=>`• ${a}`).join(' ')}</div>` : ''}
+  </div>`;
 }
 
 function adrCard(id, title, decision, consequences) {
-  return `
-    <div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <span style="font-size:9px;color:var(--blue)">${id||''}</span>
-        <span style="font-size:11px;font-weight:700">${title||''}</span>
-      </div>
-      <div style="font-size:10px;color:var(--text2);margin-bottom:6px">${decision||''}</div>
-      ${consequences.length ? `<div style="font-size:9px;color:var(--text3)">${consequences.map(c=>`• ${c}`).join('<br>')}</div>` : ''}
-    </div>`;
+  return `<div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+      <span style="font-size:9px;color:var(--blue)">${id||''}</span>
+      <span style="font-size:11px;font-weight:700">${title||''}</span>
+    </div>
+    <div style="font-size:10px;color:var(--text2);margin-bottom:6px">${decision||''}</div>
+    ${consequences.length?`<div style="font-size:9px;color:var(--text3)">${consequences.map(c=>`• ${c}`).join('<br>')}</div>`:''}
+  </div>`;
 }
 
 function epicCard(epic) {
-  return `
-    <div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px">
-      <div style="font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px">📋 ${epic.title||''}</div>
-      <div style="font-size:10px;color:var(--text2);margin-bottom:8px">${epic.description||''}</div>
-      ${(epic.stories||[]).map(s => `
-        <div style="background:var(--surface3);border-radius:4px;padding:8px 10px;margin-bottom:4px;margin-left:12px">
-          <div style="font-size:10px;font-weight:700;margin-bottom:3px">📌 ${s.title||''}</div>
-          <div style="font-size:9px;color:var(--text2)">${s.description||''}</div>
-          <div style="font-size:9px;color:var(--text3);margin-top:4px">${(s.acceptance_criteria||[]).map(a=>`• ${a}`).join(' ')}</div>
-        </div>`).join('')}
-    </div>`;
+  return `<div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px">
+    <div style="font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px">📋 ${epic.title||''}</div>
+    <div style="font-size:10px;color:var(--text2);margin-bottom:8px">${epic.description||''}</div>
+    ${(epic.stories||[]).map(s=>`<div style="background:var(--surface3);border-radius:4px;padding:8px 10px;margin-bottom:4px;margin-left:12px">
+      <div style="font-size:10px;font-weight:700;margin-bottom:3px">📌 ${s.title||''} <span style="color:var(--text3);font-size:8px">(${s.story_points||'?'} pts)</span></div>
+      <div style="font-size:9px;color:var(--text2)">${s.description||''}</div>
+      ${s.acceptance_criteria?.length?`<div style="font-size:9px;color:var(--text3);margin-top:4px"><strong>AC:</strong> ${s.acceptance_criteria.map(a=>`• ${a}`).join(' ')}</div>`:''}
+    </div>`).join('')}
+  </div>`;
 }
 
 function runbookStep(step) {
-  return `
-    <div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px;display:flex;gap:12px;align-items:flex-start">
-      <span style="color:var(--accent);font-weight:700;font-size:13px;min-width:20px">${step.step}</span>
-      <div>
-        <div style="font-size:11px;margin-bottom:3px">${step.repo||''} — ${step.action||''}</div>
-        ${step.command ? `<code style="font-size:9px;color:var(--text3);background:var(--surface3);padding:2px 6px;border-radius:3px">${step.command}</code>` : ''}
-      </div>
-    </div>`;
+  return `<div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px;display:flex;gap:12px;align-items:flex-start">
+    <span style="color:var(--accent);font-weight:700;font-size:13px;min-width:20px">${step.step}</span>
+    <div style="flex:1">
+      <div style="font-size:11px;margin-bottom:3px">${step.repo||''} — ${step.action||''}</div>
+      ${step.command?`<code style="font-size:9px;color:var(--text3);background:var(--surface3);padding:2px 6px;border-radius:3px;display:inline-block">${step.command}</code>`:''}
+    </div>
+  </div>`;
 }
 
 function approvalZone(threadId) {
-  return `
-    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
-      <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px">Human Review Required</div>
-      <input class="feedback-input" id="feedback-${threadId}" placeholder="Optional feedback or notes...">
-      <div style="display:flex;gap:10px">
-        <button class="btn-approve" onclick="approvePipeline('${threadId}', true)">✓ Approve & Continue</button>
-        <button class="btn-reject" onclick="approvePipeline('${threadId}', false)">✗ Reject</button>
-      </div>
-    </div>`;
+  return `<div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
+    <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px">Human Review Required</div>
+    <input class="feedback-input" id="feedback-${threadId}" placeholder="Optional feedback or notes...">
+    <div style="display:flex;gap:10px">
+      <button class="btn-approve" onclick="approvePipeline('${threadId}', true)">✓ Approve & Continue</button>
+      <button class="btn-reject" onclick="approvePipeline('${threadId}', false)">✗ Reject</button>
+    </div>
+  </div>`;
 }
 
 function esc(str) {
-  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}  
+  return (str||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+} 
 
 function selectThread(tid) {
   selectedThread = tid;
