@@ -26,6 +26,21 @@ from api.runbook_export import (
 import zipfile
 
 load_dotenv()
+from api.persistence import (
+    init_persistence_tables, save_pipeline, load_all_pipelines,
+    audit, get_audit_log
+)
+
+# Initialize on startup
+init_persistence_tables()
+
+# Restore pipelines from DB on server start
+try:
+    restored = load_all_pipelines()
+    pipeline_store.update(restored)
+    print(f"[Startup] Restored {len(restored)} pipelines from DB")
+except Exception as e:
+    print(f"[Startup] DB restore failed: {e}")
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -177,65 +192,90 @@ def pipeline_start(req: StartRequest, background_tasks: BackgroundTasks):
 @app.get("/pipeline/status/{thread_id}")
 def pipeline_status(thread_id: str):
     if thread_id not in pipeline_store:
-        raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
-
+        raise HTTPException(404, f"Thread {thread_id} not found")
     entry = pipeline_store[thread_id]
-
     return {
         "thread_id": thread_id,
-        "phase": entry["phase"],
-        "status": entry["status"],
+        "phase": entry.get("phase", ""),
+        "status": entry.get("status", ""),
         "sub_stage": entry.get("sub_stage", ""),
-        "requirement": entry["requirement"],
+        "requirement": entry.get("requirement", ""),
         "pr_urls": entry.get("pr_urls", []),
         "error": entry.get("error"),
+        "is_new_project": entry.get("current_state", {}).get("is_new_project", False),
+        "selected_repos": entry.get("current_state", {}).get("selected_repos", []),
         "current_state": _safe_state(entry.get("current_state", {}))
     }
 
 
 @app.post("/pipeline/approve/{thread_id}")
-def pipeline_approve(thread_id: str, req: ApproveRequest, background_tasks: BackgroundTasks):
-    """
-    Resume pipeline after human approval.
-    Call this when human approves or rejects at any gate.
-    """
+def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: BackgroundTasks = None):
     if thread_id not in pipeline_store:
-        raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
+        raise HTTPException(404, "Not found")
+
+    approved = body.get("approved", False)
+    feedback = body.get("feedback", "")
+    actor = body.get("actor", "user")
 
     entry = pipeline_store[thread_id]
+    current_phase = entry.get("phase", "1")
 
-    if "WAITING" not in entry["status"] and "INTERRUPT" not in entry["status"]:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": f"Pipeline is not waiting for approval. Current status: {entry['status']}"
-            }
-        )
+    if not approved:
+        # REJECTION — regenerate current phase with feedback
+        audit(thread_id, f"phase{current_phase}", "REJECTED", actor,
+              {"feedback": feedback})
 
-    if not req.approved:
-        pipeline_store[thread_id]["status"] = "REJECTED_BY_HUMAN"
-        pipeline_store[thread_id]["error"] = f"Rejected at phase {entry['phase']}: {req.feedback}"
+        entry["status"] = "REGENERATING"
+        entry["sub_stage"] = f"Regenerating Phase {current_phase} with feedback..."
+        entry["human_feedback"] = feedback
+        save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
+
+        if current_phase == "1":
+            background_tasks.add_task(run_phase1, thread_id, entry["requirement"], feedback)
+        elif current_phase == "2":
+            background_tasks.add_task(run_phase2, thread_id, feedback)
+        elif current_phase == "3":
+            background_tasks.add_task(run_phase3, thread_id, feedback)
+        elif current_phase == "6":
+            background_tasks.add_task(run_phase6, thread_id, feedback)
+        elif current_phase == "7":
+            background_tasks.add_task(run_phase7, thread_id, feedback)
+
         return {
-            "thread_id": thread_id,
-            "status": "REJECTED_BY_HUMAN",
-            "message": f"Pipeline rejected at phase {entry['phase']}"
+            "status": "REGENERATING",
+            "phase": current_phase,
+            "feedback_applied": feedback
         }
 
-    # Resume in background
-    background_tasks.add_task(
-        resume_current_phase,
-        thread_id,
-        req.approved,
-        req.feedback or ""
-    )
+    # APPROVAL
+    audit(thread_id, f"phase{current_phase}", "APPROVED", actor,
+          {"feedback": feedback})
+
+    entry["status"] = f"PHASE_{current_phase}_APPROVED"
+    entry["sub_stage"] = f"Phase {current_phase} approved — proceeding..."
+    save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
+
+    # Continue to next phase
+    next_phase = str(int(current_phase) + 1)
+    entry["phase"] = next_phase
+
+    if next_phase == "2":
+        background_tasks.add_task(run_phase2, thread_id, "")
+    elif next_phase == "3":
+        background_tasks.add_task(run_phase3, thread_id, "")
+    elif next_phase == "4":
+        background_tasks.add_task(run_phase4, thread_id)
+    elif next_phase == "5":
+        background_tasks.add_task(run_phase5, thread_id)
+    elif next_phase == "6":
+        background_tasks.add_task(run_phase6, thread_id, "")
+    elif next_phase == "7":
+        background_tasks.add_task(run_phase7, thread_id, "")
 
     return {
-        "thread_id": thread_id,
-        "status": "RESUMING",
-        "message": "Approval received. Pipeline resuming.",
-        "next": f"/pipeline/status/{thread_id}"
+        "status": "APPROVED",
+        "next_phase": next_phase
     }
-
 
 @app.get("/pipeline/list")
 def pipeline_list():
@@ -453,17 +493,19 @@ def knowledge_repos():
 
 
 # ── Background Tasks ──────────────────────────────────────────────────────────
-def run_phase1(thread_id: str, requirement: str):
+def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
         from agents.phase1_discovery.discovery_agent import (
             build_discovery_graph, DiscoveryState
         )
 
         pipeline_store[thread_id]["status"] = "PHASE_1_RUNNING"
         pipeline_store[thread_id]["sub_stage"] = "Generating BRD..."
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(pipeline_store[thread_id].get("current_state", {})))
+        audit(thread_id, "phase1", "PHASE_STARTED")
 
         graph = build_discovery_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p1"}}
@@ -471,45 +513,49 @@ def run_phase1(thread_id: str, requirement: str):
         initial_state = DiscoveryState(
             requirement=requirement,
             brd={}, prd={}, adr={}, architecture={},
-            human_feedback="", approved=False,
+            human_feedback=feedback,
+            approved=False,
             status="STARTED"
         )
 
-        # Stream node by node so we can save state after each
         for chunk in graph.stream(initial_state, config, stream_mode="updates"):
             for node_name, node_state in chunk.items():
+                if not isinstance(node_state, dict):
+                    continue
 
-                # Save state after each node completes
-                current = pipeline_store[thread_id].get("current_state", {})
+                current = pipeline_store[thread_id].get("current_state", {}) or {}
                 current.update(node_state)
                 pipeline_store[thread_id]["current_state"] = current
 
                 if node_name == "generate_brd":
                     pipeline_store[thread_id]["sub_stage"] = "BRD Done — Generating PRD..."
                     pipeline_store[thread_id]["status"] = "PHASE_1_BRD_DONE"
-
+                    audit(thread_id, "phase1", "BRD_GENERATED",
+                          details={"title": node_state.get("brd", {}).get("title", "")})
                 elif node_name == "generate_prd":
                     pipeline_store[thread_id]["sub_stage"] = "PRD Done — Generating ADR..."
                     pipeline_store[thread_id]["status"] = "PHASE_1_PRD_DONE"
-
+                    audit(thread_id, "phase1", "PRD_GENERATED",
+                          details={"frs": len(node_state.get("prd", {}).get("functional_requirements", []))})
                 elif node_name == "generate_adr":
                     pipeline_store[thread_id]["sub_stage"] = "ADR Done — Generating Architecture..."
                     pipeline_store[thread_id]["status"] = "PHASE_1_ADR_DONE"
-
+                    audit(thread_id, "phase1", "ADR_GENERATED",
+                          details={"decisions": len(node_state.get("adr", {}).get("decisions", []))})
                 elif node_name == "generate_architecture":
                     pipeline_store[thread_id]["sub_stage"] = "Architecture Done — Awaiting Approval"
                     pipeline_store[thread_id]["status"] = "WAITING_PHASE_1_APPROVAL"
+                    audit(thread_id, "phase1", "ARCHITECTURE_GENERATED",
+                          details={"nodes": len(node_state.get("architecture", {}).get("nodes", []))})
 
-                elif node_name == "__interrupt__":
-                    pipeline_store[thread_id]["status"] = "WAITING_PHASE_1_APPROVAL"
-                    pipeline_store[thread_id]["graph"] = graph
-                    pipeline_store[thread_id]["config"] = config
-                    return
+                save_pipeline(thread_id, pipeline_store[thread_id],
+                              _safe_state(pipeline_store[thread_id]["current_state"]))
 
-        # If we exit stream without interrupt (shouldn't happen)
         pipeline_store[thread_id]["status"] = "WAITING_PHASE_1_APPROVAL"
         pipeline_store[thread_id]["graph"] = graph
         pipeline_store[thread_id]["config"] = config
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(pipeline_store[thread_id]["current_state"]))
 
     except Exception as e:
         import traceback
@@ -518,7 +564,9 @@ def run_phase1(thread_id: str, requirement: str):
             "status": "ERROR",
             "error": f"Phase 1 error: {str(e)}"
         })
-
+        audit(thread_id, "phase1", "ERROR", details={"error": str(e)})
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(pipeline_store[thread_id].get("current_state", {})))
 
 def resume_current_phase(thread_id: str, approved: bool, feedback: str):
     """Resume whichever phase is currently waiting."""
@@ -825,6 +873,10 @@ def _safe_state(state: dict) -> dict:
             except Exception:
                 result[k] = str(v)
     return result
+
+@app.get("/pipeline/{thread_id}/audit")
+def pipeline_audit(thread_id: str):
+    return {"thread_id": thread_id, "audit_log": get_audit_log(thread_id)}
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────

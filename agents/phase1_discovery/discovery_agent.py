@@ -1,226 +1,186 @@
-"""
-Phase 1 — Discovery Agent
-Generates BRD, PRD, ADR from raw business requirement.
-Human approval INTERRUPT after PRD generated.
-"""
-
 import os
+import sys
 import json
 import re
-from typing import TypedDict
+sys.path.insert(0, r"C:\Users\user\SDLC-V2")
+
+from openai import OpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt
-from groq import Groq
-from langgraph.types import Command
+from typing import TypedDict, Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from openai import OpenAI
-
-# Replace Groq client with DeepSeek
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com"
 )
 
 
-# -----------------------------------------
-# State
-# -----------------------------------------
-
 class DiscoveryState(TypedDict):
     requirement: str
-    brd: dict
-    prd: dict
-    adr: dict
-    architecture: dict 
+    brd: Dict[str, Any]
+    prd: Dict[str, Any]
+    adr: Dict[str, Any]
+    architecture: Dict[str, Any]
     human_feedback: str
     approved: bool
     status: str
 
 
-# -----------------------------------------
-# LLM Helper
-# -----------------------------------------
-
-def call_llm(prompt: str) -> dict:
+def _llm_json(prompt: str, max_tokens: int = 4096) -> dict:
     response = client.chat.completions.create(
-        model="deepseek-v4-pro",
+        model="deepseek-chat",
         messages=[{"role": "user", "content": prompt}],
-        stream=False,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}}
+        max_tokens=max_tokens
     )
     content = response.choices[0].message.content.strip()
-
-    # Strip markdown fences
     if content.startswith("```"):
         content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
-
-    # First attempt
     try:
         return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-
-    # Find JSON object boundaries and extract
-    try:
-        start = content.find('{')
-        end = content.rfind('}') + 1
-        if start >= 0 and end > start:
-            return json.loads(content[start:end])
     except Exception:
-        pass
+        try:
+            start = content.find('{')
+            end = content.rfind('}') + 1
+            return json.loads(content[start:end])
+        except Exception:
+            return {}
 
-    # Last resort — return raw
-    return {"raw": content}
 
+def _feedback_block(state) -> str:
+    fb = state.get("human_feedback", "")
+    if fb:
+        return f"\n\nIMPORTANT — USER FEEDBACK on previous attempt (you MUST address all of this):\n{fb}\n"
+    return ""
 
-# -----------------------------------------
-# Nodes
-# -----------------------------------------
 
 def generate_brd(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating BRD...")
 
-    brd = call_llm(f"""
-You are a senior Business Analyst.
-Generate a complete BRD for this requirement.
-Return ONLY valid JSON with these fields:
+    brd = _llm_json(f"""
+You are a Senior Business Analyst.
+Generate a comprehensive BRD as JSON.
+{_feedback_block(state)}
+Return ONLY valid JSON:
 {{
-  "title": "...",
-  "business_objectives": ["..."],
-  "scope": {{"in_scope": ["..."], "out_of_scope": ["..."]}},
-  "functional_requirements": [{{"id": "FR1", "title": "...", "description": "...", "priority": "High"}}],
-  "non_functional_requirements": [{{"id": "NFR1", "title": "...", "description": "..."}}],
-  "stakeholders": ["..."],
-  "assumptions": ["..."],
-  "risks": ["..."]
+  "title": "Project title",
+  "executive_summary": "2-3 paragraph summary",
+  "business_objectives": ["objective 1", "objective 2", "..."],
+  "in_scope": ["item 1", "item 2", "..."],
+  "out_of_scope": ["item 1", "..."],
+  "stakeholders": ["stakeholder 1", "..."],
+  "functional_requirements": [
+    {{"id": "FR1", "title": "...", "description": "...", "priority": "High"}}
+  ],
+  "non_functional_requirements": [
+    {{"id": "NFR1", "title": "...", "description": "...", "priority": "High"}}
+  ],
+  "assumptions": ["assumption 1", "..."],
+  "risks": ["risk 1", "..."],
+  "success_criteria": ["criterion 1", "..."]
 }}
 
-Requirement: {state['requirement']}
+Requirement:
+{state['requirement']}
 """)
 
-    print(f"  ✅ BRD generated: {brd.get('title', 'untitled')}")
+    if not brd.get("title"):
+        brd["title"] = "Untitled Project"
+
+    print(f"  ✅ BRD generated: {brd.get('title')}")
     return {**state, "brd": brd, "status": "BRD_GENERATED"}
 
 
 def generate_prd(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating PRD...")
 
-    response = client.chat.completions.create(
-        model="deepseek-v4-pro",
-        messages=[{"role": "user", "content": f"""
-You are a Product Owner.
-Generate a PRD from this BRD.
-Return ONLY valid JSON — no markdown, no explanation.
-Be concise — max 3 acceptance criteria per requirement.
-
+    brd = state["brd"]
+    prd = _llm_json(f"""
+You are a Senior Product Owner.
+Generate a detailed PRD from this BRD.
+{_feedback_block(state)}
+Return ONLY valid JSON:
 {{
   "title": "...",
-  "product_vision": "...",
+  "product_vision": "one paragraph",
   "functional_requirements": [
-    {{
-      "id": "FR1",
-      "title": "...",
-      "description": "...",
-      "priority": "High",
-      "acceptance_criteria": ["...", "..."]
-    }}
+    {{"id": "FR1", "title": "...", "description": "...", "priority": "High",
+      "acceptance_criteria": ["AC1", "AC2", "AC3"]}}
   ],
   "non_functional_requirements": [
-    {{
-      "id": "NFR1",
-      "title": "...",
-      "description": "...",
-      "priority": "High"
-    }}
+    {{"id": "NFR1", "title": "...", "description": "...", "priority": "High"}}
   ],
   "technical_requirements": [
-    {{
-      "id": "TR1",
-      "title": "...",
-      "description": "..."
-    }}
+    {{"id": "TR1", "title": "...", "description": "..."}}
   ],
   "stakeholders": ["..."],
   "scope": "..."
 }}
 
-BRD Title: {state['brd'].get('title', '')}
-BRD Objectives: {json.dumps(state['brd'].get('business_objectives', []))}
-BRD Functional Requirements: {json.dumps(state['brd'].get('functional_requirements', []))}
-BRD Non-Functional Requirements: {json.dumps(state['brd'].get('non_functional_requirements', []))}
-"""}],
-        max_tokens=4096
-    )
+Minimum 5 FRs, 4 NFRs, 3 TRs.
 
-    content = response.choices[0].message.content.strip()
-    if content.startswith("```"):
-        content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
+BRD Title: {brd.get('title','')}
+BRD Objectives: {json.dumps(brd.get('business_objectives', []))}
+BRD Functional Requirements: {json.dumps(brd.get('functional_requirements', []))}
+BRD Non-Functional Requirements: {json.dumps(brd.get('non_functional_requirements', []))}
+""")
 
-    try:
-        prd = json.loads(content)
-    except Exception:
-        try:
-            start = content.find('{')
-            end = content.rfind('}') + 1
-            prd = json.loads(content[start:end])
-        except Exception:
-            prd = {}
-
-    # Normalise keys
     if not prd.get("title"):
-        prd["title"] = prd.get("projectTitle") or state['brd'].get('title', 'Untitled')
-    if not prd.get("functional_requirements"):
-        prd["functional_requirements"] = prd.get("functionalRequirements") or []
-    if not prd.get("non_functional_requirements"):
-        prd["non_functional_requirements"] = prd.get("nonFunctionalRequirements") or []
-    if not prd.get("technical_requirements"):
-        prd["technical_requirements"] = prd.get("technicalRequirements") or []
-    if not prd.get("product_vision"):
-        prd["product_vision"] = prd.get("productVision") or ""
+        prd["title"] = brd.get("title", "Untitled")
+    for k in ["functional_requirements", "non_functional_requirements", "technical_requirements"]:
+        if not prd.get(k):
+            prd[k] = []
 
-    print(f"  ✅ PRD: {prd.get('title')} — {len(prd.get('functional_requirements', []))} FRs, {len(prd.get('non_functional_requirements', []))} NFRs")
+    print(f"  ✅ PRD: {prd['title']} — {len(prd['functional_requirements'])} FRs, {len(prd['non_functional_requirements'])} NFRs")
     return {**state, "prd": prd, "status": "PRD_GENERATED"}
+
 
 def generate_adr(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating ADR...")
 
-    adr = call_llm(f"""
-You are a senior software architect.
-Generate Architecture Decision Records for this requirement.
+    prd = state["prd"]
+    adr = _llm_json(f"""
+You are a Senior Software Architect.
+Generate Architecture Decision Records (ADRs) for this product.
+{_feedback_block(state)}
 Return ONLY valid JSON:
 {{
   "decisions": [
     {{
       "id": "ADR-001",
-      "title": "...",
-      "status": "Accepted",
-      "context": "...",
-      "decision": "...",
-      "consequences": ["..."],
-      "alternatives_considered": ["..."]
+      "title": "Decision title",
+      "context": "Why this decision was needed",
+      "decision": "What was decided",
+      "consequences": ["consequence 1", "consequence 2"],
+      "status": "Accepted"
     }}
   ]
 }}
 
-Requirement: {state['requirement']}
-PRD Summary: {state['prd'].get('product_vision', '')}
+Minimum 5 decisions covering: tech stack, data store, deployment platform,
+authentication, monitoring/observability.
+
+Project: {prd.get('title','')}
+Functional Requirements: {json.dumps(prd.get('functional_requirements', [])[:5])}
+Non-Functional Requirements: {json.dumps(prd.get('non_functional_requirements', [])[:5])}
 """)
 
-    print(f"  ✅ ADR generated: {len(adr.get('decisions', []))} decisions")
+    if not adr.get("decisions"):
+        adr["decisions"] = []
+
+    print(f"  ✅ ADR generated: {len(adr['decisions'])} decisions")
     return {**state, "adr": adr, "status": "ADR_GENERATED"}
+
 
 def generate_architecture(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating architecture design...")
 
     prd = state["prd"]
-    brd = state["brd"]
 
-    # Build canonical requirement list exactly like V1
+    # Build canonical requirement list (V1 pattern)
     functional_reqs = []
     for r in prd.get("functional_requirements", []):
         if isinstance(r, dict):
@@ -239,18 +199,17 @@ def generate_architecture(state: DiscoveryState) -> DiscoveryState:
         elif isinstance(r, str):
             non_functional_reqs.append(r)
 
-    project_name = prd.get("title") or brd.get("title") or "SYSTEM"
+    project_name = prd.get("title", "SYSTEM")
 
-    arch = call_llm(f"""
+    arch = _llm_json(f"""
 You are a strict software architect.
-
+{_feedback_block(state)}
 RULES:
-1. Every node MUST be justified by one of the functional or non-functional requirements listed below.
-2. Do NOT invent technologies not implied by the requirements.
-3. If requirements are simple, architecture must remain simple.
-4. 4-8 nodes maximum.
-5. Every node MUST include "traced_to" — copy the exact requirement text it fulfils.
-6. Return ONLY valid JSON. No markdown. No explanation.
+1. Every node MUST be justified by a functional or non-functional requirement
+2. Do NOT invent technologies not implied by requirements
+3. 4-8 nodes maximum
+4. Every node MUST include "traced_to" — the exact requirement text it fulfils
+5. Return ONLY valid JSON
 
 Project: {project_name}
 
@@ -260,64 +219,42 @@ Functional Requirements:
 Non-Functional Requirements:
 {json.dumps(non_functional_reqs, indent=2)}
 
-Return this exact JSON structure:
+Return:
 {{
-  "project_name": "{project_name}",
+  "system_name": "{project_name}",
   "architecture_style": "microservices | monolith | layered | event-driven",
+  "deployment_model": "kubernetes | docker | serverless | vm",
   "nodes": [
     {{
       "id": "UPPERCASE_ID",
-      "name": "Human Readable Name",
+      "name": "Human Name",
       "type": "service | database | external | queue | cache",
       "zone": "external | core | data | observability",
-      "description": "What this component does",
-      "tech_stack": ["Technology1", "Technology2"],
-      "traced_to": "exact requirement text this node fulfils"
+      "description": "What it does",
+      "tech_stack": ["Tech1", "Tech2"],
+      "responsibilities": ["resp1", "resp2"],
+      "traced_to": "exact requirement text"
     }}
   ],
   "edges": [
     {{
-      "source": "NODE_ID",
-      "target": "NODE_ID",
+      "source": "ID",
+      "target": "ID",
       "protocol": "REST | gRPC | Kafka | SQL | HTTPS | internal",
-      "description": "what flows between these nodes"
+      "description": "what flows"
     }}
   ],
   "security_considerations": ["..."],
-  "deployment_model": "kubernetes | vm | docker | serverless",
   "scalability_notes": "..."
 }}
 """)
-    
 
-    if isinstance(arch, dict) and "raw" in arch and len(arch) == 1:
-        raw_str = arch["raw"]
-        raw_str = raw_str.replace('\u2011', '-').replace('\u2010', '-').replace('\u2013', '-').replace('\u2014', '-')
-        try:
-            start = raw_str.find('{')
-            end = raw_str.rfind('}') + 1
-            arch = json.loads(raw_str[start:end])
-        except Exception:
-            arch = {"nodes": [], "edges": []}
-    # Validate — remove nodes not traced to any requirement (V1 approach)
-    all_reqs = functional_reqs + non_functional_reqs
-    valid_nodes = []
-    for node in arch.get("nodes", []):
-        traced = node.get("traced_to", "")
-        # Accept if traced_to contains words from any requirement
-        if traced and any(
-            any(word.lower() in traced.lower() for word in req.split()[:5])
-            for req in all_reqs
-        ):
-            valid_nodes.append(node)
-        else:
-            # Keep it but flag it
-            node["traced_to"] = node.get("traced_to", "implicit requirement")
-            valid_nodes.append(node)
+    if not arch.get("nodes"):
+        arch["nodes"] = []
+    if not arch.get("edges"):
+        arch["edges"] = []
 
-    arch["nodes"] = valid_nodes
-
-    # Generate mermaid diagram deterministically (V1 diagram_generator approach)
+    # Generate mermaid deterministically (V1 pattern)
     mermaid_lines = ["graph TD"]
     for node in arch.get("nodes", []):
         nid = node["id"]
@@ -328,7 +265,7 @@ Return this exact JSON structure:
         elif ntype == "external":
             mermaid_lines.append(f'  {nid}(["{name}"])')
         elif ntype == "queue":
-            mermaid_lines.append(f'  {nid}>"{name}"]')
+            mermaid_lines.append(f'  {nid}{{{{"{name}"}}}}')
         else:
             mermaid_lines.append(f'  {nid}["{name}"]')
 
@@ -340,151 +277,42 @@ Return this exact JSON structure:
 
     arch["mermaid"] = "\n".join(mermaid_lines)
 
-    print(f"  ✅ Architecture: {len(arch.get('nodes', []))} nodes, {len(arch.get('edges', []))} edges")
-    print(f"  ✅ Mermaid diagram generated")
+    print(f"  ✅ Architecture: {len(arch['nodes'])} nodes, {len(arch['edges'])} edges")
     return {**state, "architecture": arch, "status": "ARCHITECTURE_GENERATED"}
 
 
 def human_approval_gate(state: DiscoveryState) -> DiscoveryState:
-    print("\n[Phase 1] ⏸ Waiting for human approval...")
-    print(f"  BRD: {state['brd'].get('title', '')}")
-    print(f"  PRD: {state['prd'].get('title', '') or state['prd'].get('projectTitle', '')}")
-    print(f"  ADR decisions: {len(state['adr'].get('decisions', []))}")
-
-    # INTERRUPT — human responds with approved True/False
-    human_input = interrupt("Waiting for human approval")
-
-    # human_input contains what was passed in resume
-    approved = human_input.get("approved", False) if isinstance(human_input, dict) else False
-    feedback = human_input.get("feedback", "") if isinstance(human_input, dict) else ""
-
-    return {
-        **state,
-        "approved": approved,
-        "human_feedback": feedback,
-        "status": "WAITING_FOR_APPROVAL"
-    }
+    interrupt({
+        "type": "DISCOVERY_REVIEW",
+        "brd": state["brd"],
+        "prd": state["prd"],
+        "adr": state["adr"],
+        "architecture": state["architecture"]
+    })
+    return state
 
 
 def process_approval(state: DiscoveryState) -> DiscoveryState:
-    approved = state.get("approved", False)
-    feedback = state.get("human_feedback", "")
-
-    if approved:
-        print(f"\n[Phase 1] ✅ Approved — moving to Phase 2")
+    if state.get("approved"):
         return {**state, "status": "APPROVED_FOR_PLANNING"}
-    else:
-        print(f"\n[Phase 1] ❌ Rejected — {feedback}")
-        return {**state, "status": "REJECTED"}
+    return {**state, "status": "REJECTED"}
 
-
-# -----------------------------------------
-# Routing
-# -----------------------------------------
-
-def route_after_approval(state: DiscoveryState) -> str:
-    if state["status"] == "APPROVED_FOR_PLANNING":
-        return "approved"
-    return "rejected"
-
-
-# -----------------------------------------
-# Build Graph
-# -----------------------------------------
 
 def build_discovery_graph():
-    builder = StateGraph(DiscoveryState)
+    g = StateGraph(DiscoveryState)
+    g.add_node("generate_brd", generate_brd)
+    g.add_node("generate_prd", generate_prd)
+    g.add_node("generate_adr", generate_adr)
+    g.add_node("generate_architecture", generate_architecture)
+    g.add_node("human_approval_gate", human_approval_gate)
+    g.add_node("process_approval", process_approval)
 
-    builder.add_node("generate_brd", generate_brd)
-    builder.add_node("generate_prd", generate_prd)
-    builder.add_node("generate_adr", generate_adr)
-    builder.add_node("generate_architecture", generate_architecture)
-    builder.add_node("human_approval_gate", human_approval_gate)
-    builder.add_node("process_approval", process_approval)
+    g.set_entry_point("generate_brd")
+    g.add_edge("generate_brd", "generate_prd")
+    g.add_edge("generate_prd", "generate_adr")
+    g.add_edge("generate_adr", "generate_architecture")
+    g.add_edge("generate_architecture", "human_approval_gate")
+    g.add_edge("human_approval_gate", "process_approval")
+    g.add_edge("process_approval", END)
 
-    builder.set_entry_point("generate_brd")
-    builder.add_edge("generate_brd", "generate_prd")
-    builder.add_edge("generate_prd", "generate_adr")
-    builder.add_edge("generate_adr", "generate_architecture")           # ← NEW
-    builder.add_edge("generate_architecture", "human_approval_gate") 
-    builder.add_edge("human_approval_gate", "process_approval")
-
-    builder.add_conditional_edges(
-        "process_approval",
-        route_after_approval,
-        {
-            "approved": END,
-            "rejected": END
-        }
-    )
-
-    memory = MemorySaver()
-    return builder.compile(
-        checkpointer=memory,
-        interrupt_before=["human_approval_gate"]  # pause BEFORE approval node
-    )
-
-
-# -----------------------------------------
-# Run
-# -----------------------------------------
-
-def start_discovery(requirement: str, thread_id: str = "thread-1"):
-    graph = build_discovery_graph()
-    config = {"configurable": {"thread_id": thread_id}}
-
-    initial_state = DiscoveryState(
-        requirement=requirement,
-        brd={},
-        prd={},
-        adr={},
-        architecture={},
-        human_feedback="",
-        approved=False,
-        status="STARTED"
-    )
-
-    print("\n" + "="*50)
-    print("--- Starting Phase 1 — Discovery ---")
-    print("="*50)
-
-    # Run until INTERRUPT
-    result = graph.invoke(initial_state, config)
-    print(f"\nStatus after interrupt: {result['status']}")
-    print(f"BRD: {result['brd'].get('title', '')}")
-    print(f"PRD: {result['prd'].get('title', '')}")
-
-    return graph, config, result
-
-
-def resume_discovery(graph, config, approved: bool, feedback: str = ""):
-    print(f"\n--- Resuming Phase 1 (approved={approved}) ---")
-
-    result = graph.invoke(
-        Command(resume={"approved": approved, "feedback": feedback}),
-        config
-    )
-
-    print(f"Final status: {result['status']}")
-    return result
-
-
-# -----------------------------------------
-# Test
-# -----------------------------------------
-
-if __name__ == "__main__":
-    requirement = "Add leave balance tracker to Leave Management System. Each employee gets 20 days per year. Balance decreases when leave is approved."
-
-    graph, config, result = start_discovery(requirement)
-
-    print(f"\nPaused at: {result['status']}")
-    print(f"BRD: {result['brd'].get('title')}")
-    print(f"PRD requirements: {len(result['prd'].get('functional_requirements', []))}")
-    print(f"ADR decisions: {len(result['adr'].get('decisions', []))}")
-
-    print("\n--- Simulating Human Approval ---")
-    final = resume_discovery(graph, config, approved=True, feedback="Looks good")
-
-    print(f"\n✅ Phase 1 Complete")
-    print(f"Final status: {final['status']}")
+    return g.compile(checkpointer=MemorySaver())

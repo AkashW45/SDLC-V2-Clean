@@ -42,6 +42,28 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
+
+  sdlc_api:
+    build: .
+    container_name: sdlc_api
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: sdlc_postgres
+      POSTGRES_PORT: 5432
+      QDRANT_HOST: sdlc_qdrant
+      QDRANT_PORT: 6333
+      NEO4J_URI: bolt://sdlc_neo4j:7687
+    depends_on:
+      - sdlc_postgres
+      - sdlc_qdrant
+      - sdlc_neo4j
+    volumes:
+      - ./repos:/repos
+    restart: unless-stopped  
+
 volumes:
   qdrant_data:
   neo4j_data:

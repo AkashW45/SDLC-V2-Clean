@@ -1,281 +1,172 @@
-"""
-Phase 0 — Project & Repo Selector
-Finds the right project and repos for a given requirement.
-Human confirms the selection before pipeline continues.
-"""
-
-"""
-Phase 0 — Project & Repo Selector
-Finds the right project and repos for a given requirement.
-Human confirms the selection before pipeline continues.
-"""
-
 import os
 import sys
-
-# Add project root to path
+import re
 sys.path.insert(0, r"C:\Users\user\SDLC-V2")
 
-from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
-from dotenv import load_dotenv
+from typing import TypedDict, List, Dict, Any
+from qdrant_client import QdrantClient
+from sentence_transformers import SentenceTransformer
+import psycopg2
+import json
 
-load_dotenv()
-
-
-# -----------------------------------------
-# State
-# -----------------------------------------
 
 class SelectorState(TypedDict):
     requirement: str
-    candidate_projects: list
-    selected_project: dict
-    selected_repos: list
-    human_feedback: str
-    approved: bool
+    candidates: List[Dict[str, Any]]
+    selected_project: Dict[str, Any]
+    selected_repos: List[Dict[str, Any]]
+    is_new_project: bool
+    human_input: Dict[str, Any]
     status: str
 
 
-# -----------------------------------------
-# Nodes
-# -----------------------------------------
-
-def search_projects(state: SelectorState) -> SelectorState:
-    """Semantic search to find top candidate projects."""
-    print("\n[Phase 0] Searching for matching projects...")
-    import sys
-    sys.path.insert(0, r"C:\Users\user\SDLC-V2")
-
-    from knowledge_layer.project_registry import search_projects as do_search
-
-    candidates = do_search(state["requirement"], top_k=3)
-
-    print(f"  Found {len(candidates)} candidate projects:")
-    for i, c in enumerate(candidates, 1):
-        print(f"  {i}. {c['project_name']} (score: {c['score']})")
-        print(f"     Repos: {', '.join(c['repos'])}")
-
-    return {
-        **state,
-        "candidate_projects": candidates,
-        "status": "PROJECTS_FOUND"
-    }
+def get_qdrant():
+    return QdrantClient(url="http://127.0.0.1:6333", timeout=60)
 
 
-def auto_select_project(state: SelectorState) -> SelectorState:
-    """
-    Auto-select top scoring project if score is high enough.
-    If top score > 0.4 — auto select.
-    If top score < 0.4 — flag for human to decide.
-    """
-    candidates = state["candidate_projects"]
-
-    if not candidates:
-        print("  ⚠️  No projects found — human must specify")
-        return {**state, "status": "NO_PROJECT_FOUND"}
-
-    top = candidates[0]
-
-    if top["score"] >= 0.4:
-        print(f"\n[Phase 0] Auto-selected: {top['project_name']} (score: {top['score']})")
-        return {
-            **state,
-            "selected_project": top,
-            "selected_repos": top["repos"],
-            "status": "PROJECT_AUTO_SELECTED"
-        }
-    else:
-        print(f"\n[Phase 0] Low confidence ({top['score']}) — human selection needed")
-        return {
-            **state,
-            "selected_project": top,
-            "selected_repos": top["repos"],
-            "status": "PROJECT_NEEDS_CONFIRMATION"
-        }
+def get_postgres():
+    return psycopg2.connect(
+        host="127.0.0.1", port=5433,
+        user="sdlc", password="sdlc1234",
+        dbname="sdlc_knowledge"
+    )
 
 
-def human_approval_gate(state: SelectorState) -> SelectorState:
-    """Human confirms project and repo selection."""
-    print("\n[Phase 0] ⏸ Waiting for project selection confirmation...")
+_embedder = None
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embedder
 
-    candidates = state["candidate_projects"]
-    selected = state["selected_project"]
 
-    print(f"\n  Top match: {selected['project_name']}")
-    print(f"  Repos: {', '.join(selected['repos'])}")
-    print(f"  Score: {selected['score']}")
+def search_projects(requirement: str, top_k: int = 3):
+    qdrant = get_qdrant()
+    embedder = get_embedder()
 
-    human_input = interrupt({
-        "message": "Confirm project selection",
-        "candidates": candidates,
-        "auto_selected": selected,
-        "stage": "phase0_project_selection"
-    })
-
-    approved = False
-    feedback = ""
-    override_project_id = None
-
-    if isinstance(human_input, dict):
-        approved = human_input.get("approved", False)
-        feedback = human_input.get("feedback", "")
-        override_project_id = human_input.get("project_id")
-
-    # Handle override — human picked a different project
-    if approved and override_project_id:
-        override = next(
-            (c for c in candidates if c["project_id"] == override_project_id),
-            None
+    try:
+        vector = embedder.encode(requirement).tolist()
+        results = qdrant.query_points(
+            collection_name="project_embeddings",
+            query=vector,
+            limit=top_k,
+            with_payload=True
         )
-        if override:
-            return {
-                **state,
-                "selected_project": override,
-                "selected_repos": override["repos"],
-                "approved": True,
-                "human_feedback": feedback,
-                "status": "PROJECT_CONFIRMED"
-            }
+
+        candidates = []
+        for r in results.points:
+            payload = r.payload or {}
+            candidates.append({
+                "id": payload.get("project_id", ""),
+                "name": payload.get("name", ""),
+                "description": payload.get("description", ""),
+                "repos": payload.get("repos", []),
+                "score": round(r.score, 4)
+            })
+        return candidates
+    except Exception as e:
+        print(f"[Phase 0] Qdrant search failed: {e}")
+        return []
+
+
+def slugify(text: str, max_len: int = 40) -> str:
+    slug = re.sub(r'[^a-z0-9]+', '-', text.lower())[:max_len].strip('-')
+    return slug or "new-project"
+
+
+def select_project_node(state: SelectorState) -> SelectorState:
+    print("\n[Phase 0] Searching for matching project...")
+    requirement = state["requirement"]
+
+    candidates = search_projects(requirement, top_k=3)
+
+    if candidates:
+        print(f"  Found {len(candidates)} candidates:")
+        for c in candidates:
+            print(f"    - {c['name']} (score: {c['score']})")
+
+    if candidates and candidates[0]["score"] >= 0.4:
+        selected = candidates[0]
+        print(f"  ✅ Auto-selected: {selected['name']} (score: {selected['score']})")
+        return {
+            **state,
+            "candidates": candidates,
+            "selected_project": selected,
+            "selected_repos": selected.get("repos", []),
+            "is_new_project": False,
+            "status": "PROJECT_SELECTED"
+        }
+
+    # No good match — create NEW project
+    slug = slugify(requirement)
+    print(f"  🆕 NEW PROJECT — slug: {slug}")
+
+    new_repos = [
+        {
+            "name": f"{slug}-backend",
+            "type": "backend",
+            "language": "python",
+            "url": f"https://github.com/AkashW45/{slug}-backend.git",
+            "exists": False
+        },
+        {
+            "name": f"{slug}-frontend",
+            "type": "frontend",
+            "language": "typescript",
+            "url": f"https://github.com/AkashW45/{slug}-frontend.git",
+            "exists": False
+        }
+    ]
+
+    new_project = {
+        "id": f"new-{slug}",
+        "name": requirement[:60],
+        "description": requirement,
+        "repos": new_repos,
+        "is_new": True,
+        "score": 0.0
+    }
 
     return {
         **state,
-        "approved": approved,
-        "human_feedback": feedback,
-        "status": "WAITING_FOR_CONFIRMATION"
+        "candidates": candidates,
+        "selected_project": new_project,
+        "selected_repos": new_repos,
+        "is_new_project": True,
+        "status": "NEW_PROJECT_CREATED"
     }
+
+
+def human_gate_node(state: SelectorState) -> SelectorState:
+    interrupt({
+        "type": "PROJECT_SELECTION",
+        "selected_project": state["selected_project"],
+        "selected_repos": state["selected_repos"],
+        "is_new_project": state.get("is_new_project", False),
+        "candidates": state.get("candidates", [])
+    })
+    return state
 
 
 def process_approval(state: SelectorState) -> SelectorState:
-    if state.get("approved"):
-        project = state["selected_project"]
-        print(f"\n[Phase 0] ✅ Project confirmed: {project['project_name']}")
-        print(f"  Repos in scope: {', '.join(state['selected_repos'])}")
-        return {**state, "status": "PROJECT_CONFIRMED"}
-    else:
-        print(f"\n[Phase 0] ❌ Rejected: {state.get('human_feedback')}")
+    human_input = state.get("human_input", {})
+    if not human_input.get("approved"):
         return {**state, "status": "REJECTED"}
+    return {**state, "status": "APPROVED"}
 
-
-# -----------------------------------------
-# Routing
-# -----------------------------------------
-
-def route_after_auto_select(state: SelectorState) -> str:
-    if state["status"] == "PROJECT_AUTO_SELECTED":
-        return "high_confidence"
-    elif state["status"] == "NO_PROJECT_FOUND":
-        return "no_match"
-    return "low_confidence"
-
-
-def route_after_approval(state: SelectorState) -> str:
-    if state["status"] == "PROJECT_CONFIRMED":
-        return "confirmed"
-    return "rejected"
-
-
-# -----------------------------------------
-# Build Graph
-# -----------------------------------------
 
 def build_selector_graph():
-    builder = StateGraph(SelectorState)
+    g = StateGraph(SelectorState)
+    g.add_node("select_project", select_project_node)
+    g.add_node("human_gate", human_gate_node)
+    g.add_node("process_approval", process_approval)
 
-    builder.add_node("search_projects", search_projects)
-    builder.add_node("auto_select_project", auto_select_project)
-    builder.add_node("human_approval_gate", human_approval_gate)
-    builder.add_node("process_approval", process_approval)
+    g.set_entry_point("select_project")
+    g.add_edge("select_project", "human_gate")
+    g.add_edge("human_gate", "process_approval")
+    g.add_edge("process_approval", END)
 
-    builder.set_entry_point("search_projects")
-    builder.add_edge("search_projects", "auto_select_project")
-
-    builder.add_conditional_edges(
-        "auto_select_project",
-        route_after_auto_select,
-        {
-            "high_confidence": "human_approval_gate",
-            "low_confidence": "human_approval_gate",
-            "no_match": END
-        }
-    )
-
-    builder.add_edge("human_approval_gate", "process_approval")
-
-    builder.add_conditional_edges(
-        "process_approval",
-        route_after_approval,
-        {
-            "confirmed": END,
-            "rejected": END
-        }
-    )
-
-    memory = MemorySaver()
-    return builder.compile(
-        checkpointer=memory,
-        interrupt_before=["human_approval_gate"]
-    )
-
-
-# -----------------------------------------
-# Run
-# -----------------------------------------
-
-def run_selector(requirement: str, thread_id: str = "thread-selector"):
-    graph = build_selector_graph()
-    config = {"configurable": {"thread_id": thread_id}}
-
-    initial_state = SelectorState(
-        requirement=requirement,
-        candidate_projects=[],
-        selected_project={},
-        selected_repos=[],
-        human_feedback="",
-        approved=False,
-        status="STARTED"
-    )
-
-    print("\n" + "="*50)
-    print("--- Phase 0 — Project Selector ---")
-    print("="*50)
-
-    result = graph.invoke(initial_state, config)
-    return graph, config, result
-
-
-def resume_selector(graph, config, approved: bool,
-                    feedback: str = "", project_id: str = None):
-    payload = {"approved": approved, "feedback": feedback}
-    if project_id:
-        payload["project_id"] = project_id
-
-    result = graph.invoke(Command(resume=payload), config)
-    return result
-
-
-# -----------------------------------------
-# Test
-# -----------------------------------------
-
-if __name__ == "__main__":
-    req = "Add leave balance tracker. Each employee gets 20 days per year."
-
-    graph, config, result = run_selector(req, "test-selector-1")
-
-    print(f"\nPaused at: {result['status']}")
-    print(f"Auto-selected: {result['selected_project'].get('project_name')}")
-    print(f"Repos: {result['selected_repos']}")
-    print(f"\nAll candidates:")
-    for c in result['candidate_projects']:
-        print(f"  {c['project_name']} — {c['score']} — {c['repos']}")
-
-    print("\n--- Simulating Human Confirmation ---")
-    final = resume_selector(graph, config, approved=True)
-
-    print(f"\n✅ Phase 0 Complete")
-    print(f"Status: {final['status']}")
-    print(f"Project: {final['selected_project']['project_name']}")
-    print(f"Repos: {final['selected_repos']}")
+    return g.compile(checkpointer=MemorySaver())
