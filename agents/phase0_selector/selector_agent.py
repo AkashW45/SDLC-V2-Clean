@@ -4,9 +4,17 @@ Finds the right project and repos for a given requirement.
 Human confirms the selection before pipeline continues.
 """
 
+"""
+Phase 0 — Project & Repo Selector
+Finds the right project and repos for a given requirement.
+Human confirms the selection before pipeline continues.
+"""
+
 import os
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
+# Add project root to path
+sys.path.insert(0, r"C:\Users\user\SDLC-V2")
 
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
@@ -38,6 +46,8 @@ class SelectorState(TypedDict):
 def search_projects(state: SelectorState) -> SelectorState:
     """Semantic search to find top candidate projects."""
     print("\n[Phase 0] Searching for matching projects...")
+    import sys
+    sys.path.insert(0, r"C:\Users\user\SDLC-V2")
 
     from knowledge_layer.project_registry import search_projects as do_search
 
