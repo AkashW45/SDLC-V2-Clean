@@ -30,9 +30,9 @@ class DiscoveryState(TypedDict):
     status: str
 
 
-def _llm_json(prompt: str, max_tokens: int = 8192) -> dict:
+def _llm_json(prompt: str, max_tokens: int = 16384) -> dict:
     response = client.chat.completions.create(
-        model="deepseek-v4-pro",
+        model="deepseek-v4-flash",
         messages=[{"role": "user", "content": prompt}],
         stream=False,
         reasoning_effort="high",

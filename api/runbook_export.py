@@ -550,53 +550,132 @@ def export_adr_markdown(adr: dict) -> str:
     return "\n".join(lines)
 
 
-def export_architecture_markdown(arch: dict) -> str:
-    if not arch:
-        return "# Architecture\n\n_No architecture generated yet._"
-    lines = [f"# System Architecture: {arch.get('system_name', 'Untitled')}\n"]
-    lines.append(f"**Style:** {arch.get('architecture_style', '')}")
-    lines.append(f"**Deployment:** {arch.get('deployment_model', '')}\n")
+def export_architecture_markdown(architecture: dict) -> str:
+    """Export architecture with embedded Mermaid diagram."""
+    if not architecture or not architecture.get("nodes"):
+        return "# Architecture\n\nNo architecture data available.\n"
 
-    if arch.get("nodes"):
-        lines.append("## Components\n")
-        for n in arch["nodes"]:
-            lines.append(f"### {n.get('id','')} — {n.get('name','')}")
-            lines.append(f"- **Type:** {n.get('type','')}")
-            lines.append(f"- **Zone:** {n.get('zone','')}")
-            lines.append(f"- **Tech Stack:** {', '.join(n.get('tech_stack', []))}")
-            lines.append(f"- **Description:** {n.get('description','')}")
-            if n.get("responsibilities"):
-                lines.append("- **Responsibilities:**")
-                for r in n["responsibilities"]:
-                    lines.append(f"  - {r}")
-            lines.append("")
+    lines = []
+    lines.append(f"# System Architecture: {architecture.get('system_name', 'Untitled System')}\n")
+    lines.append(f"**Style:** {architecture.get('architecture_style', 'N/A')}")
+    lines.append(f"**Deployment:** {architecture.get('deployment_model', 'N/A')}\n")
 
-    if arch.get("edges"):
-        lines.append("## Connections\n")
-        for e in arch["edges"]:
-            lines.append(f"- `{e.get('source','')}` → `{e.get('target','')}` "
-                        f"[{e.get('protocol','')}] — {e.get('description','')}")
+    # ── MERMAID DIAGRAM ──────────────────────────────────────────
+    lines.append("## Architecture Diagram\n")
+    mermaid_code = architecture.get("mermaid", "") or architecture.get("mermaid_diagram", "")
+    if not mermaid_code:
+        # Fallback: generate Mermaid from nodes/edges if not pre-generated
+        mermaid_code = _generate_mermaid_from_nodes(architecture)
+
+    lines.append("```mermaid")
+    lines.append(mermaid_code)
+    lines.append("```\n")
+
+    # Components
+    lines.append("## Components\n")
+    for node in architecture.get("nodes", []):
+        lines.append(f"### {node.get('id','')} — {node.get('name','')}")
+        lines.append(f"- **Type:** {node.get('type','')}")
+        lines.append(f"- **Zone:** {node.get('zone','')}")
+        if node.get('tech_stack'):
+            lines.append(f"- **Tech Stack:** {', '.join(node['tech_stack'])}")
+        lines.append(f"- **Description:** {node.get('description','')}")
+        if node.get('responsibilities'):
+            lines.append("- **Responsibilities:**")
+            for r in node['responsibilities']:
+                lines.append(f"  - {r}")
         lines.append("")
 
-    if arch.get("data_flows"):
-        lines.append("## Data Flows\n")
-        for df in arch["data_flows"]:
-            lines.append(f"### {df.get('name','')}")
-            for i, step in enumerate(df.get("steps", []), 1):
-                lines.append(f"{i}. {step}")
-            lines.append("")
+    # Connections
+    lines.append("## Connections\n")
+    for edge in architecture.get("edges", []):
+        proto = edge.get('protocol', '')
+        desc = edge.get('description', '')
+        lines.append(f"- `{edge.get('source','')}` → `{edge.get('target','')}` [{proto}] — {desc}")
+    lines.append("")
 
-    if arch.get("security_considerations"):
+    # Security
+    if architecture.get("security_considerations"):
         lines.append("## Security Considerations\n")
-        for s in arch["security_considerations"]:
+        for s in architecture["security_considerations"]:
             lines.append(f"- {s}")
         lines.append("")
 
-    if arch.get("scalability_notes"):
-        lines.append(f"## Scalability\n\n{arch['scalability_notes']}\n")
+    # Scalability
+    if architecture.get("scalability_notes"):
+        lines.append("## Scalability\n")
+        lines.append(architecture["scalability_notes"])
+        lines.append("")
 
     return "\n".join(lines)
 
+
+def _generate_mermaid_from_nodes(architecture: dict) -> str:
+    """Generate Mermaid graph syntax from architecture nodes/edges."""
+    import re
+    
+    def safe_id(node_id: str) -> str:
+        return re.sub(r'[^A-Z0-9_]', '_', str(node_id).upper())
+    
+    def shape(node: dict) -> str:
+        nid = safe_id(node.get("id", ""))
+        name = node.get("name", "").replace('"', "'")
+        ntype = node.get("type", "service").lower()
+        if ntype == "database":
+            return f'  {nid}[("{name}")]'
+        elif ntype == "queue":
+            return f'  {nid}[/"{name}"/]'
+        elif ntype == "cache":
+            return f'  {nid}{{"{name}"}}'
+        elif ntype == "external" or node.get("zone") == "external":
+            return f'  {nid}(["{name}"])'
+        elif ntype == "client":
+            return f'  {nid}>"{name}"]'
+        else:
+            return f'  {nid}["{name}"]'
+    
+    lines = ["graph TB"]
+    
+    # Group by zone
+    zones = {}
+    for node in architecture.get("nodes", []):
+        zone = node.get("zone", "core")
+        zones.setdefault(zone, []).append(node)
+    
+    # Render zones as subgraphs
+    for zone_name, nodes in zones.items():
+        lines.append(f'  subgraph {zone_name.upper()}["{zone_name.title()} Zone"]')
+        for node in nodes:
+            lines.append(f"  {shape(node).strip()}")
+        lines.append("  end")
+    
+    # Render edges
+    for edge in architecture.get("edges", []):
+        src = safe_id(edge.get("source", ""))
+        tgt = safe_id(edge.get("target", ""))
+        proto = edge.get("protocol", "")
+        if proto:
+            lines.append(f'  {src} -->|{proto}| {tgt}')
+        else:
+            lines.append(f"  {src} --> {tgt}")
+    
+    # Style nodes by type
+    lines.append("")
+    lines.append("  classDef database fill:#fdf6e3,stroke:#b58900,stroke-width:2px")
+    lines.append("  classDef external fill:#eee8d5,stroke:#586e75,stroke-width:2px")
+    lines.append("  classDef service fill:#e8f4ff,stroke:#268bd2,stroke-width:2px")
+    
+    for node in architecture.get("nodes", []):
+        nid = safe_id(node.get("id", ""))
+        ntype = node.get("type", "service").lower()
+        if ntype == "database":
+            lines.append(f"  class {nid} database")
+        elif ntype == "external" or node.get("zone") == "external":
+            lines.append(f"  class {nid} external")
+        else:
+            lines.append(f"  class {nid} service")
+    
+    return "\n".join(lines)
 
 def export_sprint_plan_markdown(sprint_plan: dict, jira_tickets: list = None) -> str:
     if not sprint_plan:

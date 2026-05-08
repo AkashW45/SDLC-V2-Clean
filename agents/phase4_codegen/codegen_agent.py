@@ -110,35 +110,57 @@ def validate_python(code: str, file_path: str) -> list:
     return errors
 
 
+# Phase 4 Codegen — Critical fixes for fresh project generation
+# Replace the generate_fresh_project function ENTIRELY in agents/phase4_codegen/codegen_agent.py
+
 def generate_fresh_project(state: CodegenState) -> CodegenState:
     """Generate complete project scaffold for a new requirement."""
     print("  [Phase 4] Generating FRESH project scaffold...")
 
-    # Pull architecture from prior phase if available
     requirement = state["requirement"]
+    impact = state.get("impact_report", {})
+    architecture = impact.get("architecture", {})
+
+    # Build architecture context for grounded scaffolding
+    arch_context = ""
+    if architecture.get("nodes"):
+        arch_summary = []
+        for node in architecture.get("nodes", []):
+            arch_summary.append(f"- {node.get('name','')} ({node.get('type','service')}): {node.get('description','')}")
+            if node.get('tech_stack'):
+                arch_summary.append(f"  Tech: {', '.join(node['tech_stack'])}")
+        arch_context = "\n\nARCHITECTURE TO IMPLEMENT:\n" + "\n".join(arch_summary)
 
     prompt = f"""
 You are a senior backend engineer scaffolding a brand new Python FastAPI project.
 
 REQUIREMENT:
 {requirement}
+{arch_context}
 
-Generate a complete starter project with these files:
-- main.py (FastAPI app entry)
-- app/models.py (Pydantic models)
-- app/routes.py (API routes)
-- app/services.py (business logic)
-- requirements.txt
-- README.md
+Generate a complete, working starter project with these files. Each MUST be production-quality:
 
-Each file should have working starter code that addresses the requirement.
+1. main.py — FastAPI app entry with health endpoint
+2. app/__init__.py — empty
+3. app/models.py — Pydantic models matching the requirement
+4. app/routes.py — API routes implementing the requirement (NOT just stubs)
+5. app/services.py — business logic functions
+6. app/database.py — SQLAlchemy setup (sqlite for now)
+7. requirements.txt — fastapi, uvicorn, pydantic, sqlalchemy
+8. README.md — how to run, what it does
+9. .gitignore — standard Python
+10. tests/__init__.py — empty
+11. tests/test_main.py — basic health test
+
+Each file MUST be syntactically valid Python and immediately runnable with:
+  pip install -r requirements.txt && uvicorn main:app --reload
 
 Return ONLY valid JSON:
 {{
   "files": [
     {{
       "file_path": "main.py",
-      "content": "complete file content",
+      "content": "complete file content as a string",
       "change_summary": "what this file does",
       "new_symbols_added": ["app", "main"],
       "existing_symbols_modified": []
@@ -147,24 +169,38 @@ Return ONLY valid JSON:
 }}
 """
 
-    response = call_llm(prompt, max_tokens=4096)
+    # call_llm returns string (not parsed JSON) — handle that
+    response = call_llm(prompt)
+
     if response.startswith("```"):
         response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
 
+    # Try multiple JSON parse strategies
+    generated_changes = []
     try:
         data = json.loads(response)
         generated_changes = data.get("files", [])
-    except Exception as e:
-        print(f"  [Phase 4] JSON parse failed: {e}")
-        generated_changes = []
+    except json.JSONDecodeError:
+        # Try to find JSON object boundary
+        try:
+            start = response.find('{')
+            end = response.rfind('}') + 1
+            if start >= 0 and end > start:
+                data = json.loads(response[start:end])
+                generated_changes = data.get("files", [])
+        except Exception as e:
+            print(f"  [Phase 4] Fresh project JSON parse failed: {e}")
+            print(f"  [Phase 4] Response head: {response[:300]}")
+            generated_changes = []
 
     # Validate Python syntax
     errors = []
     for change in generated_changes:
         if change.get("file_path", "").endswith(".py"):
-            errors.extend(validate_python(change.get("content", ""), change["file_path"]))
+            errs = validate_python(change.get("content", ""), change["file_path"])
+            errors.extend(errs)
 
-    print(f"  [Phase 4] Generated {len(generated_changes)} fresh files")
+    print(f"  [Phase 4] Generated {len(generated_changes)} fresh files (errors: {len(errors)})")
     return {
         **state,
         "generated_changes": generated_changes,
