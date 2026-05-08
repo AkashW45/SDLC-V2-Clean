@@ -30,14 +30,14 @@ class DiscoveryState(TypedDict):
     status: str
 
 
-def _llm_json(prompt: str) -> dict:
+def _llm_json(prompt: str, max_tokens: int = 8192) -> dict:
     response = client.chat.completions.create(
         model="deepseek-v4-pro",
         messages=[{"role": "user", "content": prompt}],
         stream=False,
-        reasoning_effort="high",    
-        extra_body={"thinking": {"type": "enabled"}}
-        
+        reasoning_effort="high",
+        extra_body={"thinking": {"type": "enabled"}},
+        max_tokens=max_tokens
     )
     content = response.choices[0].message.content.strip()
     if content.startswith("```"):
@@ -50,8 +50,8 @@ def _llm_json(prompt: str) -> dict:
             end = content.rfind('}') + 1
             return json.loads(content[start:end])
         except Exception:
+            print(f"  [LLM] JSON parse failed. Raw response (first 500 chars): {content[:500]}")
             return {}
-
 
 def _feedback_block(state) -> str:
     fb = state.get("human_feedback", "")

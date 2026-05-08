@@ -401,16 +401,183 @@ function renderContent() {
     if (state.brd?.title) {
       html += subHeaderWithDownload('📋 Business Requirements (BRD)', 'brd');
       html += dataRow('Title', state.brd.title);
+
+      if (state.brd.executive_summary)
+        html += dataRow('Executive Summary', state.brd.executive_summary);
+
+      if (state.brd.business_context)
+        html += dataRow('Business Context', state.brd.business_context);
+
       if (state.brd.business_objectives?.length)
-        html += dataRow('Objectives', state.brd.business_objectives.map(o=>`• ${o}`).join('<br>'));
-      if (state.brd.scope?.in_scope?.length)
-        html += dataRow('In Scope', state.brd.scope.in_scope.map(s=>`• ${s}`).join('<br>'));
-      if (state.brd.scope?.out_of_scope?.length)
-        html += dataRow('Out of Scope', state.brd.scope.out_of_scope.map(s=>`• ${s}`).join('<br>'));
-      if (state.brd.stakeholders?.length)
-        html += dataRow('Stakeholders', state.brd.stakeholders.map(s=>`• ${s}`).join('<br>'));
-      if (state.brd.risks?.length)
+        html += dataRow('Business Objectives', state.brd.business_objectives.map(o=>`• ${o}`).join('<br>'));
+
+      if (state.brd.in_scope?.length)
+        html += dataRow('In Scope', state.brd.in_scope.map(s=>`• ${s}`).join('<br>'));
+
+      if (state.brd.out_of_scope?.length)
+        html += dataRow('Out of Scope', state.brd.out_of_scope.map(s=>`• ${s}`).join('<br>'));
+
+      // Stakeholders — handle object structure
+      if (state.brd.stakeholders?.length) {
+        html += dataRow('Stakeholders', state.brd.stakeholders.map(s => {
+          if (typeof s === 'string') return `• ${s}`;
+          const role = s.role || '';
+          const name = s.name_or_team || s.name || '';
+          const resp = s.responsibility || '';
+          return `• <strong style="color:var(--accent)">${role}</strong>${name ? ` <span style="color:var(--text2)">(${name})</span>` : ''}${resp ? `<br>&nbsp;&nbsp;&nbsp;${resp}` : ''}`;
+        }).join('<br>'));
+      }
+
+      // RACI Matrix as a table
+      if (state.brd.raci_matrix?.length) {
+        html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:14px 0 6px">RACI Matrix</div>`;
+        html += `<div style="background:var(--surface2);border-radius:6px;padding:10px;overflow-x:auto;margin-bottom:8px">
+          <table style="width:100%;border-collapse:collapse;font-size:10px">
+            <thead>
+              <tr style="border-bottom:1px solid var(--border)">
+                <th style="text-align:left;padding:6px;color:var(--text3);font-weight:700">Activity</th>
+                <th style="text-align:left;padding:6px;color:var(--accent)">R</th>
+                <th style="text-align:left;padding:6px;color:var(--blue)">A</th>
+                <th style="text-align:left;padding:6px;color:var(--warn)">C</th>
+                <th style="text-align:left;padding:6px;color:var(--text2)">I</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${state.brd.raci_matrix.map(r => `
+                <tr style="border-bottom:1px solid var(--border)">
+                  <td style="padding:6px;color:var(--text)">${r.activity || ''}</td>
+                  <td style="padding:6px;color:var(--text2)">${r.responsible || ''}</td>
+                  <td style="padding:6px;color:var(--text2)">${r.accountable || ''}</td>
+                  <td style="padding:6px;color:var(--text2)">${r.consulted || ''}</td>
+                  <td style="padding:6px;color:var(--text2)">${r.informed || ''}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>`;
+      }
+
+      // Functional Requirements as cards
+      if (state.brd.functional_requirements?.length) {
+        html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:14px 0 6px">
+          Functional Requirements (${state.brd.functional_requirements.length})
+        </div>`;
+        state.brd.functional_requirements.forEach(fr => {
+          const pColor = fr.priority === 'Critical' || fr.priority === 'High' ? 'var(--danger)' : fr.priority === 'Medium' ? 'var(--warn)' : 'var(--accent)';
+          html += `<div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px;border-left:3px solid ${pColor}">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+              <span style="font-size:9px;color:var(--blue);font-weight:700">${fr.id||''}</span>
+              <span style="font-size:11px;font-weight:700">${fr.title||''}</span>
+              <span style="margin-left:auto;font-size:8px;color:${pColor}">${fr.priority||''}</span>
+            </div>
+            <div style="font-size:10px;color:var(--text2);margin-bottom:4px">${fr.description||''}</div>
+            ${fr.business_value ? `<div style="font-size:9px;color:var(--accent);margin-top:4px"><strong>Business Value:</strong> ${fr.business_value}</div>` : ''}
+          </div>`;
+        });
+      }
+
+      // Non-Functional Requirements as table
+      if (state.brd.non_functional_requirements?.length) {
+        html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:14px 0 6px">
+          Non-Functional Requirements (${state.brd.non_functional_requirements.length})
+        </div>`;
+        state.brd.non_functional_requirements.forEach(nfr => {
+          html += `<div style="background:var(--surface2);border-radius:6px;padding:10px 14px;margin-bottom:6px;border-left:3px solid var(--blue)">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <span style="font-size:9px;color:var(--blue);font-weight:700">${nfr.id||''}</span>
+              <span style="font-size:11px;font-weight:700">${nfr.title||''}</span>
+              <span style="margin-left:auto;font-size:8px;color:var(--text3)">${nfr.priority||''}</span>
+            </div>
+            <div style="font-size:10px;color:var(--text2)">${nfr.description||''}</div>
+            ${nfr.metric ? `<div style="font-size:9px;color:var(--accent);margin-top:4px"><strong>Metric:</strong> ${nfr.metric}</div>` : ''}
+          </div>`;
+        });
+      }
+
+      // KPIs as table
+      if (state.brd.kpis?.length) {
+        html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:14px 0 6px">
+          Key Performance Indicators
+        </div>`;
+        html += `<div style="background:var(--surface2);border-radius:6px;padding:10px;overflow-x:auto;margin-bottom:8px">
+          <table style="width:100%;border-collapse:collapse;font-size:10px">
+            <thead>
+              <tr style="border-bottom:1px solid var(--border)">
+                <th style="text-align:left;padding:6px;color:var(--text3)">KPI</th>
+                <th style="text-align:left;padding:6px;color:var(--accent)">Target</th>
+                <th style="text-align:left;padding:6px;color:var(--text3)">Method</th>
+                <th style="text-align:left;padding:6px;color:var(--text3)">Frequency</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${state.brd.kpis.map(k => `
+                <tr style="border-bottom:1px solid var(--border)">
+                  <td style="padding:6px;color:var(--text);font-weight:700">${k.name||''}</td>
+                  <td style="padding:6px;color:var(--accent)">${k.target||''}</td>
+                  <td style="padding:6px;color:var(--text2)">${k.measurement_method||''}</td>
+                  <td style="padding:6px;color:var(--text2)">${k.frequency||''}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>`;
+      }
+
+      // Risk Matrix as table
+      if (state.brd.risk_matrix?.length) {
+        html += `<div style="font-size:9px;color:var(--danger);letter-spacing:1.5px;text-transform:uppercase;margin:14px 0 6px">
+          ⚠️ Risk Matrix (${state.brd.risk_matrix.length})
+        </div>`;
+        html += `<div style="background:rgba(255,71,87,0.05);border:1px solid rgba(255,71,87,0.2);border-radius:6px;padding:10px;overflow-x:auto;margin-bottom:8px">
+          <table style="width:100%;border-collapse:collapse;font-size:10px">
+            <thead>
+              <tr style="border-bottom:1px solid var(--border)">
+                <th style="text-align:left;padding:6px;color:var(--text3)">ID</th>
+                <th style="text-align:left;padding:6px;color:var(--text3)">Risk</th>
+                <th style="text-align:left;padding:6px;color:var(--text3)">L</th>
+                <th style="text-align:left;padding:6px;color:var(--text3)">I</th>
+                <th style="text-align:left;padding:6px;color:var(--text3)">Mitigation</th>
+                <th style="text-align:left;padding:6px;color:var(--text3)">Owner</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${state.brd.risk_matrix.map(r => {
+                const lColor = r.likelihood === 'High' ? 'var(--danger)' : r.likelihood === 'Medium' ? 'var(--warn)' : 'var(--accent)';
+                const iColor = r.impact === 'High' ? 'var(--danger)' : r.impact === 'Medium' ? 'var(--warn)' : 'var(--accent)';
+                return `<tr style="border-bottom:1px solid var(--border)">
+                  <td style="padding:6px;color:var(--blue);font-weight:700">${r.id||''}</td>
+                  <td style="padding:6px;color:var(--text)">${r.risk||''}</td>
+                  <td style="padding:6px;color:${lColor};font-weight:700">${r.likelihood||''}</td>
+                  <td style="padding:6px;color:${iColor};font-weight:700">${r.impact||''}</td>
+                  <td style="padding:6px;color:var(--text2)">${r.mitigation||''}</td>
+                  <td style="padding:6px;color:var(--text2)">${r.owner||''}</td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>`;
+      }
+
+      // Simple risks list (legacy fallback if risk_matrix not present)
+      if (!state.brd.risk_matrix?.length && state.brd.risks?.length) {
         html += dataRow('Risks', state.brd.risks.map(r=>`• ${r}`).join('<br>'), 'warn');
+      }
+
+      // Assumptions
+      if (state.brd.assumptions?.length)
+        html += dataRow('Assumptions', state.brd.assumptions.map(a=>`• ${a}`).join('<br>'));
+
+      // Dependencies
+      if (state.brd.dependencies?.length)
+        html += dataRow('Dependencies', state.brd.dependencies.map(d=>`• ${d}`).join('<br>'));
+
+      // Success Criteria
+      if (state.brd.success_criteria?.length)
+        html += dataRow('Success Criteria', state.brd.success_criteria.map(s=>`• ${s}`).join('<br>'), 'accent');
+
+      // Timeline & Budget
+      if (state.brd.timeline_estimate)
+        html += dataRow('Timeline', state.brd.timeline_estimate);
+      if (state.brd.budget_considerations)
+        html += dataRow('Budget Considerations', state.brd.budget_considerations);
     }
 
     // PRD
