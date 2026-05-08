@@ -19,7 +19,12 @@ import psycopg2
 
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com"
+)
 
 
 # -----------------------------------------
@@ -39,11 +44,13 @@ class CodegenState(TypedDict):
 # Helpers
 # -----------------------------------------
 
-def call_llm(prompt: str, max_tokens: int = 3000) -> str:
+def call_llm(prompt: str) -> dict:
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model="deepseek-v4-pro",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens
+        stream=False,
+        reasoning_effort="high",
+        extra_body={"thinking": {"type": "enabled"}}
     )
     return response.choices[0].message.content.strip()
 
@@ -103,29 +110,93 @@ def validate_python(code: str, file_path: str) -> list:
     return errors
 
 
+def generate_fresh_project(state: CodegenState) -> CodegenState:
+    """Generate complete project scaffold for a new requirement."""
+    print("  [Phase 4] Generating FRESH project scaffold...")
+
+    # Pull architecture from prior phase if available
+    requirement = state["requirement"]
+
+    prompt = f"""
+You are a senior backend engineer scaffolding a brand new Python FastAPI project.
+
+REQUIREMENT:
+{requirement}
+
+Generate a complete starter project with these files:
+- main.py (FastAPI app entry)
+- app/models.py (Pydantic models)
+- app/routes.py (API routes)
+- app/services.py (business logic)
+- requirements.txt
+- README.md
+
+Each file should have working starter code that addresses the requirement.
+
+Return ONLY valid JSON:
+{{
+  "files": [
+    {{
+      "file_path": "main.py",
+      "content": "complete file content",
+      "change_summary": "what this file does",
+      "new_symbols_added": ["app", "main"],
+      "existing_symbols_modified": []
+    }}
+  ]
+}}
+"""
+
+    response = call_llm(prompt, max_tokens=4096)
+    if response.startswith("```"):
+        response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
+
+    try:
+        data = json.loads(response)
+        generated_changes = data.get("files", [])
+    except Exception as e:
+        print(f"  [Phase 4] JSON parse failed: {e}")
+        generated_changes = []
+
+    # Validate Python syntax
+    errors = []
+    for change in generated_changes:
+        if change.get("file_path", "").endswith(".py"):
+            errors.extend(validate_python(change.get("content", ""), change["file_path"]))
+
+    print(f"  [Phase 4] Generated {len(generated_changes)} fresh files")
+    return {
+        **state,
+        "generated_changes": generated_changes,
+        "validation_errors": errors,
+        "status": "CODE_GENERATED" if not errors else "CODE_GENERATION_FAILED"
+    }
 # -----------------------------------------
 # Nodes
 # -----------------------------------------
 
 def load_existing_code(state: CodegenState) -> CodegenState:
-    """Read current content of all affected files."""
-    print("\n[Phase 4] Loading existing code for affected files...")
+    """Read current content of all affected files. For new projects, skip."""
+    print("\n[Phase 4] Loading existing code...")
 
-    # Repo path — in production this comes from config
+    impact = state.get("impact_report", {})
+    affected_files = impact.get("affected_files", [])
+
+    # If no affected files (new project) — skip loading
+    if not affected_files:
+        print("  [Phase 4] No existing files — NEW PROJECT, generating fresh")
+        return {**state, "existing_code": {}, "status": "NEW_PROJECT_NO_CODE"}
+
     repo_path = os.getenv("REPO_PATH", r"C:\Users\user\leave-mgmt-backend")
-    affected_files = state["impact_report"].get("affected_files", [])
     existing_code = {}
 
     for af in affected_files:
         file_path = af["file_path"]
-        # Normalize path separator
         file_path_normalized = file_path.replace("\\", os.sep).replace("/", os.sep)
         content = read_file_from_repo(repo_path, file_path_normalized)
         if content:
             existing_code[file_path] = content
             print(f"  ✅ Loaded: {file_path} ({len(content)} chars)")
-        else:
-            print(f"  ⚠️  Could not load: {file_path}")
 
     return {**state, "existing_code": existing_code, "status": "CODE_LOADED"}
 
@@ -173,6 +244,9 @@ def generate_code_changes(state: CodegenState) -> CodegenState:
     Retries up to 3 times if syntax errors found.
     """
     print("\n[Phase 4] Generating code changes...")
+    # NEW PROJECT mode — generate fresh files from architecture
+    if state.get("status") == "NEW_PROJECT_NO_CODE":
+        return generate_fresh_project(state)
 
     context = build_context_packet(state)
     generated_changes = []

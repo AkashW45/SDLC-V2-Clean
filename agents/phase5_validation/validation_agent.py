@@ -20,7 +20,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com"
+)
 
 
 # -----------------------------------------
@@ -40,11 +45,13 @@ class ValidationState(TypedDict):
 # Helpers
 # -----------------------------------------
 
-def call_llm(prompt: str, max_tokens: int = 3000) -> str:
+def call_llm(prompt: str) -> dict:
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model="deepseek-v4-pro",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens
+        stream=False,
+        reasoning_effort="high",
+        extra_body={"thinking": {"type": "enabled"}}
     )
     return response.choices[0].message.content.strip()
 

@@ -30,11 +30,14 @@ class DiscoveryState(TypedDict):
     status: str
 
 
-def _llm_json(prompt: str, max_tokens: int = 4096) -> dict:
+def _llm_json(prompt: str) -> dict:
     response = client.chat.completions.create(
-        model="deepseek-chat",
+        model="deepseek-v4-pro",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens
+        stream=False,
+        reasoning_effort="high",    
+        extra_body={"thinking": {"type": "enabled"}}
+        
     )
     content = response.choices[0].message.content.strip()
     if content.startswith("```"):
@@ -61,71 +64,128 @@ def generate_brd(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating BRD...")
 
     brd = _llm_json(f"""
-You are a Senior Business Analyst.
-Generate a comprehensive BRD as JSON.
+You are a Senior Business Analyst writing a BRD for executive review.
+The BRD must read like a McKinsey document — specific, quantified, no fluff.
 {_feedback_block(state)}
-Return ONLY valid JSON:
+Return ONLY valid JSON with this exact structure:
+
 {{
   "title": "Project title",
-  "executive_summary": "2-3 paragraph summary",
-  "business_objectives": ["objective 1", "objective 2", "..."],
-  "in_scope": ["item 1", "item 2", "..."],
-  "out_of_scope": ["item 1", "..."],
-  "stakeholders": ["stakeholder 1", "..."],
+  "executive_summary": "3-paragraph executive summary covering: (1) the problem and its business impact in numbers, (2) the proposed solution and how it addresses the problem, (3) expected outcome and ROI",
+  "business_context": "1-2 paragraphs on industry context, market drivers, competitive pressure",
+  "business_objectives": [
+    "Quantified objective with target metric (e.g., 'Reduce manual processing time by 40%')",
+    "Another quantified objective"
+  ],
+  "in_scope": ["Specific deliverable 1", "..."],
+  "out_of_scope": ["Specific exclusion 1", "..."],
+  "stakeholders": [
+    {{"role": "Sponsor", "name_or_team": "...", "responsibility": "..."}},
+    {{"role": "Product Owner", "name_or_team": "...", "responsibility": "..."}}
+  ],
+  "raci_matrix": [
+    {{"activity": "Requirements Sign-off", "responsible": "Business Analyst", "accountable": "Product Owner", "consulted": "Engineering Lead", "informed": "Executive Sponsor"}},
+    {{"activity": "Architecture Review", "responsible": "Solution Architect", "accountable": "CTO", "consulted": "Security Team", "informed": "Product Owner"}},
+    {{"activity": "Production Deployment", "responsible": "DevOps", "accountable": "Engineering Manager", "consulted": "QA Lead", "informed": "All Stakeholders"}}
+  ],
   "functional_requirements": [
-    {{"id": "FR1", "title": "...", "description": "...", "priority": "High"}}
+    {{"id": "FR1", "title": "...", "description": "Detailed paragraph", "priority": "Critical|High|Medium|Low", "business_value": "How it addresses business goal"}}
   ],
   "non_functional_requirements": [
-    {{"id": "NFR1", "title": "...", "description": "...", "priority": "High"}}
+    {{"id": "NFR1", "title": "...", "description": "Quantified target (e.g., '99.9% uptime', '<200ms p95 latency')", "priority": "High", "metric": "specific KPI"}}
   ],
-  "assumptions": ["assumption 1", "..."],
-  "risks": ["risk 1", "..."],
-  "success_criteria": ["criterion 1", "..."]
+  "kpis": [
+    {{"name": "KPI name", "target": "specific number", "measurement_method": "how measured", "frequency": "daily/weekly/monthly"}}
+  ],
+  "risk_matrix": [
+    {{"id": "R1", "risk": "Risk description", "likelihood": "High|Medium|Low", "impact": "High|Medium|Low", "mitigation": "specific mitigation strategy", "owner": "team responsible"}}
+  ],
+  "assumptions": ["..."],
+  "dependencies": ["External system X must be available", "..."],
+  "success_criteria": ["Specific measurable outcome 1", "..."],
+  "timeline_estimate": "X weeks/months with major milestones",
+  "budget_considerations": "infrastructure, licensing, team capacity"
 }}
 
-Requirement:
+Minimum requirements:
+- 4+ functional requirements with business value
+- 5+ NFRs with quantified targets
+- 4+ KPIs with specific numbers
+- 6+ risks with likelihood/impact/mitigation
+- 5+ RACI activities
+- Stakeholders with at least 5 distinct roles
+
+REQUIREMENT:
 {state['requirement']}
 """)
 
     if not brd.get("title"):
         brd["title"] = "Untitled Project"
 
-    print(f"  ✅ BRD generated: {brd.get('title')}")
+    print(f"  ✅ BRD generated: {brd.get('title')} ({len(brd.get('functional_requirements',[]))} FRs, {len(brd.get('risk_matrix',[]))} risks)")
     return {**state, "brd": brd, "status": "BRD_GENERATED"}
-
 
 def generate_prd(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating PRD...")
 
     brd = state["brd"]
     prd = _llm_json(f"""
-You are a Senior Product Owner.
-Generate a detailed PRD from this BRD.
+You are a Senior Product Owner writing a PRD for engineering execution.
+This must read like a Stripe/Linear PRD — specific user stories, not vague generalities.
 {_feedback_block(state)}
 Return ONLY valid JSON:
+
 {{
   "title": "...",
-  "product_vision": "one paragraph",
+  "executive_summary": "2-paragraph summary for product leadership",
+  "product_vision": "Clear vision statement — who, what, why",
+  "target_users": [
+    {{"persona": "User type", "needs": "what they need", "pain_points": "current problems"}}
+  ],
+  "user_journeys": [
+    {{"journey": "End-to-end flow name", "steps": ["step 1", "step 2"]}}
+  ],
   "functional_requirements": [
-    {{"id": "FR1", "title": "...", "description": "...", "priority": "High",
-      "acceptance_criteria": ["AC1", "AC2", "AC3"]}}
+    {{
+      "id": "FR1",
+      "title": "...",
+      "user_story": "As a [persona] I want [goal] so that [benefit]",
+      "description": "Detailed description",
+      "priority": "P0|P1|P2",
+      "acceptance_criteria": ["Given...When...Then..."],
+      "edge_cases": ["edge case 1", "edge case 2"],
+      "dependencies": ["depends on FR2"]
+    }}
   ],
   "non_functional_requirements": [
-    {{"id": "NFR1", "title": "...", "description": "...", "priority": "High"}}
+    {{"id": "NFR1", "title": "...", "description": "Quantified", "priority": "High", "verification_method": "load test / monitoring / etc"}}
   ],
   "technical_requirements": [
-    {{"id": "TR1", "title": "...", "description": "..."}}
+    {{"id": "TR1", "title": "...", "description": "Specific technical constraint", "rationale": "why this constraint exists"}}
   ],
-  "stakeholders": ["..."],
-  "scope": "..."
+  "success_metrics": [
+    {{"metric": "...", "baseline": "current value", "target": "desired value", "timeline": "when measured"}}
+  ],
+  "release_phases": [
+    {{"phase": "MVP", "timeline": "Week 1-4", "scope": ["FR1", "FR2"]}},
+    {{"phase": "Phase 2", "timeline": "Week 5-8", "scope": ["FR3"]}}
+  ],
+  "open_questions": ["question that needs decision"]
 }}
 
-Minimum 5 FRs, 4 NFRs, 3 TRs.
+Minimum:
+- 6+ FRs with user stories AND edge cases
+- 4+ NFRs with verification methods
+- 4+ TRs with rationale
+- 3+ user personas
+- 4+ success metrics with baseline AND target
+- 3+ release phases
 
-BRD Title: {brd.get('title','')}
-BRD Objectives: {json.dumps(brd.get('business_objectives', []))}
-BRD Functional Requirements: {json.dumps(brd.get('functional_requirements', []))}
-BRD Non-Functional Requirements: {json.dumps(brd.get('non_functional_requirements', []))}
+BRD Context:
+Title: {brd.get('title','')}
+Summary: {brd.get('executive_summary','')[:500]}
+Objectives: {json.dumps(brd.get('business_objectives', []))}
+KPIs: {json.dumps(brd.get('kpis', []))}
 """)
 
     if not prd.get("title"):
@@ -143,29 +203,50 @@ def generate_adr(state: DiscoveryState) -> DiscoveryState:
 
     prd = state["prd"]
     adr = _llm_json(f"""
-You are a Senior Software Architect.
-Generate Architecture Decision Records (ADRs) for this product.
+You are a Senior Software Architect writing ADRs in MADR format.
+Each ADR must include alternatives considered with trade-offs — not just the chosen path.
 {_feedback_block(state)}
 Return ONLY valid JSON:
+
 {{
   "decisions": [
     {{
       "id": "ADR-001",
-      "title": "Decision title",
-      "context": "Why this decision was needed",
-      "decision": "What was decided",
-      "consequences": ["consequence 1", "consequence 2"],
-      "status": "Accepted"
+      "title": "Specific architectural decision",
+      "status": "Accepted|Proposed|Deprecated",
+      "date": "2026-05-08",
+      "context": "Why this decision was needed — 2-3 sentences with specific drivers",
+      "decision": "What was decided — be specific (technology, pattern, approach)",
+      "rationale": "Why this option over others — paragraph",
+      "alternatives_considered": [
+        {{"option": "Alt 1", "pros": ["pro 1"], "cons": ["con 1"], "rejected_because": "specific reason"}}
+      ],
+      "consequences": {{
+        "positive": ["positive consequence 1", "..."],
+        "negative": ["negative consequence 1", "..."],
+        "neutral": ["neutral implication"]
+      }},
+      "compliance_notes": "any regulatory/security implications",
+      "supersedes": "ADR-XXX or null"
     }}
   ]
 }}
 
-Minimum 5 decisions covering: tech stack, data store, deployment platform,
-authentication, monitoring/observability.
+Minimum 7 decisions covering:
+1. Tech stack (language/framework)
+2. Data store (type and rationale)
+3. Deployment platform (cloud/on-prem/hybrid)
+4. Authentication & authorization approach
+5. Observability strategy (logging/monitoring/tracing)
+6. API design (REST/GraphQL/gRPC)
+7. Async processing (queue/streaming/batch)
 
+Each MUST have at least 2 alternatives_considered with detailed pros/cons.
+
+PRD Context:
 Project: {prd.get('title','')}
-Functional Requirements: {json.dumps(prd.get('functional_requirements', [])[:5])}
-Non-Functional Requirements: {json.dumps(prd.get('non_functional_requirements', [])[:5])}
+NFRs: {json.dumps(prd.get('non_functional_requirements', [])[:6])}
+Tech Requirements: {json.dumps(prd.get('technical_requirements', [])[:6])}
 """)
 
     if not adr.get("decisions"):
@@ -254,26 +335,47 @@ Return:
     if not arch.get("edges"):
         arch["edges"] = []
 
-    # Generate mermaid deterministically (V1 pattern)
+    # Generate mermaid deterministically (FIXED syntax)
     mermaid_lines = ["graph TD"]
     for node in arch.get("nodes", []):
-        nid = node["id"]
-        name = node["name"]
+        nid = re.sub(r'[^A-Z0-9_]', '_', node["id"].upper())
+        # Escape quotes in name
+        name = node["name"].replace('"', "'")[:40]
         ntype = node.get("type", "service")
+
         if ntype == "database":
-            mermaid_lines.append(f'  {nid}[("{name}")]')
+            mermaid_lines.append(f'    {nid}[("{name}")]')
         elif ntype == "external":
-            mermaid_lines.append(f'  {nid}(["{name}"])')
+            mermaid_lines.append(f'    {nid}(["{name}"])')
         elif ntype == "queue":
-            mermaid_lines.append(f'  {nid}{{{{"{name}"}}}}')
+            mermaid_lines.append(f'    {nid}>"{name}"]')  # asymmetric shape, valid mermaid
+        elif ntype == "cache":
+            mermaid_lines.append(f'    {nid}[/"{name}"/]')
         else:
-            mermaid_lines.append(f'  {nid}["{name}"]')
+            mermaid_lines.append(f'    {nid}["{name}"]')
 
     for edge in arch.get("edges", []):
-        src = edge["source"]
-        tgt = edge["target"]
-        proto = edge.get("protocol", "")
-        mermaid_lines.append(f'  {src} -->|{proto}| {tgt}')
+        src = re.sub(r'[^A-Z0-9_]', '_', edge["source"].upper())
+        tgt = re.sub(r'[^A-Z0-9_]', '_', edge["target"].upper())
+        proto = edge.get("protocol", "").replace('|', '/')[:15]
+        if proto:
+            mermaid_lines.append(f'    {src} -->|{proto}| {tgt}')
+        else:
+            mermaid_lines.append(f'    {src} --> {tgt}')
+
+    # Add styling
+    mermaid_lines.append("    classDef serviceStyle fill:#1a4a8a,stroke:#2E86DE,color:#fff")
+    mermaid_lines.append("    classDef dbStyle fill:#1a6b3a,stroke:#27AE60,color:#fff")
+    mermaid_lines.append("    classDef extStyle fill:#7d3c98,stroke:#9b59b6,color:#fff")
+    for node in arch.get("nodes", []):
+        nid = re.sub(r'[^A-Z0-9_]', '_', node["id"].upper())
+        ntype = node.get("type", "service")
+        if ntype == "database":
+            mermaid_lines.append(f"    class {nid} dbStyle")
+        elif ntype == "external":
+            mermaid_lines.append(f"    class {nid} extStyle")
+        else:
+            mermaid_lines.append(f"    class {nid} serviceStyle")
 
     arch["mermaid"] = "\n".join(mermaid_lines)
 

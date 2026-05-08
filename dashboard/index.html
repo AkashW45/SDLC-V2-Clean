@@ -616,33 +616,49 @@ function renderContent() {
   }
 
   // ── PHASE 4+5 — Code + Tests ────────────────────────────────
-  if (state.generated_changes?.length) {
+  if (state.generated_changes?.length || state.test_files?.length) {
     html += sectionHeader('04+05', 'Code Generation + Validation', false);
 
-    state.generated_changes.forEach(change => {
-      html += `<div style="background:var(--surface2);border-radius:6px;padding:14px;margin-bottom:12px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <div style="font-size:11px;color:var(--blue);font-weight:700">${change.file_path}</div>
-          <div style="font-size:9px;color:var(--accent)">✓ validated</div>
-        </div>
-        <div style="font-size:10px;color:var(--text2);margin-bottom:8px">${change.change_summary || ''}</div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap">
-          ${(change.new_symbols_added||[]).map(s => `<span style="font-size:9px;padding:2px 6px;background:rgba(0,255,136,0.1);border-radius:3px;color:var(--accent)">+ ${s}</span>`).join('')}
-          ${(change.existing_symbols_modified||[]).map(s => `<span style="font-size:9px;padding:2px 6px;background:rgba(0,153,255,0.1);border-radius:3px;color:var(--blue)">~ ${s}</span>`).join('')}
-        </div>
-        <details style="margin-top:10px">
-          <summary style="font-size:9px;color:var(--text3);cursor:pointer">View generated code</summary>
-          <pre style="font-size:9px;background:var(--surface3);padding:10px;border-radius:4px;margin-top:6px;overflow-x:auto;white-space:pre-wrap;color:var(--text2);max-height:300px;overflow-y:auto">${esc(change.content||'')}</pre>
-        </details>
-      </div>`;
-    });
+    if (state.generated_changes?.length) {
+      html += subHeader(`Generated Code (${state.generated_changes.length} files)`);
+      state.generated_changes.forEach(change => {
+        html += `<div style="background:var(--surface2);border-radius:6px;padding:14px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div style="font-size:11px;color:var(--blue);font-weight:700">${change.file_path}</div>
+            <div style="font-size:9px;color:var(--accent)">✓ validated</div>
+          </div>
+          <div style="font-size:10px;color:var(--text2);margin-bottom:8px">${change.change_summary || ''}</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            ${(change.new_symbols_added||[]).map(s => `<span style="font-size:9px;padding:2px 6px;background:rgba(0,255,136,0.1);border-radius:3px;color:var(--accent)">+ ${s}</span>`).join('')}
+            ${(change.existing_symbols_modified||[]).map(s => `<span style="font-size:9px;padding:2px 6px;background:rgba(0,153,255,0.1);border-radius:3px;color:var(--blue)">~ ${s}</span>`).join('')}
+          </div>
+          <details style="margin-top:10px">
+            <summary style="font-size:9px;color:var(--text3);cursor:pointer">View generated code</summary>
+            <pre style="font-size:9px;background:var(--surface3);padding:10px;border-radius:4px;margin-top:6px;overflow-x:auto;white-space:pre-wrap;color:var(--text2);max-height:300px;overflow-y:auto">${esc(change.content||'')}</pre>
+          </details>
+        </div>`;
+      });
+    }
 
     if (state.test_files?.length) {
-      html += subHeader(`Generated Tests (${state.test_files.length})`);
+      html += `<div style="display:flex;justify-content:space-between;align-items:center;margin:14px 0 8px">
+        <div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--text3)">🧪 Generated Tests (${state.test_files.length})</div>
+        <a href="${API}/pipeline/${selectedThread}/download/test-cases" target="_blank"
+           style="font-size:9px;color:var(--accent);text-decoration:none;padding:3px 8px;border:1px solid var(--accent);border-radius:4px">
+          ⬇ Test Cases XLSX
+        </a>
+      </div>`;
       state.test_files.forEach(tf => {
-        html += `<div style="background:var(--surface2);border-radius:5px;padding:10px 14px;margin-bottom:6px">
-          <div style="font-size:10px;color:var(--blue);margin-bottom:4px">${tf.test_file_path}</div>
-          <div style="font-size:9px;color:var(--text2)">${tf.test_count || 0} tests — covers: ${(tf.tests_cover||[]).join(', ')}</div>
+        html += `<div style="background:var(--surface2);border-radius:6px;padding:12px 14px;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-size:11px;color:var(--blue);font-weight:700">${tf.test_file_path||''}</div>
+            <span style="font-size:9px;padding:2px 6px;background:rgba(0,255,136,0.1);border-radius:3px;color:var(--accent)">${tf.test_count||0} tests</span>
+          </div>
+          <div style="font-size:9px;color:var(--text2);margin-bottom:6px">Covers: ${(tf.tests_cover||[]).join(', ')}</div>
+          <details>
+            <summary style="font-size:9px;color:var(--text3);cursor:pointer">View test code</summary>
+            <pre style="font-size:9px;background:var(--surface3);padding:10px;border-radius:4px;margin-top:6px;overflow-x:auto;white-space:pre-wrap;color:var(--text2);max-height:300px;overflow-y:auto">${esc(tf.content||'')}</pre>
+          </details>
         </div>`;
       });
     }
@@ -714,9 +730,27 @@ function renderContent() {
   }
 
   el.innerHTML = html;
-  if (html.includes('class="mermaid"') && window.mermaid) {
-    setTimeout(() => mermaid.run(), 50);
-  }
+  // Render Mermaid diagrams properly
+  setTimeout(() => {
+    if (window.mermaid) {
+      const diagrams = el.querySelectorAll('.mermaid');
+      diagrams.forEach((d, i) => {
+        if (!d.getAttribute('data-rendered')) {
+          const code = d.textContent.trim();
+          d.setAttribute('data-rendered', 'true');
+          try {
+            mermaid.render(`mermaid-svg-${Date.now()}-${i}`, code).then(({svg}) => {
+              d.innerHTML = svg;
+            }).catch(err => {
+              d.innerHTML = `<pre style="color:var(--danger);font-size:10px">Mermaid error: ${err.message}\n\n${code}</pre>`;
+            });
+          } catch(e) {
+            d.innerHTML = `<pre style="font-size:10px">${code}</pre>`;
+          }
+        }
+      });
+    }
+  }, 100);
 }
 
 // ── UI Helpers ──────────────────────────────────────────────────────

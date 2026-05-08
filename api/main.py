@@ -7,13 +7,13 @@ import os
 import uuid
 import asyncio
 from typing import Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException,Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from langgraph.types import Command
-from fastapi.responses import JSONResponse, HTMLResponse, Response
+from fastapi.responses import JSONResponse, HTMLResponse, Response 
 from api.runbook_export import (
     export_runbook_excel,
     export_brd_markdown,
@@ -30,6 +30,9 @@ from api.persistence import (
     init_persistence_tables, save_pipeline, load_all_pipelines,
     audit, get_audit_log
 )
+# ── In-memory pipeline state store ────────────────────────────────────────────
+# Stores: { thread_id: { graph, config, result, phase, status } }
+pipeline_store: dict = {}
 
 # Initialize on startup
 init_persistence_tables()
@@ -56,9 +59,7 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# ── In-memory pipeline state store ────────────────────────────────────────────
-# Stores: { thread_id: { graph, config, result, phase, status } }
-pipeline_store: dict = {}
+
 
 
 # ── Request / Response Models ─────────────────────────────────────────────────
@@ -368,6 +369,17 @@ def download_sprint_plan(thread_id: str):
         headers={"Content-Disposition": f"attachment; filename=SprintPlan_{thread_id}.md"}
     )
 
+@app.get("/pipeline/{thread_id}/download/test-cases")
+def download_test_cases(thread_id: str):
+    """Download Jira-driven test cases as Excel."""
+    from api.test_cases_export import export_test_cases_excel
+    entry = _get_pipeline_or_404(thread_id)
+    xlsx_bytes = export_test_cases_excel(entry)
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=TestCases_{thread_id}.xlsx"}
+    )
 
 @app.get("/pipeline/{thread_id}/download/impact")
 def download_impact(thread_id: str):
@@ -420,6 +432,13 @@ def download_all(thread_id: str):
         for test in state.get("test_files", []):
             fname = test.get("test_file_path", "test.py").replace("/", "_").replace("\\", "_")
             z.writestr(f"09_tests/{fname}", test.get("content", ""))
+
+        # Jira-driven test cases
+        from api.test_cases_export import export_test_cases_excel
+        try:
+            z.writestr("10_TestCases.xlsx", export_test_cases_excel(entry))
+        except Exception as e:
+            print(f"[Download] test cases skipped: {e}")    
 
     buf.seek(0)
     return Response(
@@ -620,7 +639,7 @@ def resume_current_phase(thread_id: str, approved: bool, feedback: str):
         })
 
 
-def run_phase2(thread_id: str):
+def run_phase2(thread_id: str , feedback: str = ""):
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -640,7 +659,8 @@ def run_phase2(thread_id: str):
             brd=p1_state.get("brd", {}),
             prd=p1_state.get("prd", {}),
             sprint_plan={}, runbook={},
-            human_feedback="", approved=False,
+            human_feedback=feedback,
+            approved=False,
             status="STARTED"
         )
 
@@ -660,7 +680,7 @@ def run_phase2(thread_id: str):
         })
 
 
-def run_phase3(thread_id: str):
+def run_phase3(thread_id: str , feedback: str = ""):
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -677,7 +697,7 @@ def run_phase3(thread_id: str):
             "requirement": entry["requirement"],
             "impact_report": {},
             "human_approved": False,
-            "human_feedback": "",
+            "human_feedback": feedback,
             "status": "STARTED"
         }
 
@@ -750,18 +770,101 @@ def run_phase4(thread_id: str):
         })
 
 
-def run_phase6(thread_id: str):
+def run_phase6(thread_id: str, feedback: str = ""):
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agents.phase6_delivery.delivery_agent import build_delivery_graph, DeliveryState
+        import requests as req_lib
 
         entry = pipeline_store[thread_id]
         state = entry["current_state"]
 
         pipeline_store[thread_id]["status"] = "PHASE_6_RUNNING"
+        pipeline_store[thread_id]["sub_stage"] = "Determining target repos..."
         pipeline_store[thread_id]["phase"] = 6
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
 
+        # ── Smart repo routing ──────────────────────────────────────
+        is_new_project = state.get("is_new_project", False)
+        selected_repos = state.get("selected_repos", [])
+
+        # If Phase 0 marked it as new project — create GitHub repos
+        if is_new_project and selected_repos:
+            github_token = os.getenv("GITHUB_TOKEN")
+            github_owner = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
+            target_repo_url = None
+            target_repo_name = None
+
+            for repo_def in selected_repos:
+                repo_name = repo_def["name"]
+                # Only create backend repo for code push (frontend is placeholder for now)
+                if repo_def.get("type") != "backend":
+                    continue
+
+                pipeline_store[thread_id]["sub_stage"] = f"Creating GitHub repo: {repo_name}..."
+                save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
+
+                # Check if repo already exists
+                check_url = f"https://api.github.com/repos/{github_owner}/{repo_name}"
+                check_resp = req_lib.get(check_url, headers={
+                    "Authorization": f"Bearer {github_token}",
+                    "Accept": "application/vnd.github+json"
+                })
+
+                if check_resp.status_code == 404:
+                    # Create new repo
+                    create_resp = req_lib.post(
+                        "https://api.github.com/user/repos",
+                        headers={
+                            "Authorization": f"Bearer {github_token}",
+                            "Accept": "application/vnd.github+json"
+                        },
+                        json={
+                            "name": repo_name,
+                            "description": entry["requirement"][:200],
+                            "private": False,
+                            "auto_init": True  # creates main branch with README
+                        }
+                    )
+                    if create_resp.status_code == 201:
+                        print(f"  [Phase 6] ✅ Created GitHub repo: {repo_name}")
+                        audit(thread_id, "phase6", "REPO_CREATED",
+                              details={"repo": repo_name})
+                    else:
+                        print(f"  [Phase 6] ⚠️  Failed to create repo: {create_resp.text[:200]}")
+
+                target_repo_url = f"https://github.com/{github_owner}/{repo_name}.git"
+                target_repo_name = repo_name
+                break  # Use first backend repo
+
+            if not target_repo_url:
+                # Fallback if no backend repo defined
+                slug = selected_repos[0]["name"]
+                target_repo_url = f"https://github.com/{github_owner}/{slug}.git"
+                target_repo_name = slug
+        else:
+            # Existing project — use selected repo
+            if selected_repos:
+                first_repo = selected_repos[0]
+                if isinstance(first_repo, dict):
+                    target_repo_name = first_repo.get("name", "leave-mgmt-backend")
+                    target_repo_url = first_repo.get("url",
+                        f"https://github.com/AkashW45/{target_repo_name}.git")
+                else:
+                    target_repo_name = str(first_repo)
+                    target_repo_url = f"https://github.com/AkashW45/{target_repo_name}.git"
+            else:
+                # Final fallback — old behavior
+                target_repo_url = os.getenv("REPO_URL",
+                    "https://github.com/AkashW45/leave-mgmt-backend.git")
+                target_repo_name = "leave-mgmt-backend"
+
+        print(f"  [Phase 6] Target repo: {target_repo_name} ({target_repo_url})")
+        pipeline_store[thread_id]["sub_stage"] = f"Pushing code to {target_repo_name}..."
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
+
+        # ── Run delivery graph ──────────────────────────────────────
         graph = build_delivery_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p6"}}
 
@@ -769,13 +872,11 @@ def run_phase6(thread_id: str):
             requirement=entry["requirement"],
             generated_changes=state.get("generated_changes", []),
             test_files=state.get("test_files", []),
-            branch_name=f"feature/{thread_id}",
-            repo_url=os.getenv(
-                "REPO_URL",
-                "https://github.com/AkashW45/leave-mgmt-backend.git"
-            ),
+            branch_name=f"feature/{thread_id}" if not is_new_project else "main",
+            repo_url=target_repo_url,
             pr_urls=[],
-            human_feedback="", approved=False,
+            human_feedback=feedback,
+            approved=False,
             status="STARTED"
         )
 
@@ -784,19 +885,26 @@ def run_phase6(thread_id: str):
         pipeline_store[thread_id].update({
             "graph": graph,
             "config": config,
-            "current_state": {**state, **result},
+            "current_state": {**state, **result, "target_repo": target_repo_name},
             "pr_urls": result.get("pr_urls", []),
-            "status": "WAITING_PHASE_6_APPROVAL"
+            "status": "WAITING_PHASE_6_APPROVAL",
+            "sub_stage": "Code pushed — Awaiting PR approval"
         })
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(pipeline_store[thread_id]["current_state"]))
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         pipeline_store[thread_id].update({
             "status": "ERROR",
             "error": f"Phase 6 error: {str(e)}"
         })
+        audit(thread_id, "phase6", "ERROR", details={"error": str(e)})
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
 
 
-def run_phase7(thread_id: str):
+def run_phase7(thread_id: str , feedback: str = ""):
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -823,7 +931,8 @@ def run_phase7(thread_id: str):
             deploy_results=[],
             monitoring_results={},
             rollback_triggered=False,
-            human_feedback="", approved=False,
+            human_feedback=feedback,
+            approved=False,
             status="STARTED"
         )
 

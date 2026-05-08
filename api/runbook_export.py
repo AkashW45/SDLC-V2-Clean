@@ -328,70 +328,205 @@ def export_runbook_excel(pipeline_state: dict) -> bytes:
 def export_brd_markdown(brd: dict) -> str:
     if not brd:
         return "# BRD\n\n_No BRD generated yet._"
-    lines = [f"# Business Requirements Document\n",
-             f"## {brd.get('title', 'Untitled')}\n"]
-    if brd.get("business_objectives"):
-        lines.append("## Business Objectives\n")
-        for o in brd["business_objectives"]:
-            lines.append(f"- {o}")
-        lines.append("")
-    if brd.get("scope"):
-        lines.append("## Scope\n")
-        if brd["scope"].get("in_scope"):
-            lines.append("### In Scope\n")
-            for s in brd["scope"]["in_scope"]:
-                lines.append(f"- {s}")
-            lines.append("")
-        if brd["scope"].get("out_of_scope"):
-            lines.append("### Out of Scope\n")
-            for s in brd["scope"]["out_of_scope"]:
-                lines.append(f"- {s}")
-            lines.append("")
-    if brd.get("functional_requirements"):
-        lines.append("## Functional Requirements\n")
-        for fr in brd["functional_requirements"]:
-            lines.append(f"### {fr.get('id','')} — {fr.get('title','')}")
-            lines.append(f"**Priority:** {fr.get('priority','')}")
-            lines.append(f"\n{fr.get('description','')}\n")
-    if brd.get("non_functional_requirements"):
-        lines.append("## Non-Functional Requirements\n")
-        for nfr in brd["non_functional_requirements"]:
-            lines.append(f"- **{nfr.get('id','')}** — {nfr.get('description','')}")
-    if brd.get("stakeholders"):
-        lines.append("\n## Stakeholders\n")
-        for s in brd["stakeholders"]:
-            lines.append(f"- {s}")
-    if brd.get("risks"):
-        lines.append("\n## Risks\n")
-        for r in brd["risks"]:
-            lines.append(f"- {r}")
-    return "\n".join(lines)
 
+    L = []
+    L.append(f"# Business Requirements Document")
+    L.append(f"## {brd.get('title', 'Untitled')}\n")
+
+    if brd.get("executive_summary"):
+        L.append("## Executive Summary\n")
+        L.append(brd["executive_summary"] + "\n")
+
+    if brd.get("business_context"):
+        L.append("## Business Context\n")
+        L.append(brd["business_context"] + "\n")
+
+    if brd.get("business_objectives"):
+        L.append("## Business Objectives\n")
+        for o in brd["business_objectives"]:
+            L.append(f"- {o}")
+        L.append("")
+
+    if brd.get("in_scope"):
+        L.append("## Scope\n\n### In Scope\n")
+        for s in brd["in_scope"]:
+            L.append(f"- {s}")
+        L.append("")
+
+    if brd.get("out_of_scope"):
+        L.append("### Out of Scope\n")
+        for s in brd["out_of_scope"]:
+            L.append(f"- {s}")
+        L.append("")
+
+    if brd.get("stakeholders"):
+        L.append("## Stakeholders\n")
+        L.append("| Role | Name/Team | Responsibility |")
+        L.append("|------|-----------|----------------|")
+        for s in brd["stakeholders"]:
+            if isinstance(s, dict):
+                L.append(f"| {s.get('role','')} | {s.get('name_or_team','')} | {s.get('responsibility','')} |")
+            else:
+                L.append(f"| - | {s} | - |")
+        L.append("")
+
+    if brd.get("raci_matrix"):
+        L.append("## RACI Matrix\n")
+        L.append("| Activity | Responsible | Accountable | Consulted | Informed |")
+        L.append("|----------|-------------|-------------|-----------|----------|")
+        for r in brd["raci_matrix"]:
+            L.append(f"| {r.get('activity','')} | {r.get('responsible','')} | {r.get('accountable','')} | {r.get('consulted','')} | {r.get('informed','')} |")
+        L.append("")
+
+    if brd.get("functional_requirements"):
+        L.append(f"## Functional Requirements ({len(brd['functional_requirements'])})\n")
+        for fr in brd["functional_requirements"]:
+            L.append(f"### {fr.get('id','')} — {fr.get('title','')}")
+            L.append(f"**Priority:** {fr.get('priority','')}\n")
+            L.append(f"{fr.get('description','')}\n")
+            if fr.get("business_value"):
+                L.append(f"**Business Value:** {fr['business_value']}\n")
+
+    if brd.get("non_functional_requirements"):
+        L.append(f"## Non-Functional Requirements ({len(brd['non_functional_requirements'])})\n")
+        L.append("| ID | Title | Description | Priority | Metric |")
+        L.append("|-----|-------|-------------|----------|--------|")
+        for nfr in brd["non_functional_requirements"]:
+            L.append(f"| {nfr.get('id','')} | {nfr.get('title','')} | {nfr.get('description','')} | {nfr.get('priority','')} | {nfr.get('metric','')} |")
+        L.append("")
+
+    if brd.get("kpis"):
+        L.append("## Key Performance Indicators\n")
+        L.append("| KPI | Target | Method | Frequency |")
+        L.append("|-----|--------|--------|-----------|")
+        for k in brd["kpis"]:
+            L.append(f"| {k.get('name','')} | {k.get('target','')} | {k.get('measurement_method','')} | {k.get('frequency','')} |")
+        L.append("")
+
+    if brd.get("risk_matrix"):
+        L.append("## Risk Matrix\n")
+        L.append("| ID | Risk | Likelihood | Impact | Mitigation | Owner |")
+        L.append("|----|------|------------|--------|------------|-------|")
+        for r in brd["risk_matrix"]:
+            L.append(f"| {r.get('id','')} | {r.get('risk','')} | {r.get('likelihood','')} | {r.get('impact','')} | {r.get('mitigation','')} | {r.get('owner','')} |")
+        L.append("")
+
+    if brd.get("assumptions"):
+        L.append("## Assumptions\n")
+        for a in brd["assumptions"]:
+            L.append(f"- {a}")
+        L.append("")
+
+    if brd.get("dependencies"):
+        L.append("## Dependencies\n")
+        for d in brd["dependencies"]:
+            L.append(f"- {d}")
+        L.append("")
+
+    if brd.get("success_criteria"):
+        L.append("## Success Criteria\n")
+        for s in brd["success_criteria"]:
+            L.append(f"- {s}")
+        L.append("")
+
+    if brd.get("timeline_estimate"):
+        L.append(f"## Timeline\n\n{brd['timeline_estimate']}\n")
+
+    if brd.get("budget_considerations"):
+        L.append(f"## Budget Considerations\n\n{brd['budget_considerations']}\n")
+
+    return "\n".join(L)
 
 def export_prd_markdown(prd: dict) -> str:
     if not prd:
         return "# PRD\n\n_No PRD generated yet._"
-    lines = [f"# Product Requirements Document\n",
-             f"## {prd.get('title', 'Untitled')}\n"]
-    if prd.get("product_vision"):
-        lines.append(f"## Product Vision\n\n{prd['product_vision']}\n")
-    if prd.get("functional_requirements"):
-        lines.append("## Functional Requirements\n")
-        for fr in prd["functional_requirements"]:
-            lines.append(f"### {fr.get('id','')} — {fr.get('title','')}")
-            lines.append(f"**Priority:** {fr.get('priority','')}")
-            lines.append(f"\n{fr.get('description','')}\n")
-            if fr.get("acceptance_criteria"):
-                lines.append("**Acceptance Criteria:**")
-                for ac in fr["acceptance_criteria"]:
-                    lines.append(f"- {ac}")
-                lines.append("")
-    if prd.get("non_functional_requirements"):
-        lines.append("## Non-Functional Requirements\n")
-        for nfr in prd["non_functional_requirements"]:
-            lines.append(f"- **{nfr.get('id','')}** ({nfr.get('priority','')}) — {nfr.get('description','')}")
-    return "\n".join(lines)
 
+    L = []
+    L.append(f"# Product Requirements Document")
+    L.append(f"## {prd.get('title', 'Untitled')}\n")
+
+    if prd.get("executive_summary"):
+        L.append("## Executive Summary\n")
+        L.append(prd["executive_summary"] + "\n")
+
+    if prd.get("product_vision"):
+        L.append(f"## Product Vision\n\n{prd['product_vision']}\n")
+
+    if prd.get("target_users"):
+        L.append("## Target Users\n")
+        for u in prd["target_users"]:
+            if isinstance(u, dict):
+                L.append(f"### {u.get('persona','')}")
+                L.append(f"- **Needs:** {u.get('needs','')}")
+                L.append(f"- **Pain Points:** {u.get('pain_points','')}\n")
+
+    if prd.get("user_journeys"):
+        L.append("## User Journeys\n")
+        for j in prd["user_journeys"]:
+            if isinstance(j, dict):
+                L.append(f"### {j.get('journey','')}")
+                for i, s in enumerate(j.get("steps", []), 1):
+                    L.append(f"{i}. {s}")
+                L.append("")
+
+    if prd.get("functional_requirements"):
+        L.append(f"## Functional Requirements ({len(prd['functional_requirements'])})\n")
+        for fr in prd["functional_requirements"]:
+            L.append(f"### {fr.get('id','')} — {fr.get('title','')}")
+            L.append(f"**Priority:** {fr.get('priority','')}\n")
+            if fr.get("user_story"):
+                L.append(f"**User Story:** {fr['user_story']}\n")
+            L.append(f"{fr.get('description','')}\n")
+            if fr.get("acceptance_criteria"):
+                L.append("**Acceptance Criteria:**")
+                for ac in fr["acceptance_criteria"]:
+                    L.append(f"- {ac}")
+                L.append("")
+            if fr.get("edge_cases"):
+                L.append("**Edge Cases:**")
+                for ec in fr["edge_cases"]:
+                    L.append(f"- {ec}")
+                L.append("")
+            if fr.get("dependencies"):
+                L.append(f"**Dependencies:** {', '.join(fr['dependencies'])}\n")
+
+    if prd.get("non_functional_requirements"):
+        L.append("## Non-Functional Requirements\n")
+        L.append("| ID | Title | Description | Priority | Verification |")
+        L.append("|-----|-------|-------------|----------|--------------|")
+        for nfr in prd["non_functional_requirements"]:
+            L.append(f"| {nfr.get('id','')} | {nfr.get('title','')} | {nfr.get('description','')} | {nfr.get('priority','')} | {nfr.get('verification_method','')} |")
+        L.append("")
+
+    if prd.get("technical_requirements"):
+        L.append("## Technical Requirements\n")
+        for tr in prd["technical_requirements"]:
+            L.append(f"### {tr.get('id','')} — {tr.get('title','')}")
+            L.append(f"{tr.get('description','')}\n")
+            if tr.get("rationale"):
+                L.append(f"**Rationale:** {tr['rationale']}\n")
+
+    if prd.get("success_metrics"):
+        L.append("## Success Metrics\n")
+        L.append("| Metric | Baseline | Target | Timeline |")
+        L.append("|--------|----------|--------|----------|")
+        for m in prd["success_metrics"]:
+            L.append(f"| {m.get('metric','')} | {m.get('baseline','')} | {m.get('target','')} | {m.get('timeline','')} |")
+        L.append("")
+
+    if prd.get("release_phases"):
+        L.append("## Release Plan\n")
+        for r in prd["release_phases"]:
+            L.append(f"### {r.get('phase','')} — {r.get('timeline','')}")
+            L.append(f"**Scope:** {', '.join(r.get('scope', []))}\n")
+
+    if prd.get("open_questions"):
+        L.append("## Open Questions\n")
+        for q in prd["open_questions"]:
+            L.append(f"- {q}")
+        L.append("")
+
+    return "\n".join(L)
 
 def export_adr_markdown(adr: dict) -> str:
     if not adr:
