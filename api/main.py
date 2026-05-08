@@ -966,10 +966,12 @@ def run_indexer(repo_path: str, repo_name: str):
 def _safe_state(state: dict) -> dict:
     """Strip non-serialisable items (graph objects etc)."""
     safe_keys = [
-        "brd", "prd", "adr", "sprint_plan", "runbook",
+        "brd", "prd", "adr", "architecture",
+        "sprint_plan", "runbook", "jira_tickets",
         "impact_report", "generated_changes", "test_files",
         "pr_urls", "deploy_results", "monitoring_results",
-        "status", "requirement"
+        "status", "requirement",
+        "is_new_project", "selected_repos", "target_repo"
     ]
     result = {}
     for k in safe_keys:
