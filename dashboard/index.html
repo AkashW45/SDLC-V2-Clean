@@ -7,7 +7,30 @@
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <!-- ADD THESE TWO LINES HERE -->
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<script>mermaid.initialize({startOnLoad:false, theme:'dark', themeVariables:{primaryColor:'#1a4a8a',primaryTextColor:'#e6edf3',edgeLabelBackground:'#161b22',lineColor:'#2E86DE'}});</script>
+<script>
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'dark',
+  themeVariables: {
+    fontFamily: 'JetBrains Mono, monospace',
+    fontSize: '14px',
+    primaryColor: '#1E40AF',
+    primaryTextColor: '#E6EDF3',
+    primaryBorderColor: '#3B82F6',
+    lineColor: '#8B949E',
+    edgeLabelBackground: '#161B22',
+    clusterBkg: '#0D1117',
+    clusterBorder: '#30363D'
+  },
+  flowchart: {
+    htmlLabels: true,
+    curve: 'basis',
+    nodeSpacing: 50,
+    rankSpacing: 70,
+    padding: 20
+  }
+});
+</script>
 <style>
 :root {
   --bg: #090c10;
@@ -973,6 +996,17 @@ function renderContent() {
   
     // ADD THESE TWO LINES:
     el.innerHTML = html; 
+    // NEW: Tell Mermaid to render the dynamically injected diagram
+  setTimeout(async () => {
+    const mermaidNodes = document.querySelectorAll('.mermaid');
+    if (mermaidNodes.length > 0) {
+      try {
+        await mermaid.run({ querySelector: '.mermaid' });
+      } catch (err) {
+        console.warn('Mermaid rendering failed:', err);
+      }
+    }
+  }, 50); // slight delay ensures DOM is completely painted before rendering
 
 }    
 // ── UI Helpers ──────────────────────────────────────────────────────

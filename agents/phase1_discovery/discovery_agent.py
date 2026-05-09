@@ -255,6 +255,92 @@ Tech Requirements: {json.dumps(prd.get('technical_requirements', [])[:6])}
     print(f"  ✅ ADR generated: {len(adr['decisions'])} decisions")
     return {**state, "adr": adr, "status": "ADR_GENERATED"}
 
+import re
+
+def _build_mermaid(arch: dict) -> str:
+    nodes = arch.get("nodes", [])
+    edges = arch.get("edges", [])
+
+    def safe_id(node_id):
+        return re.sub(r'[^A-Z0-9_]', '_', str(node_id).upper())
+
+    def shape(node):
+        nid = safe_id(node.get("id", ""))
+        name = node.get("name", "").replace('"', "'")[:35]
+        ntype = (node.get("type") or "service").lower()
+        if ntype == "database":
+            return f'        {nid}[("{name}")]'
+        elif ntype == "external":
+            return f'        {nid}(["{name}"])'
+        elif ntype == "queue":
+            return f'        {nid}[/"{name}"\\]'
+        elif ntype == "cache":
+            return f'        {nid}[("{name}")]'
+        else:
+            return f'        {nid}["{name}"]'
+
+    # Group nodes by zone
+    zones = {}
+    for n in nodes:
+        zone = (n.get("zone") or "core").lower()
+        zones.setdefault(zone, []).append(n)
+
+    # Render order — controls visual flow left to right
+    zone_order = ["external", "edge", "dmz", "core", "pci", "data", "observability"]
+    zone_titles = {
+        "external": "External",
+        "edge": "Edge",
+        "dmz": "DMZ",
+        "core": "Core Services",
+        "pci": "PCI Zone",
+        "data": "Data Layer",
+        "observability": "Observability"
+    }
+
+    lines = ["graph LR"]
+
+    # Subgraphs per zone
+    for zone in zone_order:
+        if zone not in zones:
+            continue
+        title = zone_titles.get(zone, zone.title())
+        lines.append(f'    subgraph {zone.upper()}["{title}"]')
+        lines.append(f'    direction TB')
+        for n in zones[zone]:
+            lines.append(shape(n))
+        lines.append('    end')
+
+    # Edges
+    for e in edges:
+        src = safe_id(e.get("source", ""))
+        tgt = safe_id(e.get("target", ""))
+        proto = (e.get("protocol", "") or "").replace('|', '/')[:12]
+        if proto:
+            lines.append(f'    {src} -->|{proto}| {tgt}')
+        else:
+            lines.append(f'    {src} --> {tgt}')
+
+    # Styling — professional palette
+    lines.append('')
+    lines.append('    classDef service fill:#1E40AF,stroke:#3B82F6,stroke-width:2px,color:#fff')
+    lines.append('    classDef database fill:#065F46,stroke:#10B981,stroke-width:2px,color:#fff')
+    lines.append('    classDef external fill:#6B21A8,stroke:#A855F7,stroke-width:2px,color:#fff')
+    lines.append('    classDef queue fill:#9A3412,stroke:#F97316,stroke-width:2px,color:#fff')
+    lines.append('    classDef cache fill:#854D0E,stroke:#EAB308,stroke-width:2px,color:#fff')
+
+    # Apply classes
+    for n in nodes:
+        nid = safe_id(n.get("id", ""))
+        ntype = (n.get("type") or "service").lower()
+        if ntype in ("service", "database", "external", "queue", "cache"):
+            lines.append(f'    class {nid} {ntype}')
+        else:
+            lines.append(f'    class {nid} service')
+
+    return "\n".join(lines)
+
+
+
 
 def generate_architecture(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating architecture design...")
@@ -335,49 +421,9 @@ Return:
     if not arch.get("edges"):
         arch["edges"] = []
 
-    # Generate mermaid deterministically (FIXED syntax)
-    mermaid_lines = ["graph TD"]
-    for node in arch.get("nodes", []):
-        nid = re.sub(r'[^A-Z0-9_]', '_', node["id"].upper())
-        # Escape quotes in name
-        name = node["name"].replace('"', "'")[:40]
-        ntype = node.get("type", "service")
+    
 
-        if ntype == "database":
-            mermaid_lines.append(f'    {nid}[("{name}")]')
-        elif ntype == "external":
-            mermaid_lines.append(f'    {nid}(["{name}"])')
-        elif ntype == "queue":
-            mermaid_lines.append(f'    {nid}>"{name}"]')  # asymmetric shape, valid mermaid
-        elif ntype == "cache":
-            mermaid_lines.append(f'    {nid}[/"{name}"/]')
-        else:
-            mermaid_lines.append(f'    {nid}["{name}"]')
-
-    for edge in arch.get("edges", []):
-        src = re.sub(r'[^A-Z0-9_]', '_', edge["source"].upper())
-        tgt = re.sub(r'[^A-Z0-9_]', '_', edge["target"].upper())
-        proto = edge.get("protocol", "").replace('|', '/')[:15]
-        if proto:
-            mermaid_lines.append(f'    {src} -->|{proto}| {tgt}')
-        else:
-            mermaid_lines.append(f'    {src} --> {tgt}')
-
-    # Add styling
-    mermaid_lines.append("    classDef serviceStyle fill:#1a4a8a,stroke:#2E86DE,color:#fff")
-    mermaid_lines.append("    classDef dbStyle fill:#1a6b3a,stroke:#27AE60,color:#fff")
-    mermaid_lines.append("    classDef extStyle fill:#7d3c98,stroke:#9b59b6,color:#fff")
-    for node in arch.get("nodes", []):
-        nid = re.sub(r'[^A-Z0-9_]', '_', node["id"].upper())
-        ntype = node.get("type", "service")
-        if ntype == "database":
-            mermaid_lines.append(f"    class {nid} dbStyle")
-        elif ntype == "external":
-            mermaid_lines.append(f"    class {nid} extStyle")
-        else:
-            mermaid_lines.append(f"    class {nid} serviceStyle")
-
-    arch["mermaid"] = "\n".join(mermaid_lines)
+    arch["mermaid"] = _build_mermaid(arch)
 
     print(f"  ✅ Architecture: {len(arch['nodes'])} nodes, {len(arch['edges'])} edges")
     return {**state, "architecture": arch, "status": "ARCHITECTURE_GENERATED"}
