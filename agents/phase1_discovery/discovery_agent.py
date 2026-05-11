@@ -4,19 +4,15 @@ import json
 import re
 sys.path.insert(0, r"C:\Users\user\SDLC-V2")
 
-from openai import OpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt
 from typing import TypedDict, Dict, Any
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
+from core.llm_gateway import gateway
 
 load_dotenv()
-
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
 
 
 class DiscoveryState(TypedDict):
@@ -30,28 +26,29 @@ class DiscoveryState(TypedDict):
     status: str
 
 
-def _llm_json(prompt: str, max_tokens: int = 16384) -> dict:
-    response = client.chat.completions.create(
-        model="deepseek-v4-flash",
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
+def _generate_validated_json(prompt: str, max_tokens: int = 8192) -> dict:
+    """
+    Generate JSON from LLM using centralized gateway with strict JSON output.
+    Retries with exponential backoff on JSON decode errors.
+    """
+    response = gateway.generate(
         messages=[{"role": "user", "content": prompt}],
-        stream=False,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}},
-        max_tokens=max_tokens
+        model="deepseek-v4-pro",
+        response_format={"type": "json_object"},
+        max_tokens=max_tokens,
+        extra_params={
+            "reasoning_effort": "high",
+            "extra_body": {"thinking": {"type": "enabled"}}
+        }
     )
-    content = response.choices[0].message.content.strip()
-    if content.startswith("```"):
-        content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
+    content = response.strip() if isinstance(response, str) else response
     try:
         return json.loads(content)
-    except Exception:
-        try:
-            start = content.find('{')
-            end = content.rfind('}') + 1
-            return json.loads(content[start:end])
-        except Exception:
-            print(f"  [LLM] JSON parse failed. Raw response (first 500 chars): {content[:500]}")
-            return {}
+    except json.JSONDecodeError as e:
+        print(f"  [LLM] JSON decode error, retrying... Error: {e}")
+        raise  # Trigger retry via tenacity
+
 
 def _feedback_block(state) -> str:
     fb = state.get("human_feedback", "")
@@ -63,7 +60,7 @@ def _feedback_block(state) -> str:
 def generate_brd(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating BRD...")
 
-    brd = _llm_json(f"""
+    brd = _generate_validated_json(f"""
 You are a Senior Business Analyst writing a BRD for executive review.
 The BRD must read like a McKinsey document — specific, quantified, no fluff.
 {_feedback_block(state)}
@@ -129,7 +126,14 @@ def generate_prd(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating PRD...")
 
     brd = state["brd"]
-    prd = _llm_json(f"""
+    # Extract only essential BRD data to minimize token usage
+    brd_context = {
+        "title": brd.get("title", ""),
+        "business_objectives": brd.get("business_objectives", []),
+        "kpis": brd.get("kpis", [])
+    }
+    
+    prd = _generate_validated_json(f"""
 You are a Senior Product Owner writing a PRD for engineering execution.
 This must read like a Stripe/Linear PRD — specific user stories, not vague generalities.
 {_feedback_block(state)}
@@ -182,10 +186,7 @@ Minimum:
 - 3+ release phases
 
 BRD Context:
-Title: {brd.get('title','')}
-Summary: {brd.get('executive_summary','')[:500]}
-Objectives: {json.dumps(brd.get('business_objectives', []))}
-KPIs: {json.dumps(brd.get('kpis', []))}
+{json.dumps(brd_context)}
 """)
 
     if not prd.get("title"):
@@ -202,7 +203,14 @@ def generate_adr(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating ADR...")
 
     prd = state["prd"]
-    adr = _llm_json(f"""
+    # Extract only essential PRD data to minimize token usage
+    prd_context = {
+        "title": prd.get("title", ""),
+        "non_functional_requirements": prd.get("non_functional_requirements", [])[:6],
+        "technical_requirements": prd.get("technical_requirements", [])[:6]
+    }
+    
+    adr = _generate_validated_json(f"""
 You are a Senior Software Architect writing ADRs in MADR format.
 Each ADR must include alternatives considered with trade-offs — not just the chosen path.
 {_feedback_block(state)}
@@ -244,9 +252,7 @@ Minimum 7 decisions covering:
 Each MUST have at least 2 alternatives_considered with detailed pros/cons.
 
 PRD Context:
-Project: {prd.get('title','')}
-NFRs: {json.dumps(prd.get('non_functional_requirements', [])[:6])}
-Tech Requirements: {json.dumps(prd.get('technical_requirements', [])[:6])}
+{json.dumps(prd_context)}
 """)
 
     if not adr.get("decisions"):
@@ -260,6 +266,7 @@ def generate_architecture(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating architecture design...")
 
     prd = state["prd"]
+    adr = state.get("adr", {})
 
     # Build canonical requirement list (V1 pattern)
     functional_reqs = []
@@ -280,9 +287,17 @@ def generate_architecture(state: DiscoveryState) -> DiscoveryState:
         elif isinstance(r, str):
             non_functional_reqs.append(r)
 
+    # Extract token-optimized ADR decisions (title -> decision mapping only)
+    adr_decisions_summary = {}
+    for decision in adr.get("decisions", []):
+        title = decision.get("title", "")
+        chosen_decision = decision.get("decision", "")
+        if title and chosen_decision:
+            adr_decisions_summary[title] = chosen_decision
+
     project_name = prd.get("title", "SYSTEM")
 
-    arch = _llm_json(f"""
+    arch = _generate_validated_json(f"""
 You are a strict software architect.
 {_feedback_block(state)}
 RULES:
@@ -290,7 +305,8 @@ RULES:
 2. Do NOT invent technologies not implied by requirements
 3. 4-8 nodes maximum
 4. Every node MUST include "traced_to" — the exact requirement text it fulfils
-5. Return ONLY valid JSON
+5. You MUST strictly adhere to the technologies and patterns defined in the ADR Context. Do not invent conflicting nodes.
+6. Return ONLY valid JSON
 
 Project: {project_name}
 
@@ -299,6 +315,9 @@ Functional Requirements:
 
 Non-Functional Requirements:
 {json.dumps(non_functional_reqs, indent=2)}
+
+ADR Context (Architectural Decisions):
+{json.dumps(adr_decisions_summary, indent=2)}
 
 Return:
 {{
