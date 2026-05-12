@@ -654,6 +654,7 @@ def run_phase2(thread_id: str, feedback: str = ""):
 
         initial = PlanningState(
             requirement=entry["requirement"],
+            scope_contract=prev_state.get("scope_contract", {}),  # NEW
             brd=prev_state.get("brd", {}),
             prd=prev_state.get("prd", {}),
             sprint_plan={}, runbook={}, jira_tickets=[],
@@ -824,6 +825,7 @@ def run_phase4(thread_id: str):
         result5 = run_validation_phase(
             requirement=entry["requirement"],
             generated_changes=result4["generated_changes"],
+            scope_contract=state.get("scope_contract", {}),
             thread_id=f"{thread_id}-p5"
         )
 
@@ -991,6 +993,7 @@ def run_phase7(thread_id: str, feedback: str = ""):
             runbook=state.get("runbook", {}),
             pr_urls=entry.get("pr_urls", []),
             affected_repos=affected_repos,
+            scope_contract=state.get("scope_contract", {}),
             deploy_sequence=[],
             feature_flags=[],
             deploy_results=[],
@@ -1042,6 +1045,8 @@ def _safe_state(state: dict) -> dict:
     safe_keys = [
         # Phase 0
         "selected_project", "selected_repos", "is_new_project", "candidates",
+        # Phase 0.5 — NEW
+        "scope_contract", "classifier_output",
         # Phase 1
         "brd", "prd", "adr", "architecture",
         # Phase 2

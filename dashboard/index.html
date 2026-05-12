@@ -707,7 +707,7 @@ function renderContent() {
       if (arch.mermaid) {
         html += `<div style="background:var(--surface2);border-radius:8px;padding:16px;margin-bottom:12px;overflow-x:auto">
           <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px">Architecture Diagram</div>
-          <div class="mermaid">${arch.mermaid}</div>
+          <div class="mermaid" id="mermaid-arch-${selectedThread}">${arch.mermaid}</div>
         </div>`;
       }
 
@@ -994,19 +994,24 @@ function renderContent() {
     html += sectionClose();
   }
   
-    // ADD THESE TWO LINES:
-    el.innerHTML = html; 
-    // NEW: Tell Mermaid to render the dynamically injected diagram
-  setTimeout(async () => {
-    const mermaidNodes = document.querySelectorAll('.mermaid');
-    if (mermaidNodes.length > 0) {
-      try {
-        await mermaid.run({ querySelector: '.mermaid' });
-      } catch (err) {
-        console.warn('Mermaid rendering failed:', err);
-      }
+  el.innerHTML = html;
+
+setTimeout(async () => {
+  const nodes = el.querySelectorAll('.mermaid:not([data-rendered])');
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    const code = node.textContent.trim();
+    node.setAttribute('data-rendered', 'true');
+    try {
+      const id = 'mermaid-svg-' + Date.now() + '-' + i;
+      const { svg } = await mermaid.render(id, code);
+      node.innerHTML = svg;
+    } catch(err) {
+      console.warn('Mermaid error:', err);
+      node.innerHTML = `<pre style="color:var(--danger);font-size:10px">${code}</pre>`;
     }
-  }, 50); // slight delay ensures DOM is completely painted before rendering
+  }
+}, 50);
 
 }    
 // ── UI Helpers ──────────────────────────────────────────────────────

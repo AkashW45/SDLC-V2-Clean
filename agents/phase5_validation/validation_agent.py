@@ -34,6 +34,7 @@ client = OpenAI(
 
 class ValidationState(TypedDict):
     requirement: str
+    scope_contract: dict      # NEW
     generated_changes: list
     test_files: list
     validation_results: dict
@@ -85,7 +86,6 @@ def run_basic_lint(code: str, file_path: str) -> list:
 # -----------------------------------------
 
 def generate_tests(state: ValidationState) -> ValidationState:
-    """Generate pytest tests for all changed files."""
     print("\n[Phase 5] Generating tests...")
 
     test_files = []
@@ -99,63 +99,45 @@ def generate_tests(state: ValidationState) -> ValidationState:
 
         print(f"\n  Generating tests for: {file_path}")
 
-        prompt = f"""
-You are a senior QA engineer writing pytest tests.
+        user_msg = json.dumps({
+            "scope_contract": state.get("scope_contract", {}),
+            "file_path": file_path,
+            "content": content,
+            "change_summary": change_summary,
+            "new_symbols": new_symbols,
+            "modified_symbols": modified_symbols,
+            "requirement": state["requirement"]
+        }, indent=2)
 
-FILE BEING TESTED: {file_path}
+        response = client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": (
+                    "You are a senior QA engineer writing pytest tests. "
+                    "Return ONLY valid JSON with test_file_path, content, test_count, tests_cover."
+                )},
+                {"role": "user", "content": user_msg}
+            ],
+            max_tokens=2000
+        )
 
-FILE CONTENT:
-```python
-{content}
-```
-
-CHANGES MADE:
-{change_summary}
-
-NEW SYMBOLS ADDED: {json.dumps(new_symbols)}
-MODIFIED SYMBOLS: {json.dumps(modified_symbols)}
-
-REQUIREMENT: {state['requirement']}
-
-Write comprehensive pytest tests that:
-1. Test each new function/class added
-2. Test modified functions still work correctly
-3. Test edge cases (zero balance, negative values etc)
-4. Use pytest fixtures where appropriate
-5. No external dependencies — use mocks if needed
-
-Return ONLY valid JSON:
-{{
-  "test_file_path": "tests/test_{file_path.replace('/', '_').replace('\\\\', '_').replace('.py', '')}.py",
-  "content": "complete pytest test file content",
-  "test_count": 5,
-  "tests_cover": ["function1", "function2"]
-}}
-"""
-
-        response = call_llm(prompt, max_tokens=2000)
-
-        if response.startswith("```"):
-            response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"```(?:json)?", "", raw).strip().strip("```").strip()
 
         try:
-            test_file = json.loads(response)
-
-            # Validate test file syntax
+            test_file = json.loads(raw)
             errors = validate_python_syntax(
                 test_file.get("content", ""),
                 test_file.get("test_file_path", "")
             )
-
             if errors:
                 print(f"  ⚠️  Test syntax errors: {errors}")
                 test_file["syntax_errors"] = errors
             else:
                 print(f"  ✅ Tests generated: {test_file.get('test_count', 0)} tests")
                 print(f"     Covers: {test_file.get('tests_cover', [])}")
-
             test_files.append(test_file)
-
         except json.JSONDecodeError as e:
             print(f"  ❌ Failed to parse test response: {e}")
 

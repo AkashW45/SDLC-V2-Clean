@@ -12,6 +12,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from groq import Groq
+from agents.prompts.system_prompts import SPRINT_PLANNER_SYSTEM
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -33,6 +34,7 @@ client = OpenAI(
 
 class PlanningState(TypedDict):
     requirement: str
+    scope_contract: dict      # <-- ADD THIS LINE
     brd: dict
     prd: dict
     sprint_plan: dict
@@ -68,47 +70,34 @@ def call_llm(prompt: str) -> dict:
 # Nodes
 # -----------------------------------------
 
+
 def generate_sprint_plan(state: PlanningState) -> PlanningState:
     print("\n[Phase 2] Generating sprint plan...")
 
-    prd = state["prd"]
-    requirements = prd.get("functional_requirements", [])
+    user_msg = json.dumps({
+        "scope_contract": state["scope_contract"],
+        "brd": state["brd"],
+        "prd": state["prd"]
+    }, indent=2)
 
-    sprint_plan = call_llm(f"""
-You are a senior Scrum Master and Product Owner.
-Generate a sprint plan from this PRD.
-Return ONLY valid JSON:
-{{
-  "project": "LEAVE-MGMT",
-  "sprint_duration": "2 weeks",
-  "epics": [
-    {{
-      "epic_id": "EP-001",
-      "title": "...",
-      "description": "...",
-      "business_goal": "...",
-      "affected_repos": ["leave-mgmt-backend"],
-      "risk_level": "medium",
-      "stories": [
-        {{
-          "story_id": "US-001",
-          "title": "...",
-          "description": "As a [user] I want [goal] so that [benefit]",
-          "acceptance_criteria": ["...", "..."],
-          "story_points": 3,
-          "affected_repo": "leave-mgmt-backend",
-          "labels": ["backend"]
-        }}
-      ]
-    }}
-  ]
-}}
+    response = client.chat.completions.create(
+        model="deepseek-v4-flash",
+        messages=[
+            {"role": "system", "content": SPRINT_PLANNER_SYSTEM},
+            {"role": "user", "content": user_msg}
+        ],
+        stream=False,
+        reasoning_effort="high",
+        extra_body={"thinking": {"type": "enabled"}}
+    )
 
-PRD functional requirements:
-{json.dumps(requirements, indent=2)}
-
-Requirement: {state['requirement']}
-""")
+    content = response.choices[0].message.content.strip()
+    if content.startswith("```"):
+        content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
+    try:
+        sprint_plan = json.loads(content)
+    except Exception:
+        sprint_plan = {"epics": []}
 
     epics = sprint_plan.get("epics", [])
     total_stories = sum(len(e.get("stories", [])) for e in epics)

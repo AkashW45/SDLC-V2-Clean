@@ -31,6 +31,7 @@ client = OpenAI(
 
 class DeploymentState(TypedDict):
     requirement: str
+    scope_contract: dict      # NEW
     runbook: dict
     pr_urls: list
     affected_repos: list
@@ -373,11 +374,38 @@ def build_deployment_graph():
 # Run
 # -----------------------------------------
 
+# def run_deployment(
+#     requirement: str,
+#     scope_contract: dict = None,
+#     runbook: dict,
+#     pr_urls: list,
+#     affected_repos: list,
+#     thread_id: str = "thread-deployment"
+# ) -> tuple:
+#     graph = build_deployment_graph()
+#     config = {"configurable": {"thread_id": thread_id}}
+
+#     initial_state = DeploymentState(
+#         requirement=requirement,
+#         scope_contract=scope_contract or {},
+#         runbook=runbook,
+#         pr_urls=pr_urls,
+#         affected_repos=affected_repos,
+#         deploy_sequence=[],
+#         feature_flags=[],
+#         deploy_results=[],
+#         monitoring_results={},
+#         rollback_triggered=False,
+#         human_feedback="",
+#         approved=False,
+#         status="STARTED"
+#     )
 def run_deployment(
     requirement: str,
     runbook: dict,
     pr_urls: list,
     affected_repos: list,
+    scope_contract: dict = None,
     thread_id: str = "thread-deployment"
 ) -> tuple:
     graph = build_deployment_graph()
@@ -385,6 +413,7 @@ def run_deployment(
 
     initial_state = DeploymentState(
         requirement=requirement,
+        scope_contract=scope_contract or {},
         runbook=runbook,
         pr_urls=pr_urls,
         affected_repos=affected_repos,

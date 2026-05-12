@@ -33,6 +33,7 @@ client = OpenAI(
 
 class CodegenState(TypedDict):
     requirement: str
+    scope_contract: dict      # NEW
     impact_report: dict
     existing_code: dict        # file_path -> current content
     generated_changes: list    # list of {file_path, content, change_summary}
@@ -46,7 +47,7 @@ class CodegenState(TypedDict):
 
 def call_llm(prompt: str) -> dict:
     response = client.chat.completions.create(
-        model="deepseek-v4-pro",
+        model="deepseek-v4-flash",
         messages=[{"role": "user", "content": prompt}],
         stream=False,
         reasoning_effort="high",
@@ -112,16 +113,13 @@ def validate_python(code: str, file_path: str) -> list:
 
 # Phase 4 Codegen — Critical fixes for fresh project generation
 # Replace the generate_fresh_project function ENTIRELY in agents/phase4_codegen/codegen_agent.py
-
 def generate_fresh_project(state: CodegenState) -> CodegenState:
-    """Generate complete project scaffold for a new requirement."""
     print("  [Phase 4] Generating FRESH project scaffold...")
 
     requirement = state["requirement"]
     impact = state.get("impact_report", {})
     architecture = impact.get("architecture", {})
 
-    # Build architecture context for grounded scaffolding
     arch_context = ""
     if architecture.get("nodes"):
         arch_summary = []
@@ -131,69 +129,42 @@ def generate_fresh_project(state: CodegenState) -> CodegenState:
                 arch_summary.append(f"  Tech: {', '.join(node['tech_stack'])}")
         arch_context = "\n\nARCHITECTURE TO IMPLEMENT:\n" + "\n".join(arch_summary)
 
-    prompt = f"""
-You are a senior backend engineer scaffolding a brand new Python FastAPI project.
+    user_msg = json.dumps({
+        "scope_contract": state.get("scope_contract", {}),
+        "requirement": requirement,
+        "architecture_context": arch_context
+    }, indent=2)
 
-REQUIREMENT:
-{requirement}
-{arch_context}
+    response = client.chat.completions.create(
+        model="deepseek-v4-flash",
+        messages=[
+            {"role": "system", "content": (
+                "You are a senior backend engineer scaffolding a brand new Python FastAPI project. "
+                "Return ONLY valid JSON with a 'files' array containing objects with "
+                "file_path, content, change_summary, new_symbols_added, existing_symbols_modified."
+            )},
+            {"role": "user", "content": user_msg}
+        ],
+        max_tokens=8000
+    )
 
-Generate a complete, working starter project with these files. Each MUST be production-quality:
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"```(?:json)?", "", raw).strip().strip("```").strip()
 
-1. main.py — FastAPI app entry with health endpoint
-2. app/__init__.py — empty
-3. app/models.py — Pydantic models matching the requirement
-4. app/routes.py — API routes implementing the requirement (NOT just stubs)
-5. app/services.py — business logic functions
-6. app/database.py — SQLAlchemy setup (sqlite for now)
-7. requirements.txt — fastapi, uvicorn, pydantic, sqlalchemy
-8. README.md — how to run, what it does
-9. .gitignore — standard Python
-10. tests/__init__.py — empty
-11. tests/test_main.py — basic health test
-
-Each file MUST be syntactically valid Python and immediately runnable with:
-  pip install -r requirements.txt && uvicorn main:app --reload
-
-Return ONLY valid JSON:
-{{
-  "files": [
-    {{
-      "file_path": "main.py",
-      "content": "complete file content as a string",
-      "change_summary": "what this file does",
-      "new_symbols_added": ["app", "main"],
-      "existing_symbols_modified": []
-    }}
-  ]
-}}
-"""
-
-    # call_llm returns string (not parsed JSON) — handle that
-    response = call_llm(prompt)
-
-    if response.startswith("```"):
-        response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
-
-    # Try multiple JSON parse strategies
     generated_changes = []
     try:
-        data = json.loads(response)
+        data = json.loads(raw)
         generated_changes = data.get("files", [])
     except json.JSONDecodeError:
-        # Try to find JSON object boundary
         try:
-            start = response.find('{')
-            end = response.rfind('}') + 1
-            if start >= 0 and end > start:
-                data = json.loads(response[start:end])
-                generated_changes = data.get("files", [])
+            start = raw.find('{')
+            end = raw.rfind('}') + 1
+            data = json.loads(raw[start:end])
+            generated_changes = data.get("files", [])
         except Exception as e:
             print(f"  [Phase 4] Fresh project JSON parse failed: {e}")
-            print(f"  [Phase 4] Response head: {response[:300]}")
-            generated_changes = []
 
-    # Validate Python syntax
     errors = []
     for change in generated_changes:
         if change.get("file_path", "").endswith(".py"):
@@ -207,6 +178,100 @@ Return ONLY valid JSON:
         "validation_errors": errors,
         "status": "CODE_GENERATED" if not errors else "CODE_GENERATION_FAILED"
     }
+# def generate_fresh_project(state: CodegenState) -> CodegenState:
+#     """Generate complete project scaffold for a new requirement."""
+#     print("  [Phase 4] Generating FRESH project scaffold...")
+
+#     requirement = state["requirement"]
+#     impact = state.get("impact_report", {})
+#     architecture = impact.get("architecture", {})
+
+#     # Build architecture context for grounded scaffolding
+#     arch_context = ""
+#     if architecture.get("nodes"):
+#         arch_summary = []
+#         for node in architecture.get("nodes", []):
+#             arch_summary.append(f"- {node.get('name','')} ({node.get('type','service')}): {node.get('description','')}")
+#             if node.get('tech_stack'):
+#                 arch_summary.append(f"  Tech: {', '.join(node['tech_stack'])}")
+#         arch_context = "\n\nARCHITECTURE TO IMPLEMENT:\n" + "\n".join(arch_summary)
+
+#     prompt = f"""
+# You are a senior backend engineer scaffolding a brand new Python FastAPI project.
+
+# REQUIREMENT:
+# {requirement}
+# {arch_context}
+
+# Generate a complete, working starter project with these files. Each MUST be production-quality:
+
+# 1. main.py — FastAPI app entry with health endpoint
+# 2. app/__init__.py — empty
+# 3. app/models.py — Pydantic models matching the requirement
+# 4. app/routes.py — API routes implementing the requirement (NOT just stubs)
+# 5. app/services.py — business logic functions
+# 6. app/database.py — SQLAlchemy setup (sqlite for now)
+# 7. requirements.txt — fastapi, uvicorn, pydantic, sqlalchemy
+# 8. README.md — how to run, what it does
+# 9. .gitignore — standard Python
+# 10. tests/__init__.py — empty
+# 11. tests/test_main.py — basic health test
+
+# Each file MUST be syntactically valid Python and immediately runnable with:
+#   pip install -r requirements.txt && uvicorn main:app --reload
+
+# Return ONLY valid JSON:
+# {{
+#   "files": [
+#     {{
+#       "file_path": "main.py",
+#       "content": "complete file content as a string",
+#       "change_summary": "what this file does",
+#       "new_symbols_added": ["app", "main"],
+#       "existing_symbols_modified": []
+#     }}
+#   ]
+# }}
+# """
+
+#     # call_llm returns string (not parsed JSON) — handle that
+#     response = call_llm(prompt)
+
+#     if response.startswith("```"):
+#         response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
+
+#     # Try multiple JSON parse strategies
+#     generated_changes = []
+#     try:
+#         data = json.loads(response)
+#         generated_changes = data.get("files", [])
+#     except json.JSONDecodeError:
+#         # Try to find JSON object boundary
+#         try:
+#             start = response.find('{')
+#             end = response.rfind('}') + 1
+#             if start >= 0 and end > start:
+#                 data = json.loads(response[start:end])
+#                 generated_changes = data.get("files", [])
+#         except Exception as e:
+#             print(f"  [Phase 4] Fresh project JSON parse failed: {e}")
+#             print(f"  [Phase 4] Response head: {response[:300]}")
+#             generated_changes = []
+
+#     # Validate Python syntax
+#     errors = []
+#     for change in generated_changes:
+#         if change.get("file_path", "").endswith(".py"):
+#             errs = validate_python(change.get("content", ""), change["file_path"])
+#             errors.extend(errs)
+
+#     print(f"  [Phase 4] Generated {len(generated_changes)} fresh files (errors: {len(errors)})")
+#     return {
+#         **state,
+#         "generated_changes": generated_changes,
+#         "validation_errors": errors,
+#         "status": "CODE_GENERATED" if not errors else "CODE_GENERATION_FAILED"
+#     }
 # -----------------------------------------
 # Nodes
 # -----------------------------------------
@@ -275,12 +340,8 @@ def build_context_packet(state: CodegenState) -> dict:
 
 
 def generate_code_changes(state: CodegenState) -> CodegenState:
-    """
-    Generate targeted code changes for each affected file.
-    Retries up to 3 times if syntax errors found.
-    """
     print("\n[Phase 4] Generating code changes...")
-    # NEW PROJECT mode — generate fresh files from architecture
+
     if state.get("status") == "NEW_PROJECT_NO_CODE":
         return generate_fresh_project(state)
 
@@ -292,89 +353,56 @@ def generate_code_changes(state: CodegenState) -> CodegenState:
         file_path = file_info["file_path"]
         print(f"\n  Processing: {file_path}")
 
-        prompt = f"""
-You are a senior software engineer modifying an existing Python file.
+        user_msg = json.dumps({
+            "scope_contract": state.get("scope_contract", {}),
+            "requirement": context["requirement"],
+            "risk_level": context["risk_level"],
+            "breaking_changes": context["breaking_changes"],
+            "file_path": file_info["file_path"],
+            "existing_symbols": file_info["existing_symbols"],
+            "current_file_content": file_info["current_content"]
+        }, indent=2)
 
-REQUIREMENT:
-{context['requirement']}
-
-RISK LEVEL: {context['risk_level']}
-
-BREAKING CHANGES TO BE AWARE OF:
-{json.dumps(context['breaking_changes'], indent=2)}
-
-FILE TO MODIFY: {file_path}
-
-EXISTING SYMBOLS IN THIS FILE (from AST index):
-{json.dumps(file_info['existing_symbols'], indent=2)}
-
-CURRENT FILE CONTENT:
-```python
-{file_info['current_content']}
-```
-
-INSTRUCTIONS:
-1. Modify this file to implement the requirement
-2. Do NOT remove or rename existing functions/classes
-3. Add new functions/classes as needed
-4. Keep all existing functionality working
-5. Add TODO comments for acceptance criteria
-6. CRITICAL: Return syntactically valid Python only
-7. Return the COMPLETE updated file content
-
-Return ONLY valid JSON:
-{{
-  "file_path": "{file_path}",
-  "content": "complete updated file content here",
-  "change_summary": "what was changed and why",
-  "new_symbols_added": ["symbol1"],
-  "existing_symbols_modified": ["symbol1"]
-}}
-"""
-
-        # Retry loop — up to 3 attempts
         max_retries = 3
         success = False
 
         for attempt in range(1, max_retries + 1):
-            response = call_llm(prompt, max_tokens=3000)
-
-            if response.startswith("```"):
-                response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
+            response = client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a senior software engineer modifying an existing Python file. "
+                        "Return ONLY valid JSON with file_path, content (complete updated file), "
+                        "change_summary, new_symbols_added, existing_symbols_modified."
+                    )},
+                    {"role": "user", "content": user_msg}
+                ],
+                max_tokens=3000
+            )
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"```(?:json)?", "", raw).strip().strip("```").strip()
 
             try:
-                change = json.loads(response)
+                change = json.loads(raw)
                 content = change.get("content", "")
                 errors = validate_python(content, file_path)
 
                 if errors:
                     print(f"  ⚠️  Attempt {attempt}/{max_retries} — syntax errors: {errors}")
                     if attempt < max_retries:
-                        # Add error context to prompt for retry
-                        prompt += f"""
-
-PREVIOUS ATTEMPT FAILED WITH SYNTAX ERRORS:
-{json.dumps(errors)}
-
-Fix these syntax errors and return corrected JSON.
-Pay special attention to:
-- String escaping inside JSON
-- Proper indentation
-- No unterminated strings or brackets
-"""
+                        user_msg += f"\n\nPREVIOUS ATTEMPT FAILED WITH SYNTAX ERRORS:\n{json.dumps(errors)}"
                     continue
 
                 generated_changes.append(change)
-                print(f"  ✅ Generated (attempt {attempt}): {change.get('change_summary', '')[:80]}")
-                print(f"     New symbols: {change.get('new_symbols_added', [])}")
-                print(f"     Modified: {change.get('existing_symbols_modified', [])}")
+                print(f"  ✅ Generated: {change.get('change_summary', '')[:80]}")
                 success = True
                 break
 
             except json.JSONDecodeError as e:
                 print(f"  ⚠️  Attempt {attempt}/{max_retries} — JSON parse error: {e}")
                 if attempt < max_retries:
-                    prompt += f"\n\nPREVIOUS ATTEMPT HAD JSON ERROR: {e}\nReturn ONLY valid JSON, no extra text."
+                    user_msg += f"\n\nPREVIOUS ATTEMPT HAD JSON ERROR: {e}"
 
         if not success:
             error = f"{file_path}: Failed after {max_retries} attempts"
@@ -387,6 +415,122 @@ Pay special attention to:
         "validation_errors": all_errors,
         "status": "CODE_GENERATED" if not all_errors else "CODE_GENERATION_FAILED"
     }
+
+
+# def generate_code_changes(state: CodegenState) -> CodegenState:
+#     """
+#     Generate targeted code changes for each affected file.
+#     Retries up to 3 times if syntax errors found.
+#     """
+#     print("\n[Phase 4] Generating code changes...")
+#     # NEW PROJECT mode — generate fresh files from architecture
+#     if state.get("status") == "NEW_PROJECT_NO_CODE":
+#         return generate_fresh_project(state)
+
+#     context = build_context_packet(state)
+#     generated_changes = []
+#     all_errors = []
+
+#     for file_info in context["files"]:
+#         file_path = file_info["file_path"]
+#         print(f"\n  Processing: {file_path}")
+
+#         prompt = f"""
+# You are a senior software engineer modifying an existing Python file.
+
+# REQUIREMENT:
+# {context['requirement']}
+
+# RISK LEVEL: {context['risk_level']}
+
+# BREAKING CHANGES TO BE AWARE OF:
+# {json.dumps(context['breaking_changes'], indent=2)}
+
+# FILE TO MODIFY: {file_path}
+
+# EXISTING SYMBOLS IN THIS FILE (from AST index):
+# {json.dumps(file_info['existing_symbols'], indent=2)}
+
+# CURRENT FILE CONTENT:
+# ```python
+# {file_info['current_content']}
+# ```
+
+# INSTRUCTIONS:
+# 1. Modify this file to implement the requirement
+# 2. Do NOT remove or rename existing functions/classes
+# 3. Add new functions/classes as needed
+# 4. Keep all existing functionality working
+# 5. Add TODO comments for acceptance criteria
+# 6. CRITICAL: Return syntactically valid Python only
+# 7. Return the COMPLETE updated file content
+
+# Return ONLY valid JSON:
+# {{
+#   "file_path": "{file_path}",
+#   "content": "complete updated file content here",
+#   "change_summary": "what was changed and why",
+#   "new_symbols_added": ["symbol1"],
+#   "existing_symbols_modified": ["symbol1"]
+# }}
+# """
+
+#         # Retry loop — up to 3 attempts
+#         max_retries = 3
+#         success = False
+
+#         for attempt in range(1, max_retries + 1):
+#             response = call_llm(prompt, max_tokens=3000)
+
+#             if response.startswith("```"):
+#                 response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
+
+#             try:
+#                 change = json.loads(response)
+#                 content = change.get("content", "")
+#                 errors = validate_python(content, file_path)
+
+#                 if errors:
+#                     print(f"  ⚠️  Attempt {attempt}/{max_retries} — syntax errors: {errors}")
+#                     if attempt < max_retries:
+#                         # Add error context to prompt for retry
+#                         prompt += f"""
+
+# PREVIOUS ATTEMPT FAILED WITH SYNTAX ERRORS:
+# {json.dumps(errors)}
+
+# Fix these syntax errors and return corrected JSON.
+# Pay special attention to:
+# - String escaping inside JSON
+# - Proper indentation
+# - No unterminated strings or brackets
+# """
+#                     continue
+
+#                 generated_changes.append(change)
+#                 print(f"  ✅ Generated (attempt {attempt}): {change.get('change_summary', '')[:80]}")
+#                 print(f"     New symbols: {change.get('new_symbols_added', [])}")
+#                 print(f"     Modified: {change.get('existing_symbols_modified', [])}")
+#                 success = True
+#                 break
+
+#             except json.JSONDecodeError as e:
+#                 print(f"  ⚠️  Attempt {attempt}/{max_retries} — JSON parse error: {e}")
+#                 if attempt < max_retries:
+#                     prompt += f"\n\nPREVIOUS ATTEMPT HAD JSON ERROR: {e}\nReturn ONLY valid JSON, no extra text."
+
+#         if not success:
+#             error = f"{file_path}: Failed after {max_retries} attempts"
+#             print(f"  ❌ {error}")
+#             all_errors.append(error)
+
+#     return {
+#         **state,
+#         "generated_changes": generated_changes,
+#         "validation_errors": all_errors,
+#         "status": "CODE_GENERATED" if not all_errors else "CODE_GENERATION_FAILED"
+#     }
+
 
 def validate_changes(state: CodegenState) -> CodegenState:
     """Validate all generated changes."""
@@ -404,9 +548,12 @@ def validate_changes(state: CodegenState) -> CodegenState:
             syntax_errors = validate_python(content, file_path)
             errors.extend(syntax_errors)
 
-        # Check content is not empty
-        if not content.strip():
-            errors.append(f"{file_path}: Generated content is empty")
+        # Empty __init__.py files are intentional and valid Python
+        if file_path.endswith('__init__.py'):
+           continue  # skip — empty init files are correct
+
+        if not content or not content.strip():
+           errors.append(f"{file_path}: Generated content is empty")
 
     if errors:
         print(f"  ❌ Validation failed: {len(errors)} errors")
