@@ -267,6 +267,7 @@ def build_validation_graph():
 def run_validation_phase(
     requirement: str,
     generated_changes: list,
+    scope_contract: dict = None,
     thread_id: str = "thread-validation"
 ) -> dict:
     graph = build_validation_graph()
@@ -274,6 +275,7 @@ def run_validation_phase(
 
     initial_state = ValidationState(
         requirement=requirement,
+        scope_contract=scope_contract or {},
         generated_changes=generated_changes,
         test_files=[],
         validation_results={},
@@ -287,11 +289,16 @@ def run_validation_phase(
 
     result = graph.invoke(initial_state, config)
 
+    # Safely extract results for printing to avoid crashes
+    t_files_len = len(result.get("test_files",[]))
+    v_res = result.get("validation_results", {})
+    passed = v_res.get("passed", 0)
+    failed = v_res.get("failed", 0)
+
     print(f"\n{'='*50}")
     print(f"Phase 5 Complete — {result['status']}")
-    print(f"Test files generated: {len(result['test_files'])}")
-    print(f"Validation results: {result['validation_results'].get('passed', 0)} passed, "
-          f"{result['validation_results'].get('failed', 0)} failed")
+    print(f"Test files generated: {t_files_len}")
+    print(f"Validation results: {passed} passed, {failed} failed")
     print(f"{'='*50}")
 
     return result

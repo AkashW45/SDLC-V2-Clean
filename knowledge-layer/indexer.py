@@ -25,6 +25,29 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # -----------------------------------------
+# Tree-sitter Polyglot Setup
+# -----------------------------------------
+try:
+    from tree_sitter import Language, Parser
+    import tree_sitter_javascript as tsjs
+    import tree_sitter_typescript as tsts
+    import tree_sitter_java as tsjava
+    import tree_sitter_c_sharp as tscs
+
+    LANGUAGES = {
+        "javascript": Language(tsjs.language()),
+        "typescript": Language(tsts.language_typescript()),
+        "java": Language(tsjava.language()),
+        "csharp": Language(tscs.language()),
+    }
+    TS_AVAILABLE = True
+    print("[Indexer] Tree-sitter polyglot parsers loaded successfully.")
+except ImportError as e:
+    print(f"[!] Tree-sitter not fully installed: {e}. Non-Python parsing will be skipped.")
+    TS_AVAILABLE = False
+
+
+# -----------------------------------------
 # Connections
 # -----------------------------------------
 
@@ -197,6 +220,92 @@ def extract_imports(file_path: Path) -> list:
 
     return imports
 
+# -----------------------------------------
+# Tree-sitter Polyglot Parser (TS/JS/Java/C#)
+# -----------------------------------------
+
+def parse_with_treesitter(file_path: Path, lang: str) -> list:
+    """Universal AST walker for non-Python languages."""
+    if not TS_AVAILABLE or lang not in LANGUAGES:
+        return[]
+
+    try:
+        parser = Parser(LANGUAGES[lang])
+    except TypeError:
+        parser = Parser()
+        parser.set_language(LANGUAGES[lang])
+
+    content = file_path.read_bytes()
+    tree = parser.parse(content)
+    symbols =[]
+
+    def walk(node):
+        node_type = node.type
+        name = ""
+
+        if "class" in node_type and "declaration" in node_type:
+            for child in node.children:
+                if child.type in ("identifier", "type_identifier"):
+                    name = content[child.start_byte:child.end_byte].decode("utf8")
+                    break
+            if name:
+                symbols.append({
+                    "name": name,
+                    "type": "class",
+                    "line": node.start_point[0] + 1,
+                    "signature": f"class {name}",
+                    "docstring": "",
+                    "content": content[node.start_byte:node.end_byte].decode("utf8")[:500]
+                })
+
+        elif "function" in node_type or "method" in node_type:
+            for child in node.children:
+                if child.type in ("identifier", "property_identifier"):
+                    name = content[child.start_byte:child.end_byte].decode("utf8")
+                    break
+            if name:
+                symbols.append({
+                    "name": name,
+                    "type": "function" if "function" in node_type else "method",
+                    "line": node.start_point[0] + 1,
+                    "signature": f"{name}(...)",
+                    "docstring": "",
+                    "content": content[node.start_byte:node.end_byte].decode("utf8")[:500]
+                })
+
+        for child in node.children:
+            walk(child)
+
+    walk(tree.root_node)
+    return symbols
+
+def extract_imports_treesitter(file_path: Path, lang: str) -> list:
+    """Universal import extractor."""
+    if not TS_AVAILABLE or lang not in LANGUAGES:
+        return[]
+    
+    try:
+        parser = Parser(LANGUAGES[lang])
+    except TypeError:
+        parser = Parser()
+        parser.set_language(LANGUAGES[lang])
+
+    content = file_path.read_bytes()
+    tree = parser.parse(content)
+    imports =[]
+
+    def walk(node):
+        if "import" in node.type:
+            for child in node.children:
+                if "string" in child.type:
+                    val = content[child.start_byte:child.end_byte].decode("utf8").strip("'\"")
+                    if val:
+                        imports.append(val)
+        for child in node.children:
+            walk(child)
+
+    walk(tree.root_node)
+    return imports
 
 # -----------------------------------------
 # Protocol Contract Parser
@@ -268,29 +377,16 @@ def parse_protocol_contract(file_path: Path) -> dict:
 
 def index_symbols_postgres(conn, repo_name: str, file_path: str, symbols: list, language: str):
     cur = conn.cursor()
-
-    # Delete existing symbols for this file
-    cur.execute(
-        "DELETE FROM symbols WHERE repo_name = %s AND file_path = %s",
-        (repo_name, file_path)
-    )
-
+    cur.execute("DELETE FROM symbols WHERE repo_name = %s AND file_path = %s", (repo_name, file_path))
     for sym in symbols:
+        # Prevent Postgres crash on minified JS/TS by truncating massive names
+        safe_name = sym["name"][:250] 
+        
         cur.execute("""
             INSERT INTO symbols 
             (repo_name, file_path, symbol_name, symbol_type, language, line_number, signature, docstring)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            repo_name,
-            file_path,
-            sym["name"],
-            sym["type"],
-            language,
-            sym.get("line", 0),
-            sym.get("signature", ""),
-            sym.get("docstring", "")
-        ))
-
+        """, (repo_name, file_path, safe_name, sym["type"], language, sym.get("line", 0), sym.get("signature", ""), sym.get("docstring", "")))
     conn.commit()
     cur.close()
 
@@ -496,7 +592,9 @@ def index_repo(repo_path: str, repo_name: str):
         if lang == "python":
             symbols = parse_python_file(file_path)
             imports = extract_imports(file_path)
-        # Future: add java, csharp, typescript parsers here
+        elif lang in ("javascript", "typescript", "java", "csharp") and TS_AVAILABLE:
+            symbols = parse_with_treesitter(file_path, lang)
+            imports = extract_imports_treesitter(file_path, lang)
 
         if symbols:
             # Index in PostgreSQL
