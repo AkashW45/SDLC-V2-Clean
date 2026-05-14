@@ -1,19 +1,25 @@
 import psycopg2
+from psycopg_pool import ConnectionPool
 import json
 from datetime import datetime
 import os
 
 def _conn():
+    # Get the host (Docker compose sets this to "sdlc_postgres" for the API container)
+    db_host = os.getenv("POSTGRES_HOST", "127.0.0.1")
+    
+    # If we are inside Docker, use the internal port 5432. Otherwise, use 5437.
+    db_port = "5432" if db_host == "sdlc_postgres" else os.getenv("POSTGRES_PORT", "5437")
+    
     return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=int(os.getenv("POSTGRES_PORT", "5433")),
+        host=db_host,
+        port=db_port,
         user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
+        password=os.getenv("POSTGRES_PASSWORD", "postgres_password"),
         dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge")
     )
 
-
-def init_persistence_tables():
+def setup_db():
     conn = _conn()
     cur = conn.cursor()
 
@@ -40,7 +46,34 @@ def init_persistence_tables():
             event VARCHAR(100),
             actor VARCHAR(100),
             details JSONB,
-            created_at TIMESTAMP DEFAULT NOW()
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("REVOKE UPDATE, DELETE ON audit_log FROM PUBLIC;")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS artifact_registry (
+            artifact_id SERIAL PRIMARY KEY,
+            thread_id VARCHAR(255),
+            "key" VARCHAR(255),
+            version INT,
+            status VARCHAR(50),
+            producing_phase VARCHAR(50),
+            content TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(thread_id, "key", version)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS replay_jobs (
+            job_id SERIAL PRIMARY KEY,
+            thread_id VARCHAR(255),
+            target_artifact VARCHAR(255),
+            status VARCHAR(50),
+            diff_summary TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -51,6 +84,27 @@ def init_persistence_tables():
     cur.close()
     conn.close()
     print("[Persistence] Tables ready")
+
+
+def init_persistence_tables():
+    return setup_db()
+
+
+def enforce_audit_retention() -> int:
+    """
+    Enforce 90-day retention policy for audit logs.
+    Note: Because we revoked DELETE from PUBLIC, this specific cleanup job must run under a privileged admin role via a cron job, not the standard app role.
+    """
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM audit_log WHERE created_at < NOW() - INTERVAL '90 days';
+    """)
+    deleted_count = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return deleted_count
 
 
 def save_pipeline(thread_id: str, entry: dict, safe_state: dict):
@@ -156,4 +210,99 @@ def get_audit_log(thread_id: str) -> list:
         conn.close()
     except Exception as e:
         print(f"[Audit] read failed: {e}")
+    return out
+
+
+def save_artifact(thread_id: str, key: str, phase: str, content: str) -> int:
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM artifact_registry WHERE thread_id = %s AND \"key\" = %s",
+            (thread_id, key)
+        )
+        max_version = cur.fetchone()[0] or 0
+        new_version = max_version + 1
+        cur.execute(
+            "INSERT INTO artifact_registry (thread_id, \"key\", version, status, producing_phase, content)"
+            " VALUES (%s, %s, %s, %s, %s, %s)",
+            (thread_id, key, new_version, "ACTIVE", phase, content)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return new_version
+    except Exception as e:
+        print(f"[Persistence] save_artifact failed: {e}")
+        return 0
+
+
+def create_replay_job(thread_id: str, target_artifact: str) -> int:
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO replay_jobs (thread_id, target_artifact, status, diff_summary) VALUES (%s, %s, %s, %s) RETURNING job_id",
+            (thread_id, target_artifact, "PENDING", "")
+        )
+        job_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+        return job_id
+    except Exception as e:
+        print(f"[Persistence] create_replay_job failed: {e}")
+        return 0
+
+
+def update_replay_job(job_id: int, status: str, diff_summary: str):
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE replay_jobs SET status = %s, diff_summary = %s WHERE job_id = %s",
+            (status, diff_summary, job_id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[Persistence] update_replay_job failed: {e}")
+
+
+def get_artifact(thread_id: str, key: str, version: int = None) -> dict:
+    out = {}
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        if version is None:
+            cur.execute(
+                "SELECT thread_id, \"key\", version, status, producing_phase, content, created_at"
+                " FROM artifact_registry"
+                " WHERE thread_id = %s AND \"key\" = %s"
+                " ORDER BY version DESC LIMIT 1",
+                (thread_id, key)
+            )
+        else:
+            cur.execute(
+                "SELECT thread_id, \"key\", version, status, producing_phase, content, created_at"
+                " FROM artifact_registry"
+                " WHERE thread_id = %s AND \"key\" = %s AND version = %s",
+                (thread_id, key, version)
+            )
+        row = cur.fetchone()
+        if row:
+            out = {
+                "thread_id": row[0],
+                "key": row[1],
+                "version": row[2],
+                "status": row[3],
+                "producing_phase": row[4],
+                "content": row[5],
+                "created_at": row[6].isoformat() if row[6] else ""
+            }
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[Persistence] get_artifact failed: {e}")
     return out

@@ -12,17 +12,11 @@ from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
-from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from openai import OpenAI
-
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
+from core.llm_gateway import gateway
 
 
 # -----------------------------------------
@@ -50,14 +44,14 @@ class DeploymentState(TypedDict):
 # -----------------------------------------
 
 def call_llm(prompt: str) -> dict:
-    response = client.chat.completions.create(
+    content = gateway.generate(
+        prompt=prompt,
         model="deepseek-v4-pro",
-        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
         stream=False,
         reasoning_effort="high",
         extra_body={"thinking": {"type": "enabled"}}
-    )
-    content = response.choices[0].message.content.strip()
+    ).strip()
     if content.startswith("```"):
         content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
     try:

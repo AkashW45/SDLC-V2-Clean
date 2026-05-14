@@ -4,6 +4,7 @@ Generates Jira epics/stories and deployment runbook from approved PRD.
 Human approval INTERRUPT after sprint plan generated.
 """
 
+import concurrent.futures
 import os
 import json
 import re
@@ -12,11 +13,12 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from groq import Groq
-from agents.prompts.system_prompts import SPRINT_PLANNER_SYSTEM
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from api.jira_client import fetch_jira_metadata
+from api.persistence import save_artifact
+from core.llm_gateway import gateway
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -43,6 +45,18 @@ class PlanningState(TypedDict):
     human_feedback: str
     approved: bool
     status: str
+    thread_id: str
+
+
+def _get_thread_id(state) -> str:
+    if isinstance(state, dict):
+        thread_id = state.get("thread_id")
+        if thread_id:
+            return thread_id
+        config = state.get("config") or state.get("__config__") or state.get("_config") or {}
+        if isinstance(config, dict):
+            return config.get("thread_id") or config.get("configurable", {}).get("thread_id")
+    return "unknown-thread"
 
 
 # -----------------------------------------
@@ -70,37 +84,62 @@ def call_llm(prompt: str) -> dict:
 # Nodes
 # -----------------------------------------
 
-
 def generate_sprint_plan(state: PlanningState) -> PlanningState:
     print("\n[Phase 2] Generating sprint plan...")
 
-    user_msg = json.dumps({
-        "scope_contract": state["scope_contract"],
-        "brd": state["brd"],
-        "prd": state["prd"]
-    }, indent=2)
+    prd = state["prd"]
+    requirements = prd.get("functional_requirements", [])
 
-    response = client.chat.completions.create(
-        model="deepseek-v4-flash",
-        messages=[
-            {"role": "system", "content": SPRINT_PLANNER_SYSTEM},
-            {"role": "user", "content": user_msg}
-        ],
-        stream=False,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}}
-    )
+    sprint_plan = call_llm(f"""
+You are a senior Scrum Master and Product Owner.
+Generate a sprint plan from this PRD.
+Return ONLY valid JSON:
+{{
+  "project": "LEAVE-MGMT",
+  "sprint_duration": "2 weeks",
+  "epics": [
+    {{
+      "epic_id": "EP-001",
+      "title": "...",
+      "description": "...",
+      "business_goal": "...",
+      "affected_repos": ["leave-mgmt-backend"],
+      "risk_level": "medium",
+      "stories": [
+        {{
+          "story_id": "US-001",
+          "title": "...",
+          "description": "As a [user] I want [goal] so that [benefit]",
+          "acceptance_criteria": ["...", "..."],
+          "story_points": 3,
+          "affected_repo": "leave-mgmt-backend",
+          "labels": ["backend"]
+        }}
+      ]
+    }}
+  ]
+}}
 
-    content = response.choices[0].message.content.strip()
-    if content.startswith("```"):
-        content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
-    try:
-        sprint_plan = json.loads(content)
-    except Exception:
-        sprint_plan = {"epics": []}
+PRD functional requirements:
+{json.dumps(requirements, indent=2)}
+
+Requirement: {state['requirement']}
+""")
 
     epics = sprint_plan.get("epics", [])
     total_stories = sum(len(e.get("stories", [])) for e in epics)
+
+    thread_id = _get_thread_id(state)
+    if thread_id != "unknown-thread":
+        try:
+            save_artifact(
+                thread_id=thread_id,
+                key="SprintPlan",
+                phase="Phase 2 - Planning",
+                content=json.dumps(sprint_plan, indent=2, ensure_ascii=False)
+            )
+        except Exception as e:
+            print(f"[Persistence] save_artifact SprintPlan failed: {e}")
 
     print(f"  ✅ Sprint plan generated: {len(epics)} epics, {total_stories} stories")
     return {**state, "sprint_plan": sprint_plan, "status": "SPRINT_PLAN_GENERATED"}
@@ -256,6 +295,18 @@ Return ONLY valid JSON:
 Feature: {state['requirement']}
 Sprint plan epics: {json.dumps([e['title'] for e in state['sprint_plan'].get('epics', [])], indent=2)}
 """)
+
+    thread_id = _get_thread_id(state)
+    if thread_id != "unknown-thread":
+        try:
+            save_artifact(
+                thread_id=thread_id,
+                key="Runbook",
+                phase="Phase 2 - Planning",
+                content=json.dumps(runbook, indent=2, ensure_ascii=False)
+            )
+        except Exception as e:
+            print(f"[Persistence] save_artifact Runbook failed: {e}")
 
     print(f"  ✅ Runbook generated: {len(runbook.get('deployment_sequence', []))} deployment steps")
     return {**state, "runbook": runbook, "status": "RUNBOOK_GENERATED"}

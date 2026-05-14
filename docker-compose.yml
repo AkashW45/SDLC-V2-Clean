@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
 
   qdrant:
@@ -20,7 +18,7 @@ services:
       - "7474:7474"
       - "7687:7687"
     environment:
-      - NEO4J_AUTH=neo4j/password1234
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
       - NEO4J_dbms_default__listen__address=0.0.0.0 
@@ -33,10 +31,10 @@ services:
     image: postgres:16
     container_name: sdlc_postgres
     ports:
-      - "5433:5432"
+      - "5437:5432"
     environment:
       - POSTGRES_USER=sdlc
-      - POSTGRES_PASSWORD=sdlc1234
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=sdlc_knowledge
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -52,14 +50,14 @@ services:
       - .env
     environment:
       POSTGRES_HOST: sdlc_postgres
-      POSTGRES_PORT: 5432
+      POSTGRES_PORT: 5437
       QDRANT_HOST: sdlc_qdrant
       QDRANT_PORT: 6333
       NEO4J_URI: bolt://sdlc_neo4j:7687
     depends_on:
-      - sdlc_postgres
-      - sdlc_qdrant
-      - sdlc_neo4j
+      - postgres
+      - qdrant
+      - neo4j
     volumes:
       - ./repos:/repos
     restart: unless-stopped  

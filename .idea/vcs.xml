@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/boutique-microservices" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/conduit-django-api" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/conduit-react-ui" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/csharp-ledger-api" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/flask-contacts-api" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/golang-inventory-api" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/html5-boilerplate" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/java-telehealth-api" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/leave-mgmt-core" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/nestjs-chat-backend" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/sample-python-cli" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/spring-petclinic-monolith" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/vanillajs-todo" vcs="Git" />
+  </component>
+</project>

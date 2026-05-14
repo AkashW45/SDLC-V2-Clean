@@ -7,30 +7,7 @@
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <!-- ADD THESE TWO LINES HERE -->
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<script>
-mermaid.initialize({
-  startOnLoad: false,
-  theme: 'dark',
-  themeVariables: {
-    fontFamily: 'JetBrains Mono, monospace',
-    fontSize: '14px',
-    primaryColor: '#1E40AF',
-    primaryTextColor: '#E6EDF3',
-    primaryBorderColor: '#3B82F6',
-    lineColor: '#8B949E',
-    edgeLabelBackground: '#161B22',
-    clusterBkg: '#0D1117',
-    clusterBorder: '#30363D'
-  },
-  flowchart: {
-    htmlLabels: true,
-    curve: 'basis',
-    nodeSpacing: 50,
-    rankSpacing: 70,
-    padding: 20
-  }
-});
-</script>
+<script>mermaid.initialize({startOnLoad:false, theme:'dark', themeVariables:{primaryColor:'#1a4a8a',primaryTextColor:'#e6edf3',edgeLabelBackground:'#161b22',lineColor:'#2E86DE'}});</script>
 <style>
 :root {
   --bg: #090c10;
@@ -185,6 +162,8 @@ const API = 'http://localhost:8001';
 let activePipelines = {};  // thread_id -> pipeline data
 let selectedThread = null;
 let pollInterval = null;
+// THE ANTI-FLICKER CACHE (From Shantanu/Optimization)
+const mermaidCache = {};
 
 const PHASES = [
   { key: 'WAITING_PHASE_1_APPROVAL', label: 'Phase 1 — Discovery', num: 1 },
@@ -707,7 +686,7 @@ function renderContent() {
       if (arch.mermaid) {
         html += `<div style="background:var(--surface2);border-radius:8px;padding:16px;margin-bottom:12px;overflow-x:auto">
           <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px">Architecture Diagram</div>
-          <div class="mermaid" id="mermaid-arch-${selectedThread}">${arch.mermaid}</div>
+          <div class="mermaid">${arch.mermaid}</div>
         </div>`;
       }
 
@@ -994,24 +973,29 @@ function renderContent() {
     html += sectionClose();
   }
   
-  el.innerHTML = html;
+    // ADD THESE TWO LINES:
+    el.innerHTML = html; 
+    // *** ANTI-FLICKER RENDERING EXECUTION ***
+  // Only process nodes that haven't been cached and rendered yet.
+  setTimeout(async () => {
+    const nodes = el.querySelectorAll('.mermaid-container');
+    for (let node of nodes) {
+      const rawCode = decodeURIComponent(escape(atob(node.getAttribute('data-raw'))));
+      try {
+        const id = 'mermaid-svg-' + Date.now() + '-' + Math.floor(Math.random()*1000);
+        const { svg } = await mermaid.render(id, rawCode);
 
-setTimeout(async () => {
-  const nodes = el.querySelectorAll('.mermaid:not([data-rendered])');
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-    const code = node.textContent.trim();
-    node.setAttribute('data-rendered', 'true');
-    try {
-      const id = 'mermaid-svg-' + Date.now() + '-' + i;
-      const { svg } = await mermaid.render(id, code);
-      node.innerHTML = svg;
-    } catch(err) {
-      console.warn('Mermaid error:', err);
-      node.innerHTML = `<pre style="color:var(--danger);font-size:10px">${code}</pre>`;
+        // Save to cache so the next poll uses the SVG instantly!
+        mermaidCache[rawCode] = svg;
+        node.outerHTML = svg;
+      } catch(err) {
+        console.warn('Mermaid error:', err);
+        const errHtml = `<pre style="color:var(--danger);font-size:10px">${esc(rawCode)}</pre>`;
+        mermaidCache[rawCode] = errHtml; // Cache the error so it stops trying
+        node.outerHTML = errHtml;
+      }
     }
-  }
-}, 50);
+  }, 50);
 
 }    
 // ── UI Helpers ──────────────────────────────────────────────────────

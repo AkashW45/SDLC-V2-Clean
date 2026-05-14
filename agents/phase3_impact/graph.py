@@ -36,6 +36,7 @@ _graph = None  # built once, reused
 class ImpactState(TypedDict):
     requirement: str
     impact_report: dict
+    adr: dict
     human_approved: bool
     human_feedback: str
     status: str
@@ -47,7 +48,10 @@ class ImpactState(TypedDict):
 
 def analyze_impact(state: ImpactState) -> ImpactState:
     print("[Node] analyze_impact — running...")
-    report = run_impact_analysis(state["requirement"])
+    report = run_impact_analysis(
+        state["requirement"],
+        adr=state.get("adr", {})
+    )
     return {
         **state,
         "impact_report": report,

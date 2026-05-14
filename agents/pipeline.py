@@ -14,7 +14,7 @@ from agents.phase3_impact.graph import get_graph
 load_dotenv()
 
 
-def run_pipeline(requirement: str):
+def run_pipeline(requirement: str, workspace_path: str):
     print("\n" + "="*60)
     print("SDLC AUTOMATION PIPELINE — STARTING")
     print(f"Requirement: {requirement}")
@@ -37,7 +37,8 @@ def run_pipeline(requirement: str):
         requirement=requirement,
         brd={}, prd={}, adr={},
         human_feedback="", approved=False,
-        status="STARTED"
+        status="STARTED",
+        thread_id="pipeline-phase1"
     )
 
     result1 = graph1.invoke(initial_state, config1)
@@ -100,6 +101,7 @@ def run_pipeline(requirement: str):
     initial_state3 = {
         "requirement": requirement,
         "impact_report": {},
+        "adr": result1.get("adr", {}),
         "human_approved": False,
         "human_feedback": "",
         "status": "STARTED"
@@ -134,10 +136,13 @@ def run_pipeline(requirement: str):
 
     from agents.phase4_codegen.codegen_agent import run_codegen
 
+    # Context Precision: Pass only minified impact report, not full BRD/PRD
     result4 = run_codegen(
         requirement=requirement,
         impact_report=result3["impact_report"],
-        thread_id="pipeline-phase4"
+        workspace_path=workspace_path,
+        thread_id="pipeline-phase4",
+        adr=result1.get("adr", {})
     )
 
     if result4["status"] != "VALIDATED":

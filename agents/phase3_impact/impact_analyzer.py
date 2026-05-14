@@ -1,17 +1,7 @@
 """
 Phase 3 — Impact Analysis
-Queries Qdrant (semantic search) + Neo4j (dependency traversal) + PostgreSQL (symbol lookup)
-to produce a structured impact report before any code generation begins.
-
-Optimizations vs original:
-  - Module-level singletons for all clients (Qdrant, Neo4j driver, Groq)
-  - PostgreSQL ThreadedConnectionPool + context-manager borrow/return
-  - Embedding encoded once per unique query via lru_cache
-  - Batched Neo4j queries: single UNWIND round-trip for all file paths
-  - Parallel execution of Steps 2 & 3 (Neo4j + Postgres) via ThreadPoolExecutor
-  - Early exit when semantic search returns no hits
-  - top-level `import re` (was imported inside try block)
-  - set-comprehension for affected_repos dedup
+Unified Version: Blends Context Precision (PRD/ADR injection) with High-Performance
+Concurrency (Neo4j batching, PG pooling, and ThreadPools).
 """
 
 import os
@@ -27,41 +17,46 @@ from neo4j import GraphDatabase
 import psycopg2
 from psycopg2 import pool as pg_pool
 from sentence_transformers import SentenceTransformer
-from groq import Groq
+from openai import OpenAI
 
 load_dotenv()
 
 # -----------------------------------------
-# Module-level Singletons
-# (created once at import time, reused across every call)
+# Module-level Singletons & Pools
 # -----------------------------------------
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-qdrant_client = QdrantClient(
-    url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
-    timeout=60,
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com"
 )
 
+qdrant_host = os.getenv("QDRANT_HOST", "127.0.0.1")
+qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
+qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=60)
+
 _neo4j_driver = GraphDatabase.driver(
-    os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+    os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687"),
     auth=(
         os.getenv("NEO4J_USER", "neo4j"),
         os.getenv("NEO4J_PASSWORD", "password1234"),
     ),
 )
 
+# Detect if running in Docker network
+db_host = os.getenv("POSTGRES_HOST", "127.0.0.1")
+db_port = "5432" if db_host == "sdlc_postgres" else os.getenv("POSTGRES_PORT", "5433")
+
 _pg_pool = pg_pool.ThreadedConnectionPool(
     minconn=1,
     maxconn=10,
-    host=os.getenv("POSTGRES_HOST", "localhost"),
-    port=os.getenv("POSTGRES_PORT", "5433"),
+    host=db_host,
+    port=db_port,
     user=os.getenv("POSTGRES_USER", "sdlc"),
     password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
     dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
 )
-
 
 @contextmanager
 def _borrow_pg():
@@ -79,17 +74,12 @@ def _borrow_pg():
 
 @lru_cache(maxsize=256)
 def _encode(query: str) -> tuple:
-    """Encode query text to an embedding vector.
-
-    Result is cached so repeated or identical requirements skip the
-    (relatively expensive) transformer inference.
-    Returns a tuple so it is hashable for lru_cache.
-    """
+    """Encode query text to an embedding vector with LRU Cache."""
     return tuple(embedder.encode(query).tolist())
 
 
-def semantic_search(query: str, top_k: int = 10) -> list:
-    """Find the most relevant files and symbols for the change request."""
+def semantic_search(query: str, top_k: int = 3) -> list:
+    """Find the most relevant files. top_k=3 to enforce Context Precision."""
     query_vector = list(_encode(query))
 
     results = qdrant_client.query_points(
@@ -112,14 +102,13 @@ def semantic_search(query: str, top_k: int = 10) -> list:
 
 
 # -----------------------------------------
-# Step 2 — Dependency Traversal (Neo4j) — Batched
+# Step 2 — Dependency Traversal (Neo4j Batched)
 # -----------------------------------------
 
 def get_dependents_batch(file_paths: list) -> dict:
-    """Return all dependents for every path in one Neo4j round-trip.
-
-    Returns: {file_path: [{"file_path": str, "repo_name": str}]}
-    """
+    """Return all dependents for every path in one Neo4j round-trip."""
+    if not file_paths:
+        return {}
     with _neo4j_driver.session() as session:
         result = session.run(
             """
@@ -138,10 +127,9 @@ def get_dependents_batch(file_paths: list) -> dict:
 
 
 def get_affected_symbols_batch(file_paths: list) -> dict:
-    """Return all defined symbols for every path in one Neo4j round-trip.
-
-    Returns: {file_path: [{"name": str, "type": str, "line": int}]}
-    """
+    """Return all defined symbols for every path in one Neo4j round-trip."""
+    if not file_paths:
+        return {}
     with _neo4j_driver.session() as session:
         result = session.run(
             """
@@ -159,26 +147,12 @@ def get_affected_symbols_batch(file_paths: list) -> dict:
     return grouped
 
 
-# Kept for external compatibility — wraps the batch variants
+# Wrappers for external compatibility
 def get_dependents(file_path: str) -> list:
     return get_dependents_batch([file_path]).get(file_path, [])
 
-
 def get_affected_symbols(file_path: str) -> list:
     return get_affected_symbols_batch([file_path]).get(file_path, [])
-
-
-def get_dependencies(file_path: str) -> list:
-    """Find all files this file imports."""
-    with _neo4j_driver.session() as session:
-        result = session.run(
-            """
-            MATCH (f:File {path: $file_path})-[:IMPORTS]->(dep)
-            RETURN dep.name AS name
-            """,
-            file_path=file_path,
-        )
-        return [record["name"] for record in result]
 
 
 # -----------------------------------------
@@ -210,7 +184,6 @@ def check_protocol_contracts(repo_name: str) -> list:
         for row in rows
     ]
 
-
 def _fetch_contracts_parallel(repo_names: list) -> list:
     """Fetch contracts for all repos concurrently."""
     all_contracts: list = []
@@ -218,18 +191,12 @@ def _fetch_contracts_parallel(repo_names: list) -> list:
         return all_contracts
 
     with ThreadPoolExecutor(max_workers=min(len(repo_names), 8)) as executor:
-        futures = {
-            executor.submit(check_protocol_contracts, repo): repo
-            for repo in repo_names
-        }
+        futures = {executor.submit(check_protocol_contracts, repo): repo for repo in repo_names}
         for future in as_completed(futures):
             repo = futures[future]
             contracts = future.result()
             if contracts:
-                print(
-                    f"  {repo} has {len(contracts)} contracts: "
-                    f"{[c['contract_name'] for c in contracts]}"
-                )
+                print(f"  {repo} has {len(contracts)} contracts: {[c['contract_name'] for c in contracts]}")
             else:
                 print(f"  {repo} — no protocol contracts indexed")
             all_contracts.extend(contracts)
@@ -242,18 +209,33 @@ def _fetch_contracts_parallel(repo_names: list) -> list:
 # -----------------------------------------
 
 def assess_risk(
-        requirement: str,
-        affected_files: list,
-        affected_symbols: list,
-        contracts: list,
+    requirement: str,
+    affected_files: list,
+    affected_symbols: list,
+    contracts: list,
+    functional_requirements: list = None,
+    adr: dict = None
 ) -> dict:
-    """Use LLM to assess the risk level of the change."""
+    """Use DeepSeek to assess risk level, injecting PRD/ADR for strict Context Precision."""
+
+    functional_reqs_str = ""
+    adr_text = "ADR not provided."
+    if adr and isinstance(adr, dict):
+        adr_text = json.dumps(adr, indent=2)
+    if functional_requirements:
+        req_summary = "\n".join([f"- {req.get('title', 'Untitled')}" for req in functional_requirements[:5]])
+        functional_reqs_str = f"\n\nFunctional Requirements Summary:\n{req_summary}"
 
     prompt = f"""
 You are a senior software architect assessing the risk of a code change.
 
+ADR:
+{adr_text}
+
+CRITICAL: First, read the ADR to determine the agreed-upon programming language, framework, and tech stack. You MUST assess risk and breaking changes in strict alignment with this tech stack.
+
 Requirement:
-{requirement}
+{requirement}{functional_reqs_str}
 
 Affected Files:
 {json.dumps(affected_files, indent=2)}
@@ -273,10 +255,13 @@ Assess the risk and return ONLY valid JSON:
 }}
 """
 
-    response = groq_client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+    response = client.chat.completions.create(
+        model="deepseek-v4-flash",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=500,
+        max_tokens=800,
+        stream=False,
+        reasoning_effort="high",
+        extra_body={"thinking": {"type": "enabled"}}
     )
 
     content = response.choices[0].message.content.strip()
@@ -285,30 +270,27 @@ Assess the risk and return ONLY valid JSON:
         if content.startswith("```"):
             content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
         return json.loads(content)
-    except Exception:
+    except Exception as e:
+        print(f"  [Risk Assessment] JSON parse failed: {e}")
         return {
             "risk_level": "medium",
-            "risk_reasons": ["Could not parse risk assessment"],
+            "risk_reasons": ["Could not parse risk assessment output"],
             "breaking_changes": [],
-            "recommendation": "proceed_with_caution",
+            "recommendation": "proceed_with_caution"
         }
 
 
 # -----------------------------------------
-# Main Impact Analysis
+# Main Impact Analysis Runner
 # -----------------------------------------
 
-def run_impact_analysis(requirement: str) -> dict:
+def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None) -> dict:
     """
-    Full Phase 3 impact analysis pipeline.
-    Returns a structured impact report.
-
-    Execution order
-    ───────────────
-    1. Semantic search  (Qdrant)       — sequential, must finish first
-    2. Dependency graph (Neo4j)        ─┐ run in parallel via
-    3. Protocol contracts (Postgres)   ─┘ ThreadPoolExecutor
-    4. Risk assessment  (Groq LLM)     — sequential, needs 2 & 3
+    Execution order:
+    1. Semantic search (Qdrant) — sequential
+    2. Dependency graph (Neo4j batched) ─┐ Concurrent execution
+    3. Protocol contracts (Postgres)    ─┘
+    4. Risk assessment (LLM w/ Context Precision)
     """
 
     print(f"\n{'='*50}")
@@ -316,11 +298,13 @@ def run_impact_analysis(requirement: str) -> dict:
     print(f"Requirement: {requirement[:100]}...")
     print(f"{'='*50}")
 
-    # ------------------------------------------------------------------
-    # Step 1 — Semantic Search
-    # ------------------------------------------------------------------
+    functional_reqs = []
+    if prd and isinstance(prd, dict):
+        functional_reqs = prd.get("functional_requirements", [])
+
+    # 1. Semantic Search
     print("\n[Step 1] Semantic search across indexed repos...")
-    hits = semantic_search(requirement, top_k=10)
+    hits = semantic_search(requirement, top_k=3)
     print(f"  Found {len(hits)} relevant symbols")
 
     if not hits:
@@ -333,10 +317,10 @@ def run_impact_analysis(requirement: str) -> dict:
             "affected_symbols": [],
             "dependents": {},
             "protocol_contracts": [],
-            "risk_assessment": {},
+            "risk_assessment": {"risk_level": "low", "breaking_changes": [], "recommendation": "proceed"},
         }
 
-    # Deduplicate affected files (preserve highest-score hit per file)
+    # Deduplicate
     affected_files: dict = {}
     for hit in hits:
         key = f"{hit['repo_name']}:{hit['file_path']}"
@@ -357,10 +341,7 @@ def run_impact_analysis(requirement: str) -> dict:
 
     print(f"  Affected files: {file_paths}")
 
-    # ------------------------------------------------------------------
-    # Steps 2 & 3 — Neo4j batched queries + Postgres contract checks
-    # run concurrently; neither depends on the other's output
-    # ------------------------------------------------------------------
+    # 2 & 3. Neo4j and Postgres (Concurrent Execution)
     print("\n[Step 2] Traversing dependency graph (batched)...")
     print("[Step 3] Checking protocol contracts (parallel)...")
 
@@ -369,24 +350,28 @@ def run_impact_analysis(requirement: str) -> dict:
         fut_dependents = executor.submit(get_dependents_batch, file_paths)
         fut_contracts  = executor.submit(_fetch_contracts_parallel, affected_repos)
 
-        symbols_by_file: dict = fut_symbols.result()     # {file_path: [symbols]}
-        dependents_map: dict  = fut_dependents.result()  # {file_path: [dependents]}
+        symbols_by_file: dict = fut_symbols.result()
+        dependents_map: dict  = fut_dependents.result()
         all_contracts: list   = fut_contracts.result()
 
-    # Flatten symbols list
     all_affected_symbols = [s for syms in symbols_by_file.values() for s in syms]
 
-    # Log dependents
     for fp, deps in dependents_map.items():
         print(f"  {fp} is depended on by: {[d['file_path'] for d in deps]}")
 
-    # ------------------------------------------------------------------
-    # Step 4 — Risk Assessment (LLM)
-    # ------------------------------------------------------------------
-    print("\n[Step 4] Assessing risk...")
-    risk = assess_risk(requirement, affected_files_list, all_affected_symbols, all_contracts)
-    print(f"  Risk level: {risk['risk_level']}")
-    print(f"  Recommendation: {risk['recommendation']}")
+    # 4. Risk Assessment
+    print("\n[Step 4] Assessing risk (Context Precision)...")
+    risk = assess_risk(
+        requirement,
+        affected_files_list,
+        all_affected_symbols,
+        all_contracts,
+        functional_requirements=functional_reqs,
+        adr=adr
+    )
+
+    print(f"  Risk level: {risk.get('risk_level')}")
+    print(f"  Recommendation: {risk.get('recommendation')}")
 
     impact_report = {
         "requirement": requirement,
@@ -404,23 +389,16 @@ def run_impact_analysis(requirement: str) -> dict:
     print(f"   Repos affected: {affected_repos}")
     print(f"   Files affected: {len(affected_files_list)}")
     print(f"   Symbols affected: {len(all_affected_symbols)}")
-    print(f"   Risk: {risk['risk_level']}")
+    print(f"   Risk: {risk.get('risk_level')}")
     print(f"{'='*50}\n")
 
     return impact_report
 
-
 # -----------------------------------------
 # CLI Test
 # -----------------------------------------
-
 if __name__ == "__main__":
-    requirement = (
-        "Add leave balance tracker. Each employee gets 20 days per year. "
-        "Balance decreases when leave is approved."
-    )
-
+    requirement = "Add leave balance tracker. Each employee gets 20 days per year."
     report = run_impact_analysis(requirement)
-
     print("\nFull Impact Report:")
     print(json.dumps(report, indent=2))

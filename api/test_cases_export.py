@@ -6,12 +6,11 @@ import json
 import re
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
-from openai import OpenAI
+from dotenv import load_dotenv
 
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
+load_dotenv()
+
+from core.llm_gateway import gateway
 
 DARK_BLUE = "1F4E78"
 LIGHT_BLUE = "D9E1F2"
@@ -52,12 +51,12 @@ Return ONLY valid JSON:
 Generate 4-6 test cases covering positive, negative, edge cases.
 """
     try:
-        response = client.chat.completions.create(
+        content = gateway.generate(
+            prompt=prompt,
             model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
             max_tokens=2000
-        )
-        content = response.choices[0].message.content.strip()
+        ).strip()
         if content.startswith("```"):
             content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
         return json.loads(content).get("test_cases", [])

@@ -19,13 +19,7 @@ load_dotenv()
 
 def setup_postgres():
     print("[PostgreSQL] Connecting...")
-    conn = psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge")
-    )
+    conn = psycopg2.connect("postgresql://sdlc:sdlc1234@127.0.0.1:5437/sdlc_knowledge")
     cur = conn.cursor()
 
     print("[PostgreSQL] Creating tables...")
