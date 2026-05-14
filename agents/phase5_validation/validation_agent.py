@@ -5,6 +5,7 @@ Auto-retries up to 3 times on failure.
 No human approval gate — automatic.
 """
 
+import concurrent.futures
 import os
 import ast
 import json
@@ -15,17 +16,12 @@ import shutil
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from openai import OpenAI
-
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
+from core.llm_gateway import gateway
+from api.persistence import save_artifact
 
 
 # -----------------------------------------
@@ -39,21 +35,23 @@ class ValidationState(TypedDict):
     validation_results: dict
     retry_count: int
     status: str
+    thread_id: str
+    workspace_path: str
 
 
 # -----------------------------------------
 # Helpers
 # -----------------------------------------
 
-def call_llm(prompt: str) -> dict:
-    response = client.chat.completions.create(
-        model="deepseek-v4-pro",
-        messages=[{"role": "user", "content": prompt}],
+def call_llm(prompt: str, **kwargs) -> str:
+    return gateway.generate(
+        prompt=prompt,
+        model="deepseek-chat",
+        temperature=0.2,
         stream=False,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}}
-    )
-    return response.choices[0].message.content.strip()
+        tag="phase5_validation",
+        **kwargs
+    ).strip()
 
 
 def validate_python_syntax(code: str, file_path: str) -> list:
@@ -80,26 +78,21 @@ def run_basic_lint(code: str, file_path: str) -> list:
     return issues
 
 
-# -----------------------------------------
-# Nodes
-# -----------------------------------------
+def _process_single_test(change: dict, requirement: str, workspace_path: str):
+    file_path = change.get("file_path", "")
+    if not file_path.endswith(".py"):
+        return None
 
-def generate_tests(state: ValidationState) -> ValidationState:
-    """Generate pytest tests for all changed files."""
-    print("\n[Phase 5] Generating tests...")
+    content = change.get("content", "")
+    change_summary = change.get("change_summary", "")
+    new_symbols = change.get("new_symbols_added", [])
+    modified_symbols = change.get("existing_symbols_modified", [])
 
-    test_files = []
+    print(f"\n  Generating tests for: {file_path}")
 
-    for change in state["generated_changes"]:
-        file_path = change.get("file_path", "")
-        content = change.get("content", "")
-        change_summary = change.get("change_summary", "")
-        new_symbols = change.get("new_symbols_added", [])
-        modified_symbols = change.get("existing_symbols_modified", [])
+    safe_file_name = file_path.replace('/', '_').replace('\\', '_').replace('.py', '')
 
-        print(f"\n  Generating tests for: {file_path}")
-
-        prompt = f"""
+    prompt = f"""
 You are a senior QA engineer writing pytest tests.
 
 FILE BEING TESTED: {file_path}
@@ -115,7 +108,7 @@ CHANGES MADE:
 NEW SYMBOLS ADDED: {json.dumps(new_symbols)}
 MODIFIED SYMBOLS: {json.dumps(modified_symbols)}
 
-REQUIREMENT: {state['requirement']}
+REQUIREMENT: {requirement}
 
 Write comprehensive pytest tests that:
 1. Test each new function/class added
@@ -123,41 +116,111 @@ Write comprehensive pytest tests that:
 3. Test edge cases (zero balance, negative values etc)
 4. Use pytest fixtures where appropriate
 5. No external dependencies — use mocks if needed
+6. Do NOT return the full file as a single string.
+7. Return ONLY valid JSON using the exact schema below.
 
 Return ONLY valid JSON:
 {{
-  "test_file_path": "tests/test_{file_path.replace('/', '_').replace('\\\\', '_').replace('.py', '')}.py",
-  "content": "complete pytest test file content",
-  "test_count": 5,
-  "tests_cover": ["function1", "function2"]
+  "test_file_path": "tests/test_{safe_file_name}.py",
+  "imports": "import pytest\nfrom app.models import ...",
+  "test_functions": [
+    {{
+      "name": "test_example",
+      "code": "def test_example():\n    assert True"
+    }}
+  ],
+  "test_count": 1,
+  "tests_cover": ["function1"]
 }}
 """
 
-        response = call_llm(prompt, max_tokens=2000)
+    response = call_llm(prompt, max_tokens=8192)
 
-        if response.startswith("```"):
-            response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
+    if response.startswith("```"):
+        response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
 
-        try:
-            test_file = json.loads(response)
+    try:
+        test_file = json.loads(response)
 
-            # Validate test file syntax
-            errors = validate_python_syntax(
-                test_file.get("content", ""),
-                test_file.get("test_file_path", "")
-            )
+        imports = test_file.get("imports", "")
+        functions_code = "\n\n".join([
+            fn.get("code", "") for fn in test_file.get("test_functions", [])
+        ])
+        test_file["content"] = f"{imports}\n\n{functions_code}"
 
-            if errors:
-                print(f"  ⚠️  Test syntax errors: {errors}")
-                test_file["syntax_errors"] = errors
-            else:
-                print(f"  ✅ Tests generated: {test_file.get('test_count', 0)} tests")
-                print(f"     Covers: {test_file.get('tests_cover', [])}")
+        if workspace_path:
+            full_path = os.path.join(workspace_path, test_file["test_file_path"])
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(test_file["content"])
+            print(f"  💾 Saved test to disk: {full_path}")
 
-            test_files.append(test_file)
+        errors = validate_python_syntax(
+            test_file.get("content", ""),
+            test_file.get("test_file_path", "")
+        )
 
-        except json.JSONDecodeError as e:
-            print(f"  ❌ Failed to parse test response: {e}")
+        if errors:
+            print(f"  ⚠️  Test syntax errors: {errors}")
+            test_file["syntax_errors"] = errors
+        else:
+            print(f"  ✅ Tests generated: {test_file.get('test_count', 0)} tests")
+            print(f"     Covers: {test_file.get('tests_cover', [])}")
+
+        return test_file
+
+    except json.JSONDecodeError as e:
+        print(f"  ❌ Failed to parse test response: {e}")
+        return None
+
+
+def run_semgrep_gate(workspace_path: str) -> dict:
+    result = subprocess.run(
+        ["semgrep", "scan", "--config=p/security-audit", "--json", workspace_path],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        # Semgrep failed, assume blocked
+        return {"status": "BLOCKED", "reason": "Semgrep scan failed", "details": result.stderr}
+
+    try:
+        output = json.loads(result.stdout)
+        findings = output.get("results", [])
+        critical_findings = [
+            issue for issue in findings
+            if issue.get('extra', {}).get('severity') == 'ERROR'
+        ]
+        if critical_findings:
+            return {
+                "status": "BLOCKED",
+                "reason": f"Semgrep found {len(critical_findings)} CRITICAL SAST issues",
+                "details": critical_findings
+            }
+        else:
+            return {"status": "PASS"}
+    except json.JSONDecodeError:
+        return {"status": "BLOCKED", "reason": "Failed to parse Semgrep output", "details": result.stdout}
+
+
+# -----------------------------------------
+# Nodes
+# -----------------------------------------
+
+def generate_tests(state: ValidationState) -> ValidationState:
+    """Generate pytest tests for all changed files."""
+    print("\n[Phase 5] Generating tests...")
+
+    test_files = []
+    workspace_path = state.get('workspace_path', '')
+    requirement = state.get("requirement", "")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(_process_single_test, change, requirement, workspace_path) for change in state["generated_changes"]]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result is not None:
+                test_files.append(result)
 
     return {**state, "test_files": test_files, "status": "TESTS_GENERATED"}
 
@@ -180,9 +243,12 @@ def run_validation(state: ValidationState) -> ValidationState:
         file_path = change.get("file_path", "")
         content = change.get("content", "")
 
-        # Syntax check
-        syntax_errors = validate_python_syntax(content, file_path)
-        lint_issues = run_basic_lint(content, file_path)
+        syntax_errors = []
+        lint_issues = []
+
+        if file_path.endswith(".py"):
+            syntax_errors = validate_python_syntax(content, file_path)
+            lint_issues = run_basic_lint(content, file_path)
 
         if syntax_errors:
             results["syntax_checks"].extend(syntax_errors)
@@ -211,6 +277,16 @@ def run_validation(state: ValidationState) -> ValidationState:
             else:
                 print(f"  ✅ {test_path}: test syntax valid")
 
+    # Run Semgrep security gate
+    print("\n[Phase 5] Running Semgrep security analysis...")
+    gate_result = run_semgrep_gate(state['workspace_path'])
+    if gate_result['status'] == 'BLOCKED':
+        print(f"  ❌ Security gate BLOCKED: {gate_result['reason']}")
+        save_artifact(state['thread_id'], 'semgrep_report', json.dumps(gate_result))
+        return {**state, "status": "BLOCKED", "validation_results": results}
+    else:
+        print("  ✅ Security gate PASSED")
+
     # Determine overall status
     has_errors = (
         len(results["syntax_checks"]) > 0 or
@@ -230,6 +306,8 @@ def run_validation(state: ValidationState) -> ValidationState:
 def route_after_validation(state: ValidationState) -> str:
     if state["status"] == "VALIDATION_PASSED":
         return "pass"
+    if state["status"] == "BLOCKED":
+        return "fail"
 
     retry_count = state.get("retry_count", 0)
     if retry_count < 3:
@@ -285,6 +363,7 @@ def build_validation_graph():
 def run_validation_phase(
     requirement: str,
     generated_changes: list,
+    workspace_path: str,
     thread_id: str = "thread-validation"
 ) -> dict:
     graph = build_validation_graph()
@@ -296,7 +375,9 @@ def run_validation_phase(
         test_files=[],
         validation_results={},
         retry_count=0,
-        status="STARTED"
+        status="STARTED",
+        thread_id=thread_id,
+        workspace_path=workspace_path
     )
 
     print("\n" + "="*50)
@@ -353,7 +434,7 @@ class Employee(BaseModel):
 
     requirement = "Add leave balance tracker. Each employee gets 20 days per year."
 
-    result = run_validation_phase(requirement, mock_changes, "test-validation-1")
+    result = run_validation_phase(requirement, mock_changes, "/tmp/mock_workspace", "test-validation-1")
 
     if result['test_files']:
         print(f"\nSample test file:")

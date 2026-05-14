@@ -13,18 +13,13 @@ from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
-from groq import Groq
 from dotenv import load_dotenv
 import psycopg2
 
 load_dotenv()
 
-from openai import OpenAI
-
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
+from core.llm_gateway import gateway
+from api.persistence import audit
 
 
 # -----------------------------------------
@@ -34,25 +29,28 @@ client = OpenAI(
 class CodegenState(TypedDict):
     requirement: str
     impact_report: dict
+    adr: dict                  # Architecture Decision Record for tech stack enforcement
     existing_code: dict        # file_path -> current content
     generated_changes: list    # list of {file_path, content, change_summary}
     validation_errors: list
     status: str
+    workspace_path: str
+    thread_id: str
 
 
 # -----------------------------------------
 # Helpers
 # -----------------------------------------
 
-def call_llm(prompt: str) -> dict:
-    response = client.chat.completions.create(
-        model="deepseek-v4-pro",
-        messages=[{"role": "user", "content": prompt}],
+def call_llm(prompt: str, **kwargs) -> str:
+    return gateway.generate(
+        prompt=prompt,
+        model="deepseek-chat",
+        temperature=0.2,
         stream=False,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}}
-    )
-    return response.choices[0].message.content.strip()
+        tag="phase4_codegen",
+        **kwargs
+    ).strip()
 
 
 def get_postgres():
@@ -110,103 +108,160 @@ def validate_python(code: str, file_path: str) -> list:
     return errors
 
 
-# Phase 4 Codegen — Critical fixes for fresh project generation
-# Replace the generate_fresh_project function ENTIRELY in agents/phase4_codegen/codegen_agent.py
+def extract_file_outline(code: str) -> str:
+    """Extract class and function names to provide file structure without full content."""
+    outline = "[File Outline]\n"
+    try:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                outline += f"  class {node.name}\n"
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        outline += f"    def {item.name}(...)\n"
+            elif isinstance(node, ast.FunctionDef) and node.col_offset == 0:
+                outline += f"  def {node.name}(...)\n"
+    except SyntaxError:
+        outline = "[Could not parse file outline]\n"
+    return outline
+
+
+def extract_relevant_context(code: str, affected_symbols: list) -> str:
+    """
+    Context Windowing: For files > 100 lines, extract only relevant functions/classes
+    being modified plus a 20-line buffer. Otherwise return full code.
+    """
+    lines = code.split("\n")
+    
+    # If file is small, return everything
+    if len(lines) <= 100:
+        return code
+    
+    # Extract line ranges for affected symbols
+    affected_ranges = []
+    for sym in affected_symbols:
+        sym_line = sym.get("line", 0) if isinstance(sym, dict) else 0
+        if sym_line > 0:
+            start = max(0, sym_line - 20)
+            end = min(len(lines), sym_line + 20)
+            affected_ranges.append((start, end))
+    
+    if not affected_ranges:
+        return "\n".join(lines[:100])
+    
+    # Merge overlapping ranges
+    affected_ranges.sort()
+    merged_ranges = [affected_ranges[0]]
+    for start, end in affected_ranges[1:]:
+        last_start, last_end = merged_ranges[-1]
+        if start <= last_end + 10:
+            merged_ranges[-1] = (last_start, max(last_end, end))
+        else:
+            merged_ranges.append((start, end))
+    
+    # Extract windowed sections
+    windowed_code = ""
+    for start, end in merged_ranges:
+        windowed_code += "\n".join(lines[start:end]) + "\n... (code omitted) ...\n"
+    
+    return windowed_code
+
 
 def generate_fresh_project(state: CodegenState) -> CodegenState:
     """Generate complete project scaffold for a new requirement."""
     print("  [Phase 4] Generating FRESH project scaffold...")
 
     requirement = state["requirement"]
-    impact = state.get("impact_report", {})
-    architecture = impact.get("architecture", {})
-
-    # Build architecture context for grounded scaffolding
-    arch_context = ""
-    if architecture.get("nodes"):
-        arch_summary = []
-        for node in architecture.get("nodes", []):
-            arch_summary.append(f"- {node.get('name','')} ({node.get('type','service')}): {node.get('description','')}")
-            if node.get('tech_stack'):
-                arch_summary.append(f"  Tech: {', '.join(node['tech_stack'])}")
-        arch_context = "\n\nARCHITECTURE TO IMPLEMENT:\n" + "\n".join(arch_summary)
+    adr = state.get("adr", {})
+    
+    # Extract tech stack from ADR
+    adr_text = json.dumps(adr, indent=2) if adr else "ADR not provided."
+    tech_stack = ""
+    if adr and isinstance(adr, dict):
+        tech_stack = adr.get("technology_stack", "Python/FastAPI (default)")
+        language = adr.get("programming_language", "Python")
+        framework = adr.get("primary_framework", "FastAPI")
 
     prompt = f"""
-You are a senior backend engineer scaffolding a brand new Python FastAPI project.
+You are an Expert Software Engineer specializing in the tech stack defined in the provided ADR and Architecture Decision Record.
+
+ADR:
+{adr_text}
+
+CRITICAL: First, read the ADR to determine the agreed-upon programming language and framework. Generate starter code ONLY in the tech stack specified in the ADR. File extensions and project structure MUST match the specified language:
+- If TypeScript/Node.js: Use .ts extensions, package.json, express/nestjs patterns
+- If Python: Use .py extensions, requirements.txt, FastAPI/Django patterns
+- If C#/.NET: Use .cs extensions, .csproj, ASP.NET patterns
+- Otherwise: Follow the ADR specifications exactly
+
+DO NOT default to Python unless explicitly specified in the ADR.
 
 REQUIREMENT:
 {requirement}
-{arch_context}
 
-Generate a complete, working starter project with these files. Each MUST be production-quality:
-
-1. main.py — FastAPI app entry with health endpoint
-2. app/__init__.py — empty
-3. app/models.py — Pydantic models matching the requirement
-4. app/routes.py — API routes implementing the requirement (NOT just stubs)
-5. app/services.py — business logic functions
-6. app/database.py — SQLAlchemy setup (sqlite for now)
-7. requirements.txt — fastapi, uvicorn, pydantic, sqlalchemy
-8. README.md — how to run, what it does
-9. .gitignore — standard Python
-10. tests/__init__.py — empty
-11. tests/test_main.py — basic health test
-
-Each file MUST be syntactically valid Python and immediately runnable with:
-  pip install -r requirements.txt && uvicorn main:app --reload
+Generate a complete starter project scaffold with files appropriate for the tech stack in the ADR.
 
 Return ONLY valid JSON:
 {{
   "files": [
     {{
-      "file_path": "main.py",
-      "content": "complete file content as a string",
+      "file_path": "path/to/file.ext (with correct extension for tech stack)",
+      "content": "complete file content",
       "change_summary": "what this file does",
-      "new_symbols_added": ["app", "main"],
+      "new_symbols_added": ["symbol1"],
       "existing_symbols_modified": []
     }}
   ]
 }}
 """
 
-    # call_llm returns string (not parsed JSON) — handle that
-    response = call_llm(prompt)
-
+    response = call_llm(prompt, max_tokens=4096)
     if response.startswith("```"):
         response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
 
-    # Try multiple JSON parse strategies
-    generated_changes = []
     try:
         data = json.loads(response)
         generated_changes = data.get("files", [])
-    except json.JSONDecodeError:
-        # Try to find JSON object boundary
-        try:
-            start = response.find('{')
-            end = response.rfind('}') + 1
-            if start >= 0 and end > start:
-                data = json.loads(response[start:end])
-                generated_changes = data.get("files", [])
-        except Exception as e:
-            print(f"  [Phase 4] Fresh project JSON parse failed: {e}")
-            print(f"  [Phase 4] Response head: {response[:300]}")
-            generated_changes = []
+    except Exception as e:
+        print(f"  [Phase 4] JSON parse failed: {e}")
+        generated_changes = []
 
-    # Validate Python syntax
+    # Validate syntax (language-agnostic for now, but could extend)
     errors = []
     for change in generated_changes:
+        # Only validate Python files if that's the ADR stack
         if change.get("file_path", "").endswith(".py"):
-            errs = validate_python(change.get("content", ""), change["file_path"])
-            errors.extend(errs)
+            errors.extend(validate_python(change.get("content", ""), change["file_path"]))
 
-    print(f"  [Phase 4] Generated {len(generated_changes)} fresh files (errors: {len(errors)})")
+    print(f"  [Phase 4] Generated {len(generated_changes)} fresh files")
     return {
         **state,
         "generated_changes": generated_changes,
         "validation_errors": errors,
         "status": "CODE_GENERATED" if not errors else "CODE_GENERATION_FAILED"
     }
+
+
+
+def eval_first_check(state: CodegenState) -> CodegenState:
+    """Check for goldenset.yaml before proceeding with code generation."""
+    workspace_path = state.get('workspace_path', '')
+    goldenset_path = os.path.join(workspace_path, 'goldenset.yaml')
+    
+    if os.path.exists(goldenset_path):
+        audit(state.get('thread_id', 'unknown'), 'phase4', 'INFO', 'system', {
+            'message': 'Eval-First Check Passed: goldenset.yaml found.'
+        })
+        print("  [Phase 4] Eval-First Check: PASSED (goldenset.yaml found)")
+    else:
+        audit(state.get('thread_id', 'unknown'), 'phase4', 'WARNING', 'system', {
+            'message': 'Eval-First Check Failed: goldenset.yaml missing. Proceeding in SOFT MODE.'
+        })
+        print("  [Phase 4] Eval-First Check: WARNING (goldenset.yaml missing — soft mode)")
+    
+    return state
+
+
 # -----------------------------------------
 # Nodes
 # -----------------------------------------
@@ -285,15 +340,28 @@ def generate_code_changes(state: CodegenState) -> CodegenState:
         return generate_fresh_project(state)
 
     context = build_context_packet(state)
+    adr = state.get("adr", {})
+    adr_text = json.dumps(adr, indent=2) if adr else "ADR not provided."
     generated_changes = []
     all_errors = []
 
     for file_info in context["files"]:
         file_path = file_info["file_path"]
+        current_content = file_info["current_content"]
         print(f"\n  Processing: {file_path}")
 
+        # Context Windowing: extract relevant sections for large files
+        file_outline = extract_file_outline(current_content)
+        windowed_content = extract_relevant_context(current_content, file_info["existing_symbols"])
+        content_for_llm = current_content if len(current_content.split("\n")) <= 100 else windowed_content
+
         prompt = f"""
-You are a senior software engineer modifying an existing Python file.
+You are an Expert Software Engineer specializing in the tech stack defined in the provided ADR.
+
+ADR:
+{adr_text}
+
+CRITICAL: The ADR defines the agreed-upon tech stack. Use the same programming language, framework, and conventions as specified in the ADR. Generate file extensions and code patterns that match the ADR. DO NOT default to Python unless the ADR specifies Python.
 
 REQUIREMENT:
 {context['requirement']}
@@ -305,12 +373,14 @@ BREAKING CHANGES TO BE AWARE OF:
 
 FILE TO MODIFY: {file_path}
 
+{file_outline}
+
 EXISTING SYMBOLS IN THIS FILE (from AST index):
 {json.dumps(file_info['existing_symbols'], indent=2)}
 
-CURRENT FILE CONTENT:
-```python
-{file_info['current_content']}
+RELEVANT FILE CONTENT:
+```
+{content_for_llm}
 ```
 
 INSTRUCTIONS:
@@ -319,13 +389,19 @@ INSTRUCTIONS:
 3. Add new functions/classes as needed
 4. Keep all existing functionality working
 5. Add TODO comments for acceptance criteria
-6. CRITICAL: Return syntactically valid Python only
-7. Return the COMPLETE updated file content
+6. CRITICAL: Return syntactically valid code in the language specified by the ADR
+7. Instead of returning the entire file, return ONLY the exact blocks of code that need to be changed.
+8. The search_block must match the existing file content exactly.
 
 Return ONLY valid JSON:
 {{
   "file_path": "{file_path}",
-  "content": "complete updated file content here",
+  "changes": [
+    {{
+      "search_block": "Exact existing code snippet to replace",
+      "replace_block": "The new code to insert"
+    }}
+  ],
   "change_summary": "what was changed and why",
   "new_symbols_added": ["symbol1"],
   "existing_symbols_modified": ["symbol1"]
@@ -345,7 +421,28 @@ Return ONLY valid JSON:
             try:
                 change = json.loads(response)
                 content = change.get("content", "")
-                errors = validate_python(content, file_path)
+
+                if change.get("changes"):
+                    content = current_content
+                    diff_errors = []
+                    for diff in change["changes"]:
+                        search_block = diff.get("search_block", "")
+                        replace_block = diff.get("replace_block", "")
+                        if not search_block:
+                            diff_errors.append(f"{file_path}: missing search_block in diff")
+                            continue
+                        if search_block not in content:
+                            diff_errors.append(f"{file_path}: search_block not found in current content")
+                            continue
+                        content = content.replace(search_block, replace_block, 1)
+
+                    if diff_errors:
+                        errors = diff_errors
+                    else:
+                        change["content"] = content
+                        errors = validate_python(content, file_path)
+                else:
+                    errors = validate_python(content, file_path)
 
                 if errors:
                     print(f"  ⚠️  Attempt {attempt}/{max_retries} — syntax errors: {errors}")
@@ -363,6 +460,14 @@ Pay special attention to:
 - No unterminated strings or brackets
 """
                     continue
+
+                workspace_path = state.get('workspace_path', '')
+                if workspace_path:
+                    full_path = os.path.join(workspace_path, change["file_path"])
+                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                    with open(full_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    print(f"  💾 Saved to disk: {full_path}")
 
                 generated_changes.append(change)
                 print(f"  ✅ Generated (attempt {attempt}): {change.get('change_summary', '')[:80]}")
@@ -404,8 +509,8 @@ def validate_changes(state: CodegenState) -> CodegenState:
             syntax_errors = validate_python(content, file_path)
             errors.extend(syntax_errors)
 
-        # Check content is not empty
-        if not content.strip():
+        # Check content is not empty, but allow empty Python package markers
+        if not content.strip() and not file_path.endswith("__init__.py"):
             errors.append(f"{file_path}: Generated content is empty")
 
     if errors:
@@ -431,11 +536,13 @@ def route_after_validation(state: CodegenState) -> str:
 def build_codegen_graph():
     builder = StateGraph(CodegenState)
 
+    builder.add_node("eval_first_check", eval_first_check)
     builder.add_node("load_existing_code", load_existing_code)
     builder.add_node("generate_code_changes", generate_code_changes)
     builder.add_node("validate_changes", validate_changes)
 
-    builder.set_entry_point("load_existing_code")
+    builder.set_entry_point("eval_first_check")
+    builder.add_edge("eval_first_check", "load_existing_code")
     builder.add_edge("load_existing_code", "generate_code_changes")
     builder.add_edge("generate_code_changes", "validate_changes")
 
@@ -456,17 +563,20 @@ def build_codegen_graph():
 # Run
 # -----------------------------------------
 
-def run_codegen(requirement: str, impact_report: dict, thread_id: str = "thread-codegen"):
+def run_codegen(requirement: str, impact_report: dict, workspace_path: str, thread_id: str = "thread-codegen", adr: dict = None):
     graph = build_codegen_graph()
     config = {"configurable": {"thread_id": thread_id}}
 
     initial_state = CodegenState(
         requirement=requirement,
         impact_report=impact_report,
+        adr=adr or {},
         existing_code={},
         generated_changes=[],
         validation_errors=[],
-        status="STARTED"
+        status="STARTED",
+        workspace_path=workspace_path,
+        thread_id=thread_id
     )
 
     print("\n" + "="*50)
@@ -528,7 +638,7 @@ if __name__ == "__main__":
 
     requirement = "Add leave balance tracker. Each employee gets 20 days per year. Balance decreases when leave is approved."
 
-    result = run_codegen(requirement, mock_impact_report, "test-codegen-1")
+    result = run_codegen(requirement, mock_impact_report, "/tmp/mock_workspace", "test-codegen-1")
 
     # Show generated content for first file
     if result['generated_changes']:

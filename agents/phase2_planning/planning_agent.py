@@ -4,6 +4,7 @@ Generates Jira epics/stories and deployment runbook from approved PRD.
 Human approval INTERRUPT after sprint plan generated.
 """
 
+import concurrent.futures
 import os
 import json
 import re
@@ -11,20 +12,15 @@ from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
-from groq import Groq
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from api.jira_client import fetch_jira_metadata
+from api.persistence import save_artifact
+from core.llm_gateway import gateway
 from dotenv import load_dotenv
 
 load_dotenv()
-from openai import OpenAI
-
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
 
 
 # -----------------------------------------
@@ -41,6 +37,18 @@ class PlanningState(TypedDict):
     human_feedback: str
     approved: bool
     status: str
+    thread_id: str
+
+
+def _get_thread_id(state) -> str:
+    if isinstance(state, dict):
+        thread_id = state.get("thread_id")
+        if thread_id:
+            return thread_id
+        config = state.get("config") or state.get("__config__") or state.get("_config") or {}
+        if isinstance(config, dict):
+            return config.get("thread_id") or config.get("configurable", {}).get("thread_id")
+    return "unknown-thread"
 
 
 # -----------------------------------------
@@ -48,14 +56,15 @@ class PlanningState(TypedDict):
 # -----------------------------------------
 
 def call_llm(prompt: str) -> dict:
-    response = client.chat.completions.create(
+    content = gateway.generate(
+        prompt=prompt,
         model="deepseek-v4-pro",
-        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
         stream=False,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}}
-    )
-    content = response.choices[0].message.content.strip()
+        reasoning_effort="low",
+        extra_body={"thinking": {"type": "enabled"}},
+        tag="phase2_planning"
+    ).strip()
     if content.startswith("```"):
         content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
     try:
@@ -112,6 +121,18 @@ Requirement: {state['requirement']}
 
     epics = sprint_plan.get("epics", [])
     total_stories = sum(len(e.get("stories", [])) for e in epics)
+
+    thread_id = _get_thread_id(state)
+    if thread_id != "unknown-thread":
+        try:
+            save_artifact(
+                thread_id=thread_id,
+                key="SprintPlan",
+                phase="Phase 2 - Planning",
+                content=json.dumps(sprint_plan, indent=2, ensure_ascii=False)
+            )
+        except Exception as e:
+            print(f"[Persistence] save_artifact SprintPlan failed: {e}")
 
     print(f"  ✅ Sprint plan generated: {len(epics)} epics, {total_stories} stories")
     return {**state, "sprint_plan": sprint_plan, "status": "SPRINT_PLAN_GENERATED"}
@@ -226,7 +247,28 @@ def create_jira_tickets(state: PlanningState) -> PlanningState:
     except Exception as e:
         print(f"  ⚠️  Jira creation skipped: {e}")
         return {**state, "jira_tickets": [], "status": "JIRA_SKIPPED"}
-    
+
+
+def create_jira_tickets_and_runbook(state: PlanningState) -> PlanningState:
+    print("\n[Phase 2] Creating Jira tickets and runbook in parallel...")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        tickets_future = executor.submit(create_jira_tickets, dict(state))
+        runbook_future = executor.submit(generate_runbook, dict(state))
+
+        result_tickets = tickets_future.result()
+        result_runbook = runbook_future.result()
+
+    merged_state = {
+        **state,
+        "jira_tickets": result_tickets.get("jira_tickets", []),
+        "runbook": result_runbook.get("runbook", {}),
+        "status": "JIRA_AND_RUNBOOK_GENERATED"
+    }
+
+    return merged_state
+
+
 def generate_runbook(state: PlanningState) -> PlanningState:
     print("\n[Phase 2] Generating runbook...")
 
@@ -267,6 +309,18 @@ Return ONLY valid JSON:
 Feature: {state['requirement']}
 Sprint plan epics: {json.dumps([e['title'] for e in state['sprint_plan'].get('epics', [])], indent=2)}
 """)
+
+    thread_id = _get_thread_id(state)
+    if thread_id != "unknown-thread":
+        try:
+            save_artifact(
+                thread_id=thread_id,
+                key="Runbook",
+                phase="Phase 2 - Planning",
+                content=json.dumps(runbook, indent=2, ensure_ascii=False)
+            )
+        except Exception as e:
+            print(f"[Persistence] save_artifact Runbook failed: {e}")
 
     print(f"  ✅ Runbook generated: {len(runbook.get('deployment_sequence', []))} deployment steps")
     return {**state, "runbook": runbook, "status": "RUNBOOK_GENERATED"}
@@ -325,15 +379,13 @@ def build_planning_graph():
     builder = StateGraph(PlanningState)
 
     builder.add_node("generate_sprint_plan", generate_sprint_plan)
-    builder.add_node("create_jira_tickets", create_jira_tickets)
-    builder.add_node("generate_runbook", generate_runbook)
+    builder.add_node("create_jira_tickets_and_runbook", create_jira_tickets_and_runbook)
     builder.add_node("human_approval_gate", human_approval_gate)
     builder.add_node("process_approval", process_approval)
 
     builder.set_entry_point("generate_sprint_plan")
-    builder.add_edge("generate_sprint_plan", "create_jira_tickets")
-    builder.add_edge("create_jira_tickets", "generate_runbook")
-    builder.add_edge("generate_runbook", "human_approval_gate")
+    builder.add_edge("generate_sprint_plan", "create_jira_tickets_and_runbook")
+    builder.add_edge("create_jira_tickets_and_runbook", "human_approval_gate")
     builder.add_edge("human_approval_gate", "process_approval")
 
     builder.add_conditional_edges(
@@ -368,7 +420,8 @@ def start_planning(requirement: str, brd: dict, prd: dict, thread_id: str = "thr
         runbook={},
         human_feedback="",
         approved=False,
-        status="STARTED"
+        status="STARTED",
+        thread_id=thread_id
     )
 
     print("\n" + "="*50)

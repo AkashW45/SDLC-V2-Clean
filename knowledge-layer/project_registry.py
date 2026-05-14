@@ -145,8 +145,10 @@ if __name__ == "__main__":
     register_project(
         project_id="leave-mgmt",
         project_name="Leave Management System",
-        description="Specifically tracks employee LEAVE REQUESTS — vacation days, sick days, casual leave, annual leave entitlement balances, leave approval workflow. Does NOT handle feedback, performance reviews, surveys, or any non-leave HR functions.",
-        domain="HR-Leave",
+        description="Employee leave request, approval, and balance tracking system. "
+                    "Handles annual leave entitlement, sick leave, casual leave, "
+                    "manager approval workflow, and year-end balance reset.",
+        domain="HR",
         tech_stack=["Python", "FastAPI", "Pydantic"],
         repos=["leave-mgmt-backend", "leave-mgmt-frontend", "leave-mgmt-batch"],
         owner_team="HR Platform Team"

@@ -11,6 +11,7 @@ langchain-groq
 
 # AI / LLM
 groq
+openai
 
 # HTTP
 requests
@@ -33,3 +34,9 @@ pytest-cov
 # Utils
 jinja2
 pyyaml
+semgrep
+tenacity
+
+openpyxl
+psycopg_pool
+psycopg[binary]

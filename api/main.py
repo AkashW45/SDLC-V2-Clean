@@ -1,24 +1,21 @@
 """
 SDLC Automation Platform V2 — FastAPI HTTP Layer
 Exposes the LangGraph pipeline as HTTP endpoints.
-
-ARCHITECTURAL FIX 2026-05-08:
-  - Phase 0 (project selector) is now ACTUALLY invoked before Phase 1
-  - is_new_project + selected_repos populated from Phase 0 propagate through state
-  - Phase 6 routes to correct repo (no silent fallback to leave-mgmt-backend)
 """
 import io
 import os
-import re
 import uuid
 import asyncio
+import requests
 from typing import Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Body
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Body, Depends, Security
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, Response
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from langgraph.types import Command
+from fastapi.responses import JSONResponse, HTMLResponse, Response 
 from api.runbook_export import (
     export_runbook_excel,
     export_brd_markdown,
@@ -31,14 +28,14 @@ from api.runbook_export import (
 import zipfile
 
 load_dotenv()
-
-# ── In-memory pipeline state store ────────────────────────────────────────────
-pipeline_store: dict = {}
-
 from api.persistence import (
     init_persistence_tables, save_pipeline, load_all_pipelines,
-    audit, get_audit_log
+    audit, get_audit_log, create_replay_job, update_replay_job,
+    get_artifact, save_artifact
 )
+# ── In-memory pipeline state store ────────────────────────────────────────────
+# Stores: { thread_id: { graph, config, result, phase, status } }
+pipeline_store: dict = {}
 
 # Initialize on startup
 init_persistence_tables()
@@ -54,16 +51,128 @@ except Exception as e:
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="SDLC Automation Platform V2",
-    description="AI-powered SDLC pipeline — Phases 0-7",
-    version="2.0.1"
+    description="AI-powered SDLC pipeline — Phases 1-7",
+    version="2.0.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[os.getenv("FRONTEND_URL", "https://selfforge.internal")],
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+# ── API Key Authentication ───────────────────────────────────────────────────
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+VALID_API_KEY = os.getenv("API_SECRET_KEY", "sdlc-dev-key-12345")
+
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    if api_key != VALID_API_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorised")
+
+
+
+
+def extract_target_artifact(payload: dict) -> str:
+    artifact = payload.get("artifact")
+    if isinstance(artifact, str) and artifact.strip():
+        normalized = artifact.strip().upper()
+        if normalized == "ARCHITECTURE":
+            return "Architecture"
+        return normalized
+
+    feedback = str(payload.get("feedback", "")).lower()
+    if "adr" in feedback:
+        return "ADR"
+    if "prd" in feedback:
+        return "PRD"
+    if "brd" in feedback:
+        return "BRD"
+    if "architecture" in feedback or "arch" in feedback:
+        return "Architecture"
+    return "ADR"
+
+
+def execute_surgical_replay(job_id: int, thread_id: str, target_artifact: str, feedback: str):
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from agents.phase1_discovery.discovery_agent import (
+            generate_brd, generate_prd, generate_adr, generate_architecture
+        )
+
+        previous_artifact = get_artifact(thread_id, target_artifact)
+        old_version = previous_artifact.get("version", 0)
+
+        def load_previous(key_name: str):
+            prev = get_artifact(thread_id, key_name)
+            content = prev.get("content", "")
+            if not content:
+                return {}
+            try:
+                return json.loads(content)
+            except Exception:
+                return {}
+
+        state = {
+            "requirement": pipeline_store[thread_id]["requirement"],
+            "brd": load_previous("BRD"),
+            "prd": load_previous("PRD"),
+            "adr": load_previous("ADR"),
+            "architecture": load_previous("Architecture"),
+            "human_feedback": feedback,
+            "approved": False,
+            "status": "STARTED",
+            "thread_id": thread_id
+        }
+
+        generator_map = {
+            "BRD": generate_brd,
+            "PRD": generate_prd,
+            "ADR": generate_adr,
+            "ARCHITECTURE": generate_architecture
+        }
+
+        generator = generator_map.get(target_artifact.upper())
+        if not generator:
+            raise ValueError(f"Unsupported artifact for replay: {target_artifact}")
+
+        result = generator(state)
+        artifact_key = "Architecture" if target_artifact.upper() == "ARCHITECTURE" else target_artifact.upper()
+        artifact_body = result.get(artifact_key.lower(), result.get(artifact_key, {}))
+        content = json.dumps(artifact_body, indent=2, ensure_ascii=False)
+        new_version = save_artifact(thread_id, artifact_key, "Phase 1 - Discovery Replay", content)
+        diff_summary = f"Updated {artifact_key} from version {old_version} to version {new_version}"
+
+        update_replay_job(job_id, "COMPLETED", diff_summary)
+
+        slack_url = os.getenv("SLACK_WEBHOOK_URL")
+        if slack_url:
+            try:
+                requests.post(
+                    slack_url,
+                    json={"text": f"Replay Job {job_id} completed for {thread_id}. Artifact: {artifact_key}. Diff: {diff_summary}"}
+                )
+            except Exception as slack_error:
+                print(f"[Slack] notification failed: {slack_error}")
+
+        audit(thread_id, "phase1", "REPLAY_COMPLETED", "system", {
+            "job_id": job_id,
+            "artifact": artifact_key,
+            "diff_summary": diff_summary
+        })
+
+        pipeline_store[thread_id]["status"] = "PHASE_1_REPLAY_COMPLETED"
+        pipeline_store[thread_id]["sub_stage"] = f"Replay completed for {artifact_key}"
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id].get("current_state", {})))
+
+    except Exception as e:
+        error_message = str(e)
+        update_replay_job(job_id, "FAILED", error_message)
+        audit(thread_id, "phase1", "REPLAY_FAILED", "system", {"job_id": job_id, "error": error_message})
+        pipeline_store[thread_id]["status"] = "ERROR"
+        pipeline_store[thread_id]["error"] = f"Replay failed: {error_message}"
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id].get("current_state", {})))
 
 
 # ── Request / Response Models ─────────────────────────────────────────────────
@@ -87,24 +196,25 @@ class SearchRequest(BaseModel):
     top_k: Optional[int] = 10
 
 
-# ── Slug helper (used as fallback if Phase 0 fails) ───────────────────────────
-def _slugify(text: str, max_len: int = 40) -> str:
-    slug = re.sub(r'[^a-z0-9]+', '-', text.lower())[:max_len].strip('-')
-    return slug or "new-project"
-
-
 # ── Health Check ──────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
+    """Check all service connections."""
     services = {}
+
+    # Check Qdrant
     try:
         from qdrant_client import QdrantClient
         q = QdrantClient(url="http://127.0.0.1:6333", timeout=5)
         collections = q.get_collections()
-        services["qdrant"] = {"status": "ok", "collections": len(collections.collections)}
+        services["qdrant"] = {
+            "status": "ok",
+            "collections": len(collections.collections)
+        }
     except Exception as e:
         services["qdrant"] = {"status": "error", "error": str(e)}
 
+    # Check Neo4j
     try:
         from neo4j import GraphDatabase
         driver = GraphDatabase.driver(
@@ -119,6 +229,7 @@ def health():
     except Exception as e:
         services["neo4j"] = {"status": "error", "error": str(e)}
 
+    # Check PostgreSQL
     try:
         import psycopg2
         conn = psycopg2.connect(
@@ -133,38 +244,55 @@ def health():
     except Exception as e:
         services["postgres"] = {"status": "error", "error": str(e)}
 
-    overall = "ok" if all(s["status"] == "ok" for s in services.values()) else "degraded"
-    return {"status": overall, "services": services, "version": "2.0.1"}
+    overall = "ok" if all(
+        s["status"] == "ok" for s in services.values()
+    ) else "degraded"
 
+    return {
+        "status": overall,
+        "services": services,
+        "version": "2.0.0"
+    }
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def serve_dashboard():
-    dashboard_path = os.path.join(os.path.dirname(__file__), '..', 'dashboard', 'index.html')
+    dashboard_path = os.path.join(
+        os.path.dirname(__file__), '..', 'dashboard', 'index.html'
+    )
     with open(dashboard_path, 'r', encoding='utf-8') as f:
-        return HTMLResponse(content=f.read())
-
+        html = f.read()
+    # Inject API key for dashboard authentication
+    api_key_script = f"const API_KEY = '{VALID_API_KEY}';\nconsole.log('API_KEY injected:', API_KEY);"
+    # Insert after the first <script> tag
+    html = html.replace(
+        "const API = 'http://localhost:8001';",
+        f"const API = 'http://localhost:8001';\n{api_key_script}"
+    )
+    return HTMLResponse(content=html)
+    
 
 # ── Pipeline Endpoints ────────────────────────────────────────────────────────
 @app.post("/pipeline/start")
-def pipeline_start(req: StartRequest, background_tasks: BackgroundTasks):
+def pipeline_start(req: StartRequest, background_tasks: BackgroundTasks, api_key: str = Depends(verify_api_key)):
     """
-    Start the SDLC pipeline.
-    FLOW: Phase 0 (project selector) → Phase 1 (discovery)
+    Start the SDLC pipeline from a plain English requirement.
+    Returns immediately with thread_id.
+    Pipeline runs Phase 1 until first INTERRUPT, then waits.
     """
     thread_id = req.thread_id or f"pipeline-{uuid.uuid4().hex[:8]}"
 
     if thread_id in pipeline_store:
         return JSONResponse(
             status_code=400,
-            content={"error": f"Thread {thread_id} already exists."}
+            content={"error": f"Thread {thread_id} already exists. Use a different thread_id."}
         )
 
+    # Initialize store entry
     pipeline_store[thread_id] = {
         "thread_id": thread_id,
         "requirement": req.requirement,
-        "phase": 0,
+        "phase": 1,
         "status": "STARTING",
-        "sub_stage": "Routing to project...",
         "current_state": {},
         "graph": None,
         "config": None,
@@ -172,13 +300,13 @@ def pipeline_start(req: StartRequest, background_tasks: BackgroundTasks):
         "error": None
     }
 
-    # FIX: Run Phase 0 FIRST, which then auto-chains to Phase 1
-    background_tasks.add_task(run_phase0_and_phase1, thread_id, req.requirement)
+    # Run Phase 1 in background
+    background_tasks.add_task(run_phase1, thread_id, req.requirement)
 
     return {
         "thread_id": thread_id,
         "status": "STARTED",
-        "message": "Pipeline started. Phase 0 routing → Phase 1 discovery.",
+        "message": "Pipeline started. Poll /pipeline/status/{thread_id} for updates.",
         "next": f"/pipeline/status/{thread_id}"
     }
 
@@ -188,7 +316,6 @@ def pipeline_status(thread_id: str):
     if thread_id not in pipeline_store:
         raise HTTPException(404, f"Thread {thread_id} not found")
     entry = pipeline_store[thread_id]
-    safe = _safe_state(entry.get("current_state", {}))
     return {
         "thread_id": thread_id,
         "phase": entry.get("phase", ""),
@@ -197,16 +324,14 @@ def pipeline_status(thread_id: str):
         "requirement": entry.get("requirement", ""),
         "pr_urls": entry.get("pr_urls", []),
         "error": entry.get("error"),
-        "is_new_project": safe.get("is_new_project", False),
-        "selected_project": safe.get("selected_project", {}),
-        "selected_repos": safe.get("selected_repos", []),
-        "target_repo": safe.get("target_repo", ""),
-        "current_state": safe
+        "is_new_project": entry.get("current_state", {}).get("is_new_project", False),
+        "selected_repos": entry.get("current_state", {}).get("selected_repos", []),
+        "current_state": _safe_state(entry.get("current_state", {}))
     }
 
 
 @app.post("/pipeline/approve/{thread_id}")
-def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: BackgroundTasks = None):
+def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: BackgroundTasks = None, api_key: str = Depends(verify_api_key)):
     if thread_id not in pipeline_store:
         raise HTTPException(404, "Not found")
 
@@ -215,17 +340,32 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
     actor = body.get("actor", "user")
 
     entry = pipeline_store[thread_id]
-    current_phase = str(entry.get("phase", "1"))
+    current_phase = entry.get("phase", "1")
 
     if not approved:
-        audit(thread_id, f"phase{current_phase}", "REJECTED", actor, {"feedback": feedback})
+        # REJECTION — regenerate current phase with feedback
+        audit(thread_id, f"phase{current_phase}", "REJECTED", actor,
+              {"feedback": feedback})
+
         entry["status"] = "REGENERATING"
         entry["sub_stage"] = f"Regenerating Phase {current_phase} with feedback..."
         entry["human_feedback"] = feedback
         save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
 
         if current_phase == "1":
-            background_tasks.add_task(run_phase1, thread_id, entry["requirement"], feedback)
+            target_artifact = extract_target_artifact(body)
+            job_id = create_replay_job(thread_id, target_artifact)
+            entry["status"] = "REPLAYING"
+            entry["sub_stage"] = f"Surgical replay for {target_artifact}"
+            save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
+            background_tasks.add_task(execute_surgical_replay, job_id, thread_id, target_artifact, feedback)
+            return {
+                "status": "REPLAYING",
+                "phase": current_phase,
+                "job_id": job_id,
+                "target_artifact": target_artifact,
+                "feedback_applied": feedback
+            }
         elif current_phase == "2":
             background_tasks.add_task(run_phase2, thread_id, feedback)
         elif current_phase == "3":
@@ -235,28 +375,28 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
         elif current_phase == "7":
             background_tasks.add_task(run_phase7, thread_id, feedback)
 
-        return {"status": "REGENERATING", "phase": current_phase, "feedback_applied": feedback}
+        return {
+            "status": "REGENERATING",
+            "phase": current_phase,
+            "feedback_applied": feedback
+        }
 
     # APPROVAL
-    audit(thread_id, f"phase{current_phase}", "APPROVED", actor, {"feedback": feedback})
+    audit(thread_id, f"phase{current_phase}", "APPROVED", actor,
+          {"feedback": feedback})
+
     entry["status"] = f"PHASE_{current_phase}_APPROVED"
     entry["sub_stage"] = f"Phase {current_phase} approved — proceeding..."
     save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
 
+    # Continue to next phase
     next_phase = str(int(current_phase) + 1)
-    entry["phase"] = int(next_phase)
+    entry["phase"] = next_phase
 
     if next_phase == "2":
         background_tasks.add_task(run_phase2, thread_id, "")
     elif next_phase == "3":
-        # FIX: skip Phase 3 for new projects — there's nothing to impact-analyze
-        is_new = entry.get("current_state", {}).get("is_new_project", False)
-        if is_new:
-            print(f"  [Approve] New project — skipping Phase 3, jumping to Phase 4")
-            entry["phase"] = 4
-            background_tasks.add_task(run_phase4, thread_id)
-        else:
-            background_tasks.add_task(run_phase3, thread_id, "")
+        background_tasks.add_task(run_phase3, thread_id, "")
     elif next_phase == "4":
         background_tasks.add_task(run_phase4, thread_id)
     elif next_phase == "5":
@@ -266,18 +406,22 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
     elif next_phase == "7":
         background_tasks.add_task(run_phase7, thread_id, "")
 
-    return {"status": "APPROVED", "next_phase": next_phase}
-
+    return {
+        "status": "APPROVED",
+        "next_phase": next_phase
+    }
 
 @app.get("/pipeline/list")
 def pipeline_list():
+    """List all active pipelines."""
     return {
         "pipelines": [
             {
                 "thread_id": tid,
-                "phase": e.get("phase", ""),
-                "status": e.get("status", ""),
-                "requirement": e["requirement"][:60] + "..." if len(e["requirement"]) > 60 else e["requirement"]
+                "phase": e["phase"],
+                "status": e["status"],
+                "requirement": e["requirement"][:60] + "..."
+                if len(e["requirement"]) > 60 else e["requirement"]
             }
             for tid, e in pipeline_store.items()
         ],
@@ -287,13 +431,14 @@ def pipeline_list():
 
 @app.delete("/pipeline/{thread_id}")
 def pipeline_delete(thread_id: str):
+    """Remove a pipeline from the store."""
     if thread_id not in pipeline_store:
         raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
     del pipeline_store[thread_id]
     return {"message": f"Pipeline {thread_id} removed"}
 
-
 # ── DOWNLOAD ENDPOINTS ─────────────────────────────────────────────
+
 def _get_pipeline_or_404(thread_id: str):
     if thread_id not in pipeline_store:
         raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
@@ -304,32 +449,44 @@ def _get_pipeline_or_404(thread_id: str):
 def download_brd(thread_id: str):
     entry = _get_pipeline_or_404(thread_id)
     md = export_brd_markdown(entry["current_state"].get("brd", {}))
-    return Response(content=md, media_type="text/markdown",
-                    headers={"Content-Disposition": f"attachment; filename=BRD_{thread_id}.md"})
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=BRD_{thread_id}.md"}
+    )
 
 
 @app.get("/pipeline/{thread_id}/download/prd")
 def download_prd(thread_id: str):
     entry = _get_pipeline_or_404(thread_id)
     md = export_prd_markdown(entry["current_state"].get("prd", {}))
-    return Response(content=md, media_type="text/markdown",
-                    headers={"Content-Disposition": f"attachment; filename=PRD_{thread_id}.md"})
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=PRD_{thread_id}.md"}
+    )
 
 
 @app.get("/pipeline/{thread_id}/download/adr")
 def download_adr(thread_id: str):
     entry = _get_pipeline_or_404(thread_id)
     md = export_adr_markdown(entry["current_state"].get("adr", {}))
-    return Response(content=md, media_type="text/markdown",
-                    headers={"Content-Disposition": f"attachment; filename=ADR_{thread_id}.md"})
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=ADR_{thread_id}.md"}
+    )
 
 
 @app.get("/pipeline/{thread_id}/download/architecture")
 def download_architecture(thread_id: str):
     entry = _get_pipeline_or_404(thread_id)
     md = export_architecture_markdown(entry["current_state"].get("architecture", {}))
-    return Response(content=md, media_type="text/markdown",
-                    headers={"Content-Disposition": f"attachment; filename=Architecture_{thread_id}.md"})
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=Architecture_{thread_id}.md"}
+    )
 
 
 @app.get("/pipeline/{thread_id}/download/sprint-plan")
@@ -339,12 +496,15 @@ def download_sprint_plan(thread_id: str):
         entry["current_state"].get("sprint_plan", {}),
         entry["current_state"].get("jira_tickets", [])
     )
-    return Response(content=md, media_type="text/markdown",
-                    headers={"Content-Disposition": f"attachment; filename=SprintPlan_{thread_id}.md"})
-
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=SprintPlan_{thread_id}.md"}
+    )
 
 @app.get("/pipeline/{thread_id}/download/test-cases")
 def download_test_cases(thread_id: str):
+    """Download Jira-driven test cases as Excel."""
     from api.test_cases_export import export_test_cases_excel
     entry = _get_pipeline_or_404(thread_id)
     xlsx_bytes = export_test_cases_excel(entry)
@@ -354,17 +514,20 @@ def download_test_cases(thread_id: str):
         headers={"Content-Disposition": f"attachment; filename=TestCases_{thread_id}.xlsx"}
     )
 
-
 @app.get("/pipeline/{thread_id}/download/impact")
 def download_impact(thread_id: str):
     entry = _get_pipeline_or_404(thread_id)
     md = export_impact_markdown(entry["current_state"].get("impact_report", {}))
-    return Response(content=md, media_type="text/markdown",
-                    headers={"Content-Disposition": f"attachment; filename=ImpactReport_{thread_id}.md"})
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=ImpactReport_{thread_id}.md"}
+    )
 
 
 @app.get("/pipeline/{thread_id}/download/runbook")
 def download_runbook(thread_id: str):
+    """Excel runbook — full enterprise format."""
     entry = _get_pipeline_or_404(thread_id)
     xlsx_bytes = export_runbook_excel(entry)
     return Response(
@@ -376,33 +539,39 @@ def download_runbook(thread_id: str):
 
 @app.get("/pipeline/{thread_id}/download/all")
 def download_all(thread_id: str):
+    """ZIP containing every artifact."""
     entry = _get_pipeline_or_404(thread_id)
     state = entry["current_state"]
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("01_BRD.md", export_brd_markdown(state.get("brd", {})))
-        z.writestr("02_PRD.md", export_prd_markdown(state.get("prd", {})))
-        z.writestr("03_ADR.md", export_adr_markdown(state.get("adr", {})))
-        z.writestr("04_Architecture.md", export_architecture_markdown(state.get("architecture", {})))
-        z.writestr("05_SprintPlan.md", export_sprint_plan_markdown(
-            state.get("sprint_plan", {}), state.get("jira_tickets", [])))
-        z.writestr("06_ImpactReport.md", export_impact_markdown(state.get("impact_report", {})))
-        z.writestr("07_Runbook.xlsx", export_runbook_excel(entry))
+        z.writestr(f"01_BRD.md",          export_brd_markdown(state.get("brd", {})))
+        z.writestr(f"02_PRD.md",          export_prd_markdown(state.get("prd", {})))
+        z.writestr(f"03_ADR.md",          export_adr_markdown(state.get("adr", {})))
+        z.writestr(f"04_Architecture.md", export_architecture_markdown(state.get("architecture", {})))
+        z.writestr(f"05_SprintPlan.md",   export_sprint_plan_markdown(
+            state.get("sprint_plan", {}),
+            state.get("jira_tickets", [])
+        ))
+        z.writestr(f"06_ImpactReport.md", export_impact_markdown(state.get("impact_report", {})))
+        z.writestr(f"07_Runbook.xlsx",    export_runbook_excel(entry))
 
+        # Generated code files
         for change in state.get("generated_changes", []):
             fname = change.get("file_path", "unknown.txt").replace("/", "_").replace("\\", "_")
             z.writestr(f"08_code/{fname}", change.get("content", ""))
 
+        # Test files
         for test in state.get("test_files", []):
             fname = test.get("test_file_path", "test.py").replace("/", "_").replace("\\", "_")
             z.writestr(f"09_tests/{fname}", test.get("content", ""))
 
+        # Jira-driven test cases
         from api.test_cases_export import export_test_cases_excel
         try:
             z.writestr("10_TestCases.xlsx", export_test_cases_excel(entry))
         except Exception as e:
-            print(f"[Download] test cases skipped: {e}")
+            print(f"[Download] test cases skipped: {e}")    
 
     buf.seek(0)
     return Response(
@@ -415,23 +584,39 @@ def download_all(thread_id: str):
 # ── Knowledge Layer Endpoints ─────────────────────────────────────────────────
 @app.post("/knowledge/index")
 def knowledge_index(req: IndexRequest, background_tasks: BackgroundTasks):
+    """Index a repository into the Knowledge Layer."""
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
     background_tasks.add_task(run_indexer, req.repo_path, req.repo_name)
-    return {"status": "INDEXING_STARTED", "repo_name": req.repo_name, "repo_path": req.repo_path}
+
+    return {
+        "status": "INDEXING_STARTED",
+        "repo_name": req.repo_name,
+        "repo_path": req.repo_path,
+        "message": "Indexing running in background."
+    }
 
 
 @app.post("/knowledge/search")
 def knowledge_search(req: SearchRequest):
+    """Semantic search across indexed repos."""
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
     from agents.phase3_impact.impact_analyzer import semantic_search
     hits = semantic_search(req.query, top_k=req.top_k)
-    return {"query": req.query, "results": hits, "total": len(hits)}
+
+    return {
+        "query": req.query,
+        "results": hits,
+        "total": len(hits)
+    }
 
 
 @app.get("/knowledge/repos")
 def knowledge_repos():
+    """List all indexed repos."""
     import psycopg2
     conn = psycopg2.connect(
         host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
@@ -441,116 +626,22 @@ def knowledge_repos():
         dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge")
     )
     cur = conn.cursor()
-    cur.execute("SELECT repo_name, language, file_count, last_indexed FROM repo_maps ORDER BY last_indexed DESC")
-    repos = [{"repo_name": r[0], "language": r[1], "file_count": r[2], "last_indexed": str(r[3])}
-             for r in cur.fetchall()]
+    cur.execute("""
+        SELECT repo_name, language, file_count, last_indexed
+        FROM repo_maps ORDER BY last_indexed DESC
+    """)
+    repos = [
+        {
+            "repo_name": r[0],
+            "language": r[1],
+            "file_count": r[2],
+            "last_indexed": str(r[3])
+        }
+        for r in cur.fetchall()
+    ]
     cur.close()
     conn.close()
     return {"repos": repos, "total": len(repos)}
-
-
-# ── PHASE 0 — Project Selector (NEW: actually invoked) ───────────────────────
-def run_phase0_and_phase1(thread_id: str, requirement: str):
-    """
-    Run Phase 0 (project selector) FIRST, then chain into Phase 1.
-    This is the architectural fix — Phase 0 was previously dead code.
-    """
-    try:
-        import sys
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-        pipeline_store[thread_id]["phase"] = 0
-        pipeline_store[thread_id]["status"] = "PHASE_0_RUNNING"
-        pipeline_store[thread_id]["sub_stage"] = "Searching for matching project..."
-        save_pipeline(thread_id, pipeline_store[thread_id],
-                      _safe_state(pipeline_store[thread_id].get("current_state", {})))
-        audit(thread_id, "phase0", "PHASE_STARTED")
-
-        # Use selector logic directly (no graph needed — it's a single decision)
-        from agents.phase0_selector.selector_agent import search_projects, slugify
-
-        candidates = search_projects(requirement, top_k=3)
-
-        if candidates and candidates[0]["score"] >= 0.7:
-            selected = candidates[0]
-            is_new = False
-            selected_repos = selected.get("repos", [])
-            # Normalize repos to dict format
-            normalized_repos = []
-            for r in selected_repos:
-                if isinstance(r, str):
-                    normalized_repos.append({
-                        "name": r,
-                        "type": "backend" if "backend" in r else "frontend" if "frontend" in r else "service",
-                        "url": f"https://github.com/{os.getenv('GITHUB_REPO_OWNER','AkashW45')}/{r}.git",
-                        "exists": True
-                    })
-                else:
-                    normalized_repos.append(r)
-            selected_repos = normalized_repos
-
-            print(f"[Phase 0] ✅ Matched existing project: {selected['name']} (score: {selected['score']})")
-            audit(thread_id, "phase0", "PROJECT_MATCHED",
-                  details={"project": selected["name"], "score": selected["score"]})
-        else:
-            # NEW PROJECT
-            slug = slugify(requirement)
-            is_new = True
-            github_owner = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
-            selected_repos = [
-                {
-                    "name": f"{slug}-backend",
-                    "type": "backend",
-                    "language": "python",
-                    "url": f"https://github.com/{github_owner}/{slug}-backend.git",
-                    "exists": False
-                },
-                {
-                    "name": f"{slug}-frontend",
-                    "type": "frontend",
-                    "language": "typescript",
-                    "url": f"https://github.com/{github_owner}/{slug}-frontend.git",
-                    "exists": False
-                }
-            ]
-            selected = {
-                "id": f"new-{slug}",
-                "name": requirement[:60],
-                "description": requirement,
-                "repos": selected_repos,
-                "is_new": True,
-                "score": 0.0
-            }
-            print(f"[Phase 0] 🆕 NEW PROJECT: {slug}")
-            audit(thread_id, "phase0", "NEW_PROJECT_CREATED",
-                  details={"slug": slug, "repos": [r["name"] for r in selected_repos]})
-
-        # Persist Phase 0 results into state
-        current = pipeline_store[thread_id].get("current_state", {}) or {}
-        current["selected_project"] = selected
-        current["selected_repos"] = selected_repos
-        current["is_new_project"] = is_new
-        current["candidates"] = candidates
-        pipeline_store[thread_id]["current_state"] = current
-        pipeline_store[thread_id]["status"] = "PHASE_0_DONE"
-        pipeline_store[thread_id]["sub_stage"] = (
-            f"{'New project' if is_new else 'Matched existing'}: {selected['name'][:50]}"
-        )
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(current))
-
-        # Now chain into Phase 1
-        run_phase1(thread_id, requirement)
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        pipeline_store[thread_id].update({
-            "status": "ERROR",
-            "error": f"Phase 0 error: {str(e)}"
-        })
-        audit(thread_id, "phase0", "ERROR", details={"error": str(e)})
-        save_pipeline(thread_id, pipeline_store[thread_id],
-                      _safe_state(pipeline_store[thread_id].get("current_state", {})))
 
 
 # ── Background Tasks ──────────────────────────────────────────────────────────
@@ -562,7 +653,6 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
             build_discovery_graph, DiscoveryState
         )
 
-        pipeline_store[thread_id]["phase"] = 1
         pipeline_store[thread_id]["status"] = "PHASE_1_RUNNING"
         pipeline_store[thread_id]["sub_stage"] = "Generating BRD..."
         save_pipeline(thread_id, pipeline_store[thread_id],
@@ -577,7 +667,8 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
             brd={}, prd={}, adr={}, architecture={},
             human_feedback=feedback,
             approved=False,
-            status="STARTED"
+            status="STARTED",
+            thread_id=thread_id
         )
 
         for chunk in graph.stream(initial_state, config, stream_mode="updates"):
@@ -585,12 +676,8 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
                 if not isinstance(node_state, dict):
                     continue
 
-                # FIX: Preserve Phase 0 state when merging Phase 1 outputs
                 current = pipeline_store[thread_id].get("current_state", {}) or {}
-                # Phase 1 only contributes brd/prd/adr/architecture; preserve everything else
-                for k, v in node_state.items():
-                    if k in ("brd", "prd", "adr", "architecture", "status"):
-                        current[k] = v
+                current.update(node_state)
                 pipeline_store[thread_id]["current_state"] = current
 
                 if node_name == "generate_brd":
@@ -634,29 +721,78 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
         save_pipeline(thread_id, pipeline_store[thread_id],
                       _safe_state(pipeline_store[thread_id].get("current_state", {})))
 
+def resume_current_phase(thread_id: str, approved: bool, feedback: str):
+    """Resume whichever phase is currently waiting."""
+    entry = pipeline_store[thread_id]
+    phase = entry["phase"]
 
-def run_phase2(thread_id: str, feedback: str = ""):
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+        graph = entry["graph"]
+        config = entry["config"]
+
+        # Resume current phase
+        result = graph.invoke(
+            Command(resume={"approved": approved, "feedback": feedback}),
+            config
+        )
+
+        entry["current_state"] = result
+        status = result.get("status", "")
+
+        # Move to next phase based on approval status
+        if phase == 1 and status == "APPROVED_FOR_PLANNING":
+            pipeline_store[thread_id]["phase"] = 1
+            pipeline_store[thread_id]["status"] = "PHASE_1_APPROVED"
+            run_phase2(thread_id)
+
+        elif phase == 2 and status == "APPROVED_FOR_IMPACT_ANALYSIS":
+            pipeline_store[thread_id]["status"] = "PHASE_2_APPROVED"
+            run_phase3(thread_id)
+
+        elif phase == 3 and status == "APPROVED_FOR_CODE_GENERATION":
+            pipeline_store[thread_id]["status"] = "PHASE_3_APPROVED"
+            run_phase4(thread_id)
+
+        elif phase == 6 and status == "APPROVED_FOR_DEPLOYMENT":
+            pipeline_store[thread_id]["status"] = "PHASE_6_APPROVED"
+            run_phase7(thread_id)
+
+        elif phase == 7 and status in ("DEPLOYMENT_COMPLETE", "ROLLED_BACK"):
+            pipeline_store[thread_id]["status"] = "PIPELINE_COMPLETE"
+
+        else:
+            pipeline_store[thread_id]["status"] = status
+
+    except Exception as e:
+        pipeline_store[thread_id].update({
+            "status": "ERROR",
+            "error": f"Phase {phase} resume error: {str(e)}"
+        })
+
+
+def run_phase2(thread_id: str , feedback: str = ""):
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agents.phase2_planning.planning_agent import build_planning_graph, PlanningState
 
         entry = pipeline_store[thread_id]
-        prev_state = entry["current_state"]
+        p1_state = entry["current_state"]
 
         pipeline_store[thread_id]["status"] = "PHASE_2_RUNNING"
-        pipeline_store[thread_id]["sub_stage"] = "Generating sprint plan..."
         pipeline_store[thread_id]["phase"] = 2
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(prev_state))
 
         graph = build_planning_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p2"}}
 
         initial = PlanningState(
             requirement=entry["requirement"],
-            brd=prev_state.get("brd", {}),
-            prd=prev_state.get("prd", {}),
-            sprint_plan={}, runbook={}, jira_tickets=[],
+            brd=p1_state.get("brd", {}),
+            prd=p1_state.get("prd", {}),
+            sprint_plan={}, runbook={},
             human_feedback=feedback,
             approved=False,
             status="STARTED"
@@ -664,71 +800,28 @@ def run_phase2(thread_id: str, feedback: str = ""):
 
         result = graph.invoke(initial, config)
 
-        # FIX: merge instead of replace — preserve all Phase 0/1 state
-        merged = {**prev_state}
-        for k in ("sprint_plan", "runbook", "jira_tickets"):
-            if k in result:
-                merged[k] = result[k]
-
         pipeline_store[thread_id].update({
             "graph": graph,
             "config": config,
-            "current_state": merged,
-            "status": "WAITING_PHASE_2_APPROVAL",
-            "sub_stage": "Sprint plan ready — Awaiting approval"
+            "current_state": {**p1_state, **result},
+            "status": "WAITING_PHASE_2_APPROVAL"
         })
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         pipeline_store[thread_id].update({
             "status": "ERROR",
             "error": f"Phase 2 error: {str(e)}"
         })
 
 
-def run_phase3(thread_id: str, feedback: str = ""):
+def run_phase3(thread_id: str , feedback: str = ""):
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agents.phase3_impact.graph import get_graph
 
         entry = pipeline_store[thread_id]
-        prev_state = entry["current_state"]
-
-        # FIX: For new projects, skip Phase 3 (nothing to impact analyze)
-        if prev_state.get("is_new_project", False):
-            print(f"[Phase 3] Skipping — new project has no existing code to analyze")
-            empty_impact = {
-                "requirement": entry["requirement"],
-                "affected_repos": [r["name"] for r in prev_state.get("selected_repos", [])],
-                "affected_files": [],
-                "affected_symbols": [],
-                "dependents": {},
-                "protocol_contracts": [],
-                "risk_assessment": {
-                    "risk_level": "low",
-                    "risk_reasons": ["New project — no existing code to risk"],
-                    "breaking_changes": [],
-                    "recommendation": "proceed"
-                },
-                "status": "SKIPPED_NEW_PROJECT"
-            }
-            merged = {**prev_state, "impact_report": empty_impact}
-            pipeline_store[thread_id].update({
-                "current_state": merged,
-                "status": "PHASE_3_SKIPPED_NEW_PROJECT",
-                "sub_stage": "New project — Phase 3 not applicable",
-                "phase": 3
-            })
-            save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
-            # Auto-advance to Phase 4
-            run_phase4(thread_id)
-            return
-
         pipeline_store[thread_id]["status"] = "PHASE_3_RUNNING"
-        pipeline_store[thread_id]["sub_stage"] = "Analyzing code impact..."
         pipeline_store[thread_id]["phase"] = 3
 
         graph = get_graph()
@@ -744,22 +837,14 @@ def run_phase3(thread_id: str, feedback: str = ""):
 
         result = graph.invoke(initial, config)
 
-        merged = {**prev_state}
-        if "impact_report" in result:
-            merged["impact_report"] = result["impact_report"]
-
         pipeline_store[thread_id].update({
             "graph": graph,
             "config": config,
-            "current_state": merged,
-            "status": "WAITING_PHASE_3_APPROVAL",
-            "sub_stage": "Impact report ready — Awaiting approval"
+            "current_state": {**entry["current_state"], **result},
+            "status": "WAITING_PHASE_3_APPROVAL"
         })
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         pipeline_store[thread_id].update({
             "status": "ERROR",
             "error": f"Phase 3 error: {str(e)}"
@@ -767,7 +852,7 @@ def run_phase3(thread_id: str, feedback: str = ""):
 
 
 def run_phase4(thread_id: str):
-    """Phase 4 + 5 — auto, with detailed sub-stage telemetry."""
+    """Phase 4 + 5 run automatically — no human gate."""
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -777,79 +862,51 @@ def run_phase4(thread_id: str):
         entry = pipeline_store[thread_id]
         state = entry["current_state"]
 
-        def update_substage(msg, status=None):
-            pipeline_store[thread_id]["sub_stage"] = msg
-            if status:
-                pipeline_store[thread_id]["status"] = status
-            save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
-            print(f"  [Phase 4/5] {msg}")
-
-        update_substage("Preparing context for codegen...", "PHASE_4_RUNNING")
+        # Phase 4
+        pipeline_store[thread_id]["status"] = "PHASE_4_RUNNING"
         pipeline_store[thread_id]["phase"] = 4
 
-        impact = state.get("impact_report", {})
-        is_new = state.get("is_new_project", False)
-        if is_new and not impact.get("affected_files"):
-            impact = {
-                "requirement": entry["requirement"],
-                "affected_files": [],
-                "affected_repos": [r["name"] for r in state.get("selected_repos", [])],
-                "architecture": state.get("architecture", {}),
-                "risk_assessment": {"risk_level": "low", "breaking_changes": [], "recommendation": "proceed"}
-            }
-            update_substage(f"NEW project — generating fresh scaffold for {len(state.get('selected_repos',[]))} repo(s)...")
-        else:
-            update_substage(f"Modifying {len(impact.get('affected_files', []))} existing files...")
-
-        update_substage("Calling DeepSeek V4 Pro for code generation...")
         result4 = run_codegen(
             requirement=entry["requirement"],
-            impact_report=impact,
+            impact_report=state.get("impact_report", {}),
+            workspace_path="/repos",
             thread_id=f"{thread_id}-p4"
         )
 
         if result4["status"] != "VALIDATED":
-            errors = result4.get("validation_errors", [])
-            update_substage(f"Codegen failed: {len(errors)} validation errors", "ERROR")
-            pipeline_store[thread_id]["error"] = f"Phase 4 failed: {errors[:3]}"
+            pipeline_store[thread_id].update({
+                "status": "ERROR",
+                "error": f"Phase 4 failed: {result4.get('validation_errors', [])}"
+            })
             return
 
-        files_generated = len(result4.get("generated_changes", []))
-        update_substage(f"✅ {files_generated} files generated and validated")
-        
         # Phase 5
+        pipeline_store[thread_id]["status"] = "PHASE_5_RUNNING"
         pipeline_store[thread_id]["phase"] = 5
-        update_substage("Generating pytest test files...", "PHASE_5_RUNNING")
-        
+
         result5 = run_validation_phase(
             requirement=entry["requirement"],
             generated_changes=result4["generated_changes"],
+            workspace_path="/repos",
             thread_id=f"{thread_id}-p5"
         )
 
-        tests_generated = len(result5.get("test_files", []))
-        update_substage(f"✅ {tests_generated} test files generated")
-
-        merged = {
-            **state,
+        # Update state and move to Phase 6
+        pipeline_store[thread_id]["current_state"].update({
             "generated_changes": result4["generated_changes"],
-            "test_files": result5.get("test_files", [])
-        }
-        pipeline_store[thread_id]["current_state"] = merged
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+            "test_files": result5["test_files"]
+        })
 
-        update_substage(f"Phases 4+5 complete: {files_generated} code files + {tests_generated} test files")
-        run_phase6(thread_id, "")
+        run_phase6(thread_id)
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        pipeline_store[thread_id].update({"status": "ERROR", "error": f"Phase 4/5 error: {str(e)}"})
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id].get("current_state", {})))
+        pipeline_store[thread_id].update({
+            "status": "ERROR",
+            "error": f"Phase 4/5 error: {str(e)}"
+        })
 
 
 def run_phase6(thread_id: str, feedback: str = ""):
-    """Phase 6 — Delivery with full visibility."""
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -859,71 +916,91 @@ def run_phase6(thread_id: str, feedback: str = ""):
         entry = pipeline_store[thread_id]
         state = entry["current_state"]
 
-        def update_substage(msg, status=None):
-            pipeline_store[thread_id]["sub_stage"] = msg
-            if status:
-                pipeline_store[thread_id]["status"] = status
-            save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
-            print(f"  [Phase 6] {msg}")
-
-        update_substage("Determining target repository...", "PHASE_6_RUNNING")
+        pipeline_store[thread_id]["status"] = "PHASE_6_RUNNING"
+        pipeline_store[thread_id]["sub_stage"] = "Determining target repos..."
         pipeline_store[thread_id]["phase"] = 6
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
 
+        # ── Smart repo routing ──────────────────────────────────────
         is_new_project = state.get("is_new_project", False)
         selected_repos = state.get("selected_repos", [])
 
-        if not selected_repos:
-            update_substage("ERROR: No selected_repos. Phase 0 did not run.", "ERROR")
-            pipeline_store[thread_id]["error"] = "No selected_repos in state"
-            return
+        # If Phase 0 marked it as new project — create GitHub repos
+        if is_new_project and selected_repos:
+            github_token = os.getenv("GITHUB_TOKEN")
+            github_owner = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
+            target_repo_url = None
+            target_repo_name = None
 
-        target_repo = next((r for r in selected_repos if r.get("type") == "backend"), selected_repos[0])
-        target_repo_name = target_repo["name"]
-        target_repo_url = target_repo.get("url",
-            f"https://github.com/{os.getenv('GITHUB_REPO_OWNER','AkashW45')}/{target_repo_name}.git")
+            for repo_def in selected_repos:
+                repo_name = repo_def["name"]
+                # Only create backend repo for code push (frontend is placeholder for now)
+                if repo_def.get("type") != "backend":
+                    continue
 
-        github_token = os.getenv("GITHUB_TOKEN")
-        github_owner = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
+                pipeline_store[thread_id]["sub_stage"] = f"Creating GitHub repo: {repo_name}..."
+                save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
 
-        update_substage(f"Target: {target_repo_name} ({'NEW' if is_new_project else 'existing'})")
+                # Check if repo already exists
+                check_url = f"https://api.github.com/repos/{github_owner}/{repo_name}"
+                check_resp = req_lib.get(check_url, headers={
+                    "Authorization": f"Bearer {github_token}",
+                    "Accept": "application/vnd.github+json"
+                })
 
-        if is_new_project or not target_repo.get("exists", True):
-            update_substage(f"Checking if {target_repo_name} exists on GitHub...")
+                if check_resp.status_code == 404:
+                    # Create new repo
+                    create_resp = req_lib.post(
+                        "https://api.github.com/user/repos",
+                        headers={
+                            "Authorization": f"Bearer {github_token}",
+                            "Accept": "application/vnd.github+json"
+                        },
+                        json={
+                            "name": repo_name,
+                            "description": entry["requirement"][:200],
+                            "private": False,
+                            "auto_init": True  # creates main branch with README
+                        }
+                    )
+                    if create_resp.status_code == 201:
+                        print(f"  [Phase 6] ✅ Created GitHub repo: {repo_name}")
+                        audit(thread_id, "phase6", "REPO_CREATED",
+                              details={"repo": repo_name})
+                    else:
+                        print(f"  [Phase 6] ⚠️  Failed to create repo: {create_resp.text[:200]}")
 
-            check_url = f"https://api.github.com/repos/{github_owner}/{target_repo_name}"
-            check_resp = req_lib.get(check_url, headers={
-                "Authorization": f"Bearer {github_token}",
-                "Accept": "application/vnd.github+json"
-            })
+                target_repo_url = f"https://github.com/{github_owner}/{repo_name}.git"
+                target_repo_name = repo_name
+                break  # Use first backend repo
 
-            if check_resp.status_code == 404:
-                update_substage(f"Creating new GitHub repo: {target_repo_name}...")
-                create_resp = req_lib.post(
-                    "https://api.github.com/user/repos",
-                    headers={
-                        "Authorization": f"Bearer {github_token}",
-                        "Accept": "application/vnd.github+json"
-                    },
-                    json={
-                        "name": target_repo_name,
-                        "description": entry["requirement"][:200],
-                        "private": False,
-                        "auto_init": True
-                    }
-                )
-                if create_resp.status_code == 201:
-                    update_substage(f"✅ GitHub repo created: {target_repo_name}")
-                    audit(thread_id, "phase6", "REPO_CREATED", details={"repo": target_repo_name})
+            if not target_repo_url:
+                # Fallback if no backend repo defined
+                slug = selected_repos[0]["name"]
+                target_repo_url = f"https://github.com/{github_owner}/{slug}.git"
+                target_repo_name = slug
+        else:
+            # Existing project — use selected repo
+            if selected_repos:
+                first_repo = selected_repos[0]
+                if isinstance(first_repo, dict):
+                    target_repo_name = first_repo.get("name", "leave-mgmt-backend")
+                    target_repo_url = first_repo.get("url",
+                        f"https://github.com/AkashW45/{target_repo_name}.git")
                 else:
-                    update_substage(f"❌ Failed to create repo: {create_resp.status_code}", "ERROR")
-                    pipeline_store[thread_id]["error"] = f"Repo creation failed: {create_resp.text[:200]}"
-                    return
+                    target_repo_name = str(first_repo)
+                    target_repo_url = f"https://github.com/AkashW45/{target_repo_name}.git"
             else:
-                update_substage(f"ℹ️ Repo {target_repo_name} already exists, will push to it")
+                # Final fallback — old behavior
+                target_repo_url = os.getenv("REPO_URL",
+                    "https://github.com/AkashW45/leave-mgmt-backend.git")
+                target_repo_name = "leave-mgmt-backend"
 
-        branch_name = "main" if is_new_project else f"feature/{thread_id}"
-        update_substage(f"Pushing {len(state.get('generated_changes',[]))} files to {target_repo_name}/{branch_name}...")
+        print(f"  [Phase 6] Target repo: {target_repo_name} ({target_repo_url})")
+        pipeline_store[thread_id]["sub_stage"] = f"Pushing code to {target_repo_name}..."
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
 
+        # ── Run delivery graph ──────────────────────────────────────
         graph = build_delivery_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p6"}}
 
@@ -931,7 +1008,7 @@ def run_phase6(thread_id: str, feedback: str = ""):
             requirement=entry["requirement"],
             generated_changes=state.get("generated_changes", []),
             test_files=state.get("test_files", []),
-            branch_name=branch_name,
+            branch_name=f"feature/{thread_id}" if not is_new_project else "main",
             repo_url=target_repo_url,
             pr_urls=[],
             human_feedback=feedback,
@@ -940,32 +1017,30 @@ def run_phase6(thread_id: str, feedback: str = ""):
         )
 
         result = graph.invoke(initial, config)
-        pr_urls = result.get("pr_urls", [])
 
-        merged = {**state, "pr_urls": pr_urls, "target_repo": target_repo_name}
         pipeline_store[thread_id].update({
-            "graph": graph, "config": config,
-            "current_state": merged,
-            "pr_urls": pr_urls,
-            "status": "WAITING_PHASE_6_APPROVAL"
+            "graph": graph,
+            "config": config,
+            "current_state": {**state, **result, "target_repo": target_repo_name},
+            "pr_urls": result.get("pr_urls", []),
+            "status": "WAITING_PHASE_6_APPROVAL",
+            "sub_stage": "Code pushed — Awaiting PR approval"
         })
-
-        if pr_urls:
-            update_substage(f"✅ Pushed to {target_repo_name} — PR: {pr_urls[0][:60]}...")
-        else:
-            update_substage(f"✅ Pushed to {target_repo_name}/{branch_name} — Awaiting PR approval")
-
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(pipeline_store[thread_id]["current_state"]))
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        pipeline_store[thread_id].update({"status": "ERROR", "error": f"Phase 6 error: {str(e)}"})
+        pipeline_store[thread_id].update({
+            "status": "ERROR",
+            "error": f"Phase 6 error: {str(e)}"
+        })
         audit(thread_id, "phase6", "ERROR", details={"error": str(e)})
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id].get("current_state", {})))
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
 
 
-def run_phase7(thread_id: str, feedback: str = ""):
+def run_phase7(thread_id: str , feedback: str = ""):
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -975,13 +1050,7 @@ def run_phase7(thread_id: str, feedback: str = ""):
         state = entry["current_state"]
 
         pipeline_store[thread_id]["status"] = "PHASE_7_RUNNING"
-        pipeline_store[thread_id]["sub_stage"] = "Resolving deployment sequence..."
         pipeline_store[thread_id]["phase"] = 7
-
-        # Use selected_repos from Phase 0, not impact_report
-        affected_repos = [r["name"] for r in state.get("selected_repos", [])]
-        if not affected_repos:
-            affected_repos = state.get("impact_report", {}).get("affected_repos", [])
 
         graph = build_deployment_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p7"}}
@@ -990,7 +1059,9 @@ def run_phase7(thread_id: str, feedback: str = ""):
             requirement=entry["requirement"],
             runbook=state.get("runbook", {}),
             pr_urls=entry.get("pr_urls", []),
-            affected_repos=affected_repos,
+            affected_repos=state.get(
+                "impact_report", {}
+            ).get("affected_repos", ["leave-mgmt-backend"]),
             deploy_sequence=[],
             feature_flags=[],
             deploy_results=[],
@@ -1003,23 +1074,14 @@ def run_phase7(thread_id: str, feedback: str = ""):
 
         result = graph.invoke(initial, config)
 
-        merged = {**state}
-        for k in ("deploy_sequence", "feature_flags", "deploy_results", "monitoring_results", "rollback_triggered"):
-            if k in result:
-                merged[k] = result[k]
-
         pipeline_store[thread_id].update({
             "graph": graph,
             "config": config,
-            "current_state": merged,
-            "status": "WAITING_PHASE_7_APPROVAL",
-            "sub_stage": "Deployment plan ready — Awaiting production approval"
+            "current_state": {**state, **result},
+            "status": "WAITING_PHASE_7_APPROVAL"
         })
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         pipeline_store[thread_id].update({
             "status": "ERROR",
             "error": f"Phase 7 error: {str(e)}"
@@ -1038,28 +1100,13 @@ def run_indexer(repo_path: str, repo_name: str):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _safe_state(state: dict) -> dict:
-    """Strip non-serialisable items. CRITICAL: must include Phase 0 keys."""
+    """Strip non-serialisable items (graph objects etc)."""
     safe_keys = [
-        # Phase 0
-        "selected_project", "selected_repos", "is_new_project", "candidates",
-        # Phase 1
-        "brd", "prd", "adr", "architecture",
-        # Phase 2
-        "sprint_plan", "runbook", "jira_tickets",
-        # Phase 3
-        "impact_report",
-        # Phase 4 / 5
-        "generated_changes", "test_files",
-        # Phase 6
-        "pr_urls", "target_repo",
-        # Phase 7
-        "deploy_results", "monitoring_results", "deploy_sequence",
-        "feature_flags", "rollback_triggered",
-        # Common
+        "brd", "prd", "adr", "sprint_plan", "runbook",
+        "impact_report", "generated_changes", "test_files",
+        "pr_urls", "deploy_results", "monitoring_results",
         "status", "requirement"
     ]
-    if not isinstance(state, dict):
-        return {}
     result = {}
     for k in safe_keys:
         if k in state:
@@ -1072,7 +1119,6 @@ def _safe_state(state: dict) -> dict:
                 result[k] = str(v)
     return result
 
-
 @app.get("/pipeline/{thread_id}/audit")
 def pipeline_audit(thread_id: str):
     return {"thread_id": thread_id, "audit_log": get_audit_log(thread_id)}
@@ -1081,4 +1127,4 @@ def pipeline_audit(thread_id: str):
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)

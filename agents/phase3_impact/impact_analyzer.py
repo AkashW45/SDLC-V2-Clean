@@ -11,7 +11,20 @@ from qdrant_client import QdrantClient
 from neo4j import GraphDatabase
 import psycopg2
 from sentence_transformers import SentenceTransformer
-from groq import Groq
+from core.llm_gateway import gateway
+
+import os
+
+# Safe Neo4j Connection
+neo4j_uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+neo4j_pass = os.getenv("NEO4J_PASSWORD", "password1234")
+driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_pass))
+
+# Safe Qdrant Connection
+qdrant_host = os.getenv("QDRANT_HOST", "127.0.0.1")
+qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
+qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
 
 load_dotenv()
 
@@ -20,30 +33,38 @@ load_dotenv()
 # -----------------------------------------
 
 def get_postgres():
+    db_host = os.getenv("POSTGRES_HOST", "127.0.0.1")
+    # Use internal port 5432 if inside Docker, otherwise external port
+    db_port = "5432" if db_host == "sdlc_postgres" else os.getenv("POSTGRES_PORT", "5437")
+    
     return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
+        host=db_host,
+        port=db_port,
         user=os.getenv("POSTGRES_USER", "sdlc"),
         password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
         dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge")
     )
 
 def get_qdrant():
+    qdrant_host = os.getenv("QDRANT_HOST", "127.0.0.1")
+    qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
+    
     return QdrantClient(
-        url="http://127.0.0.1:6333",
+        host=qdrant_host,
+        port=qdrant_port,
         timeout=60
     )
 
 def get_neo4j():
+    # Your docker-compose.yml already overrides this perfectly with bolt://sdlc_neo4j:7687
     return GraphDatabase.driver(
-        os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+        os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687"),
         auth=(
             os.getenv("NEO4J_USER", "neo4j"),
             os.getenv("NEO4J_PASSWORD", "password1234")
         )
     )
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 
@@ -179,15 +200,30 @@ def assess_risk(
     requirement: str,
     affected_files: list,
     affected_symbols: list,
-    contracts: list
+    contracts: list,
+    functional_requirements: list = None,
+    adr: dict = None
 ) -> dict:
-    """Use LLM to assess risk level of the change."""
+    """Use LLM to assess risk level of the change. Context Precision: only pass functional_requirements summary and ADR."""
+
+    functional_reqs_str = ""
+    adr_text = "ADR not provided."
+    if adr and isinstance(adr, dict):
+        adr_text = json.dumps(adr, indent=2)
+    if functional_requirements:
+        req_summary = "\\n".join([f"- {req.get('title', 'Untitled')}" for req in functional_requirements[:5]])
+        functional_reqs_str = f"\\nFunctional Requirements Summary:\\n{req_summary}"
 
     prompt = f"""
 You are a senior software architect assessing the risk of a code change.
 
+ADR:
+{adr_text}
+
+CRITICAL: First, read the ADR to determine the agreed-upon programming language, framework, and tech stack. You MUST generate file paths and structural plans that strictly align with this tech stack. For example, if the ADR specifies Node.js/TypeScript, you must output paths like src/models/user.ts, src/routes/index.ts, and package.json. DO NOT default to Python files unless the ADR specifies Python.
+
 Requirement:
-{requirement}
+{requirement}{functional_reqs_str}
 
 Affected Files:
 {json.dumps(affected_files, indent=2)}
@@ -207,13 +243,13 @@ Assess the risk and return ONLY valid JSON:
 }}
 """
 
-    response = groq_client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=500
-    )
-
-    content = response.choices[0].message.content.strip()
+    content = gateway.generate(
+        prompt=prompt,
+        model="deepseek-v4-pro",
+        temperature=0.2,
+        max_tokens=500,
+        tag="phase3_impact"
+    ).strip()
 
     try:
         # Clean markdown fences if present
@@ -234,10 +270,15 @@ Assess the risk and return ONLY valid JSON:
 # Main Impact Analysis
 # -----------------------------------------
 
-def run_impact_analysis(requirement: str) -> dict:
+def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None) -> dict:
     """
     Full Phase 3 impact analysis pipeline.
     Returns structured impact report.
+    
+    Args:
+        requirement: The change requirement
+        prd: Optional PRD dict; if provided, only functional_requirements are used for context (Context Precision)
+        adr: Optional ADR dict; used to enforce stack alignment in risk assessment
     """
 
     print(f"\n{'='*50}")
@@ -245,9 +286,14 @@ def run_impact_analysis(requirement: str) -> dict:
     print(f"Requirement: {requirement[:100]}...")
     print(f"{'='*50}")
 
-    # Step 1 — Semantic Search
+    # Extract only functional_requirements if PRD provided (Context Precision optimization)
+    functional_reqs = []
+    if prd and isinstance(prd, dict):
+        functional_reqs = prd.get("functional_requirements", [])
+
+    # Step 1 — Semantic Search (Context Precision: limited to top 3 results)
     print("\n[Step 1] Semantic search across indexed repos...")
-    hits = semantic_search(requirement, top_k=10)
+    hits = semantic_search(requirement, top_k=3)
     print(f"  Found {len(hits)} relevant symbols")
 
     # Deduplicate affected files
@@ -297,13 +343,15 @@ def run_impact_analysis(requirement: str) -> dict:
         else:
             print(f"  {repo} — no protocol contracts indexed")
 
-    # Step 4 — Risk Assessment
+    # Step 4 — Risk Assessment (Context Precision: extract functional_requirements if PRD available)
     print("\n[Step 4] Assessing risk...")
     risk = assess_risk(
         requirement,
         affected_files_list,
         all_affected_symbols,
-        all_contracts
+        all_contracts,
+        functional_requirements=functional_reqs,
+        adr=adr
     )
     print(f"  Risk level: {risk['risk_level']}")
     print(f"  Recommendation: {risk['recommendation']}")
