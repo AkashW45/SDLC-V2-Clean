@@ -162,6 +162,8 @@ const API = 'http://localhost:8001';
 let activePipelines = {};  // thread_id -> pipeline data
 let selectedThread = null;
 let pollInterval = null;
+// THE ANTI-FLICKER CACHE (From Shantanu/Optimization)
+const mermaidCache = {};
 
 const PHASES = [
   { key: 'WAITING_PHASE_1_APPROVAL', label: 'Phase 1 — Discovery', num: 1 },
@@ -196,10 +198,7 @@ async function launchPipeline() {
   try {
     const r = await fetch(`${API}/pipeline/start`, {
       method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'X-API-Key': API_KEY
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ requirement: req })
     });
     const d = await r.json();
@@ -251,10 +250,7 @@ async function approvePipeline(threadId, approved) {
   try {
     const r = await fetch(`${API}/pipeline/approve/${threadId}`, {
       method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'X-API-Key': API_KEY
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ approved, feedback })
     });
     const d = await r.json();
@@ -373,6 +369,28 @@ function renderContent() {
         </div>
       </div>
     </div>`;
+
+  // ── Phase 0 routing panel ──────────────────────────────────────
+  if (state.selected_project) {
+    const proj = state.selected_project;
+    const isNew = state.is_new_project;
+    const repos = (state.selected_repos || []).map(r =>
+      `<code style="background:var(--surface2);color:var(--blue);padding:2px 6px;border-radius:4px;font-size:10px">${r.name}</code>`
+    ).join(' ');
+    html += `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:16px">
+        <div style="font-size:9px;color:var(--text3);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">
+          00 — Project Routing
+          <span style="margin-left:8px;padding:2px 8px;border-radius:4px;font-size:9px;font-weight:700;
+            background:${isNew ? 'rgba(0,212,255,0.15)' : 'rgba(16,185,129,0.15)'};
+            color:${isNew ? 'var(--accent)' : 'var(--accent)'}">
+            ${isNew ? '🆕 NEW PROJECT' : '✓ MATCHED'}
+          </span>
+        </div>
+        <div style="font-size:13px;font-weight:700;color:var(--text)">${proj.name}</div>
+        <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">${repos}</div>
+      </div>`;
+  }
 
   // ── PHASE 1 — BRD/PRD/ADR/Architecture ──────────────────────
   if (state.brd?.title || state.prd || state.adr || state.architecture) {
@@ -587,7 +605,7 @@ function renderContent() {
     }
 
     // PRD
-    if (state.prd) {
+    if (state.prd?.title || state.prd?.product_vision || state.prd?.functional_requirements?.length) {
       html += subHeaderWithDownload('📄 Product Requirements (PRD)', 'prd');
       if (state.prd.product_vision || state.prd.productVision) {
         html += dataRow('Product Vision', state.prd.product_vision || state.prd.productVision || '');
@@ -789,8 +807,33 @@ function renderContent() {
   }
 
   // ── PHASE 4+5 — Code + Tests ────────────────────────────────
-  if (state.generated_changes?.length || state.test_files?.length) {
+  // Show this block when phase is 4 or 5, OR when artifacts exist
+  const showPhase45 = (p.phase >= 4 && p.phase <= 5) || state.generated_changes?.length || state.test_files?.length;
+  if (showPhase45) {
     html += sectionHeader('04+05', 'Code Generation + Validation', false);
+
+    // LIVE sub-stage indicator while running
+    if ((p.phase === 4 || p.phase === 5) && isRunning) {
+      html += `<div style="background:linear-gradient(135deg,rgba(0,212,255,0.08),rgba(0,255,136,0.05));border:1px solid var(--accent);border-radius:8px;padding:14px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="spinner"></div>
+          <div>
+            <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase">Phase ${p.phase} · Live</div>
+            <div style="font-size:12px;color:var(--accent);font-weight:700;margin-top:2px">${p.sub_stage || 'Working...'}</div>
+          </div>
+        </div>
+      </div>`;
+    }
+
+    // Status pills showing what's done
+    html += `<div style="display:flex;gap:8px;margin-bottom:14px">
+      <span style="font-size:10px;padding:4px 10px;border-radius:20px;background:${state.generated_changes?.length ? 'rgba(0,255,136,0.15)' : 'var(--surface2)'};color:${state.generated_changes?.length ? 'var(--accent)' : 'var(--text3)'}">
+        ${state.generated_changes?.length ? '✓' : '○'} Code: ${state.generated_changes?.length || 0} files
+      </span>
+      <span style="font-size:10px;padding:4px 10px;border-radius:20px;background:${state.test_files?.length ? 'rgba(0,255,136,0.15)' : 'var(--surface2)'};color:${state.test_files?.length ? 'var(--accent)' : 'var(--text3)'}">
+        ${state.test_files?.length ? '✓' : '○'} Tests: ${state.test_files?.length || 0} files
+      </span>
+    </div>`;
 
     if (state.generated_changes?.length) {
       html += subHeader(`Generated Code (${state.generated_changes.length} files)`);
@@ -840,25 +883,70 @@ function renderContent() {
   }
 
   // ── PHASE 6 — Delivery ──────────────────────────────────────
-  if (status.includes('PHASE_6') || status.includes('WAITING_PHASE_6') || p.pr_urls?.length || state.pr_urls?.length) {
-    const cleanStatus = status.trim();
-    const needsApproval = cleanStatus === 'WAITING_PHASE_6_APPROVAL';
+  // Render when phase is 6, when PRs exist, or when waiting for approval
+  const showPhase6 = p.phase === 6 || p.pr_urls?.length || state.pr_urls?.length || state.target_repo;
+  if (showPhase6) {
+    const needsApproval = status === 'WAITING_PHASE_6_APPROVAL';
     const urls = p.pr_urls?.length ? p.pr_urls : (state.pr_urls || []);
     html += sectionHeader('06', 'Delivery — GitHub PR', needsApproval);
-    if (urls.length === 0 && needsApproval) {
-      html += '<div style="color:var(--warn);font-size:11px;margin-bottom:10px;">⚠️ No PR URLs were generated. Code push or PR creation may have failed.</div>';
+
+    // LIVE sub-stage indicator
+    if (p.phase === 6 && isRunning) {
+      html += `<div style="background:linear-gradient(135deg,rgba(0,212,255,0.08),rgba(0,255,136,0.05));border:1px solid var(--accent);border-radius:8px;padding:14px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="spinner"></div>
+          <div>
+            <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase">Phase 6 · Live</div>
+            <div style="font-size:12px;color:var(--accent);font-weight:700;margin-top:2px">${p.sub_stage || 'Working...'}</div>
+          </div>
+        </div>
+      </div>`;
     }
-    urls.forEach(url => {
-      html += `<a class="pr-link" href="${url}" target="_blank">🔗 ${url}</a><br>`;
-    });
+
+    // Show target repo prominently
+    if (state.target_repo) {
+      const isNew = state.is_new_project;
+      html += `<div style="background:var(--surface2);border-left:3px solid ${isNew ? 'var(--accent)' : 'var(--blue)'};border-radius:6px;padding:12px 14px;margin-bottom:12px">
+        <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px">Target Repository</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <code style="font-size:12px;color:${isNew ? 'var(--accent)' : 'var(--blue)'};font-weight:700">${state.target_repo}</code>
+          ${isNew ? '<span style="font-size:9px;padding:2px 8px;background:rgba(0,255,136,0.15);color:var(--accent);border-radius:10px">🆕 CREATED</span>' : ''}
+          <a href="https://github.com/AkashW45/${state.target_repo}" target="_blank" style="margin-left:auto;font-size:10px;color:var(--text2);text-decoration:none">↗ View on GitHub</a>
+        </div>
+      </div>`;
+    }
+
+    if (urls.length) {
+      html += subHeader('Pull Requests');
+      urls.forEach(url => {
+        html += `<a class="pr-link" href="${url}" target="_blank">🔗 ${url}</a><br>`;
+      });
+    } else if (p.phase === 6 && !isRunning) {
+      html += `<div style="font-size:10px;color:var(--text3);font-style:italic;padding:8px">No PR created yet</div>`;
+    }
+
     if (needsApproval) html += approvalZone(selectedThread);
     html += sectionClose();
   }
 
   // ── PHASE 7 — Deployment ────────────────────────────────────
-  if (status.includes('PHASE_7') || status === 'DEPLOYMENT_COMPLETE' || status === 'WAITING_PHASE_7_APPROVAL') {
+  const showPhase7 = p.phase === 7 || status.includes('PHASE_7') || status === 'DEPLOYMENT_COMPLETE' || status === 'WAITING_PHASE_7_APPROVAL';
+  if (showPhase7) {
     const needsApproval = status === 'WAITING_PHASE_7_APPROVAL';
     html += sectionHeader('07', 'Deployment', needsApproval);
+
+    // LIVE sub-stage indicator
+    if (p.phase === 7 && isRunning) {
+      html += `<div style="background:linear-gradient(135deg,rgba(0,212,255,0.08),rgba(0,255,136,0.05));border:1px solid var(--accent);border-radius:8px;padding:14px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="spinner"></div>
+          <div>
+            <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase">Phase 7 · Live</div>
+            <div style="font-size:12px;color:var(--accent);font-weight:700;margin-top:2px">${p.sub_stage || 'Working...'}</div>
+          </div>
+        </div>
+      </div>`;
+    }
 
     if (state.deploy_sequence?.length) {
       html += subHeader('Deploy Sequence');
@@ -884,52 +972,32 @@ function renderContent() {
     if (needsApproval) html += approvalZone(selectedThread);
     html += sectionClose();
   }
+  
+    // ADD THESE TWO LINES:
+    el.innerHTML = html; 
+    // *** ANTI-FLICKER RENDERING EXECUTION ***
+  // Only process nodes that haven't been cached and rendered yet.
+  setTimeout(async () => {
+    const nodes = el.querySelectorAll('.mermaid-container');
+    for (let node of nodes) {
+      const rawCode = decodeURIComponent(escape(atob(node.getAttribute('data-raw'))));
+      try {
+        const id = 'mermaid-svg-' + Date.now() + '-' + Math.floor(Math.random()*1000);
+        const { svg } = await mermaid.render(id, rawCode);
 
-  if (isRunning) {
-    html += `<div style="display:flex;align-items:center;gap:10px;padding:20px;color:var(--text2);font-size:12px">
-      <div class="spinner"></div><span>${status.replace(/_/g,' ')}...</span>
-    </div>`;
-  }
-
-  if (isError && p.error) {
-    html += `<div style="background:rgba(255,71,87,0.07);border:1px solid rgba(255,71,87,0.3);border-radius:8px;padding:16px;margin-top:16px">
-      <div style="color:var(--danger);font-size:12px;font-weight:700;margin-bottom:8px">❌ Error</div>
-      <div style="font-size:11px;color:var(--text2)">${p.error}</div>
-    </div>`;
-  }
-
-  if (isComplete) {
-    html += `<div style="background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.3);border-radius:8px;padding:20px;margin-top:16px;text-align:center">
-      <div style="font-size:32px;margin-bottom:8px">🎉</div>
-      <div style="font-family:'Syne',sans-serif;font-size:18px;color:var(--accent);font-weight:800">Pipeline Complete</div>
-      <div style="font-size:11px;color:var(--text2);margin-top:6px">All phases completed successfully</div>
-    </div>`;
-  }
-
-  el.innerHTML = html;
-  // Render Mermaid diagrams properly
-  setTimeout(() => {
-    if (window.mermaid) {
-      const diagrams = el.querySelectorAll('.mermaid');
-      diagrams.forEach((d, i) => {
-        if (!d.getAttribute('data-rendered')) {
-          const code = d.textContent.trim();
-          d.setAttribute('data-rendered', 'true');
-          try {
-            mermaid.render(`mermaid-svg-${Date.now()}-${i}`, code).then(({svg}) => {
-              d.innerHTML = svg;
-            }).catch(err => {
-              d.innerHTML = `<pre style="color:var(--danger);font-size:10px">Mermaid error: ${err.message}\n\n${code}</pre>`;
-            });
-          } catch(e) {
-            d.innerHTML = `<pre style="font-size:10px">${code}</pre>`;
-          }
-        }
-      });
+        // Save to cache so the next poll uses the SVG instantly!
+        mermaidCache[rawCode] = svg;
+        node.outerHTML = svg;
+      } catch(err) {
+        console.warn('Mermaid error:', err);
+        const errHtml = `<pre style="color:var(--danger);font-size:10px">${esc(rawCode)}</pre>`;
+        mermaidCache[rawCode] = errHtml; // Cache the error so it stops trying
+        node.outerHTML = errHtml;
+      }
     }
-  }, 100);
-}
+  }, 50);
 
+}    
 // ── UI Helpers ──────────────────────────────────────────────────────
 
 function sectionHeader(num, title, needsApproval) {

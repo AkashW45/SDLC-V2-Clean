@@ -1,6 +1,12 @@
 """
 Phase 3 — Impact Analysis LangGraph Agent
 Uses INTERRUPT for human approval before code generation begins.
+
+Optimizations vs original:
+  - Removed duplicate resume_impact_analysis function (dead code; resume_with_approval
+    is the canonical path used by the API)
+  - Singleton graph built exactly once via get_graph() — unchanged, already correct
+  - Docstrings tightened; no logic changes to the graph itself
 """
 
 import json
@@ -16,8 +22,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from agents.phase3_impact.impact_analyzer import run_impact_analysis
 
 # -----------------------------------------
-# SHARED memory — must be module-level
-# so start and resume use the SAME instance
+# SHARED memory — module-level so start and
+# resume operate on the SAME MemorySaver instance
 # -----------------------------------------
 _memory = MemorySaver()
 _graph = None  # built once, reused
@@ -49,7 +55,7 @@ def analyze_impact(state: ImpactState) -> ImpactState:
     return {
         **state,
         "impact_report": report,
-        "status": "IMPACT_ANALYZED"
+        "status": "IMPACT_ANALYZED",
     }
 
 
@@ -69,7 +75,7 @@ def human_approval_gate(state: ImpactState) -> ImpactState:
         **state,
         "human_approved": approved,
         "human_feedback": feedback,
-        "status": "WAITING_FOR_APPROVAL"
+        "status": "WAITING_FOR_APPROVAL",
     }
 
 
@@ -77,15 +83,14 @@ def process_approval(state: ImpactState) -> ImpactState:
     print(f"[Node] process_approval — human_approved={state.get('human_approved')}")
     if state.get("human_approved"):
         return {**state, "status": "APPROVED_FOR_CODE_GENERATION"}
-    else:
-        return {
-            **state,
-            "status": "REJECTED_BY_HUMAN",
-            "impact_report": {
-                **state["impact_report"],
-                "rejection_reason": state.get("human_feedback", "No reason given")
-            }
-        }
+    return {
+        **state,
+        "status": "REJECTED_BY_HUMAN",
+        "impact_report": {
+            **state["impact_report"],
+            "rejection_reason": state.get("human_feedback", "No reason given"),
+        },
+    }
 
 
 def route_after_approval(state: ImpactState) -> str:
@@ -97,7 +102,7 @@ def route_after_approval(state: ImpactState) -> str:
 # -----------------------------------------
 
 def get_graph():
-    """Returns singleton graph with shared memory."""
+    """Return the singleton compiled graph (builds on first call)."""
     global _graph
     if _graph is not None:
         return _graph
@@ -115,12 +120,12 @@ def get_graph():
     builder.add_conditional_edges(
         "process_approval",
         route_after_approval,
-        {"approved": END, "rejected": END}
+        {"approved": END, "rejected": END},
     )
 
     _graph = builder.compile(
         checkpointer=_memory,
-        interrupt_before=["human_approval_gate"]
+        interrupt_before=["human_approval_gate"],
     )
 
     return _graph
@@ -131,15 +136,16 @@ def get_graph():
 # -----------------------------------------
 
 def start_impact_analysis(requirement: str, thread_id: str) -> dict:
+    """Start a new impact-analysis run and block at the human-approval gate."""
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
 
-    initial_state = {
+    initial_state: ImpactState = {
         "requirement": requirement,
         "impact_report": {},
         "human_approved": False,
         "human_feedback": "",
-        "status": "STARTED"
+        "status": "STARTED",
     }
 
     result = graph.invoke(initial_state, config)
@@ -148,40 +154,35 @@ def start_impact_analysis(requirement: str, thread_id: str) -> dict:
         "thread_id": thread_id,
         "status": result.get("status"),
         "impact_report": result.get("impact_report"),
-        "message": "Impact analysis complete. Awaiting human approval."
+        "message": "Impact analysis complete. Awaiting human approval.",
     }
 
 
 def resume_with_approval(thread_id: str, approved: bool, feedback: str = "") -> dict:
+    """Resume an interrupted graph run after the human has reviewed the report."""
     graph = get_graph()  # same graph, same _memory
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Inject human decision into existing checkpoint
+    # Inject human decision into the existing checkpoint
     graph.update_state(
         config,
-        {"human_approved": approved, "human_feedback": feedback}
+        {"human_approved": approved, "human_feedback": feedback},
     )
 
-    # Resume from INTERRUPT
+    # Resume from the INTERRUPT point
     result = graph.invoke(None, config)
 
     return {
         "thread_id": thread_id,
         "status": result.get("status"),
         "approved": approved,
-        "message": "Approved — ready for code generation" if approved else "Rejected — pipeline stopped"
+        "message": (
+            "Approved — ready for code generation"
+            if approved
+            else "Rejected — pipeline stopped"
+        ),
     }
 
-def resume_impact_analysis(graph, config, approved: bool, feedback: str = ""):
-    print(f"\n--- Resuming Phase 3 (approved={approved}) ---")
-
-    result = graph.invoke(
-        Command(resume={"approved": approved, "feedback": feedback}),
-        config
-    )
-
-    print(f"Final status: {result['status']}")
-    return result
 
 # -----------------------------------------
 # CLI Test

@@ -12,6 +12,7 @@ from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
+from groq import Groq
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -21,6 +22,12 @@ from core.llm_gateway import gateway
 from dotenv import load_dotenv
 
 load_dotenv()
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com"
+)
 
 
 # -----------------------------------------
@@ -29,6 +36,7 @@ load_dotenv()
 
 class PlanningState(TypedDict):
     requirement: str
+    scope_contract: dict      # <-- ADD THIS LINE
     brd: dict
     prd: dict
     sprint_plan: dict
@@ -56,15 +64,14 @@ def _get_thread_id(state) -> str:
 # -----------------------------------------
 
 def call_llm(prompt: str) -> dict:
-    content = gateway.generate(
-        prompt=prompt,
+    response = client.chat.completions.create(
         model="deepseek-v4-pro",
-        temperature=0.2,
+        messages=[{"role": "user", "content": prompt}],
         stream=False,
-        reasoning_effort="low",
-        extra_body={"thinking": {"type": "enabled"}},
-        tag="phase2_planning"
-    ).strip()
+        reasoning_effort="high",
+        extra_body={"thinking": {"type": "enabled"}}
+    )
+    content = response.choices[0].message.content.strip()
     if content.startswith("```"):
         content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
     try:
@@ -247,28 +254,7 @@ def create_jira_tickets(state: PlanningState) -> PlanningState:
     except Exception as e:
         print(f"  ⚠️  Jira creation skipped: {e}")
         return {**state, "jira_tickets": [], "status": "JIRA_SKIPPED"}
-
-
-def create_jira_tickets_and_runbook(state: PlanningState) -> PlanningState:
-    print("\n[Phase 2] Creating Jira tickets and runbook in parallel...")
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        tickets_future = executor.submit(create_jira_tickets, dict(state))
-        runbook_future = executor.submit(generate_runbook, dict(state))
-
-        result_tickets = tickets_future.result()
-        result_runbook = runbook_future.result()
-
-    merged_state = {
-        **state,
-        "jira_tickets": result_tickets.get("jira_tickets", []),
-        "runbook": result_runbook.get("runbook", {}),
-        "status": "JIRA_AND_RUNBOOK_GENERATED"
-    }
-
-    return merged_state
-
-
+    
 def generate_runbook(state: PlanningState) -> PlanningState:
     print("\n[Phase 2] Generating runbook...")
 
@@ -379,13 +365,15 @@ def build_planning_graph():
     builder = StateGraph(PlanningState)
 
     builder.add_node("generate_sprint_plan", generate_sprint_plan)
-    builder.add_node("create_jira_tickets_and_runbook", create_jira_tickets_and_runbook)
+    builder.add_node("create_jira_tickets", create_jira_tickets)
+    builder.add_node("generate_runbook", generate_runbook)
     builder.add_node("human_approval_gate", human_approval_gate)
     builder.add_node("process_approval", process_approval)
 
     builder.set_entry_point("generate_sprint_plan")
-    builder.add_edge("generate_sprint_plan", "create_jira_tickets_and_runbook")
-    builder.add_edge("create_jira_tickets_and_runbook", "human_approval_gate")
+    builder.add_edge("generate_sprint_plan", "create_jira_tickets")
+    builder.add_edge("create_jira_tickets", "generate_runbook")
+    builder.add_edge("generate_runbook", "human_approval_gate")
     builder.add_edge("human_approval_gate", "process_approval")
 
     builder.add_conditional_edges(
@@ -420,8 +408,7 @@ def start_planning(requirement: str, brd: dict, prd: dict, thread_id: str = "thr
         runbook={},
         human_feedback="",
         approved=False,
-        status="STARTED",
-        thread_id=thread_id
+        status="STARTED"
     )
 
     print("\n" + "="*50)

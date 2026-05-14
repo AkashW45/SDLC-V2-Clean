@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="644a9c84-48f3-45fc-ba56-f2734484d037" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/FULL_DEBUG_EXPORT.txt" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/Phase4_Phase5_Changes_Summary.docx" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/agents/critic/critic_agent.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/agents/prompts/system_prompts.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/debug_export.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/agents/phase1_discovery/discovery_agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/agents/phase1_discovery/discovery_agent.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/agents/phase2_planning/planning_agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/agents/phase2_planning/planning_agent.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/agents/phase3_impact/graph.py" beforeDir="false" afterPath="$PROJECT_DIR$/agents/phase3_impact/graph.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/agents/phase3_impact/impact_analyzer.py" beforeDir="false" afterPath="$PROJECT_DIR$/agents/phase3_impact/impact_analyzer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/agents/phase4_codegen/codegen_agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/agents/phase4_codegen/codegen_agent.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/agents/phase5_validation/validation_agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/agents/phase5_validation/validation_agent.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/agents/phase7_deployment/deployment_agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/agents/phase7_deployment/deployment_agent.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/dashboard/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/dashboard/index.html" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+    <option name="ROOT_SYNC" value="DONT_SYNC" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 0
+}</component>
+  <component name="ProjectId" id="3Dfo1mgyi0tHanEtDVDGwIxdgIv" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "git-widget-placeholder": "Merging feature/shantanu",
+    "kotlin-language-version-configured": "true",
+    "last_opened_file_path": "C:/Users/user/SDLC-V2",
+    "nodejs_package_manager_path": "npm",
+    "vue.rearranger.settings.migration": "true"
+  }
+}]]></component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="644a9c84-48f3-45fc-ba56-f2734484d037" name="Changes" comment="" />
+      <created>1778682274657</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1778682274657</updated>
+      <workItem from="1778682277499" duration="19000" />
+    </task>
+    <servers />
+  </component>
+  <component name="UnknownFeatures">
+    <option featureType="com.intellij.fileTypeFactory" implementationName="*.py" />
+  </component>
+</project>
