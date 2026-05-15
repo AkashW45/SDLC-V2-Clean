@@ -28,7 +28,10 @@ INCLUDE_EXTENSIONS = {
     ".toml",
     ".env",
     ".txt",
-    ".ini"
+    ".ini",
+    ".html",
+    ".swp"
+
 }
 
 MAX_FILE_SIZE = 500_000  # 500 KB

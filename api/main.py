@@ -620,8 +620,12 @@ def run_phase3(thread_id: str, feedback: str = ""):
 
 def run_phase4(thread_id: str):
     try:
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agents.phase4_codegen.codegen_agent import run_codegen
         from agents.phase5_validation.validation_agent import run_validation_phase
+        from agents.expansion_engine import decide_single
+        from agents.units_model import attach_units
 
         entry = pipeline_store[thread_id]
         state = entry["current_state"]
@@ -637,7 +641,7 @@ def run_phase4(thread_id: str):
         impact = state.get("impact_report", {})
         if state.get("is_new_project", False) and not impact.get("affected_files"):
             impact = {"requirement": entry["requirement"], "affected_files": [], "affected_repos": [r["name"] for r in state.get("selected_repos", [])], "architecture": state.get("architecture", {}), "risk_assessment": {"risk_level": "low", "breaking_changes": [], "recommendation": "proceed"}}
-
+            
         result4 = run_codegen(requirement=entry["requirement"], impact_report=impact, workspace_path="/repos", thread_id=f"{thread_id}-p4", adr=state.get("adr", {}), scope_contract=state.get("scope_contract", {}))
 
         if result4["status"] != "VALIDATED":
@@ -646,14 +650,48 @@ def run_phase4(thread_id: str):
 
         pipeline_store[thread_id]["phase"] = 5
         update_substage("Generating pytest test files...", "PHASE_5_RUNNING")
-
+        
         result5 = run_validation_phase(requirement=entry["requirement"], generated_changes=result4["generated_changes"], scope_contract=state.get("scope_contract", {}), thread_id=f"{thread_id}-p5")
 
         merged = {**state, "generated_changes": result4["generated_changes"], "test_files": result5.get("test_files", [])}
         pipeline_store[thread_id]["current_state"] = merged
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+        
+        # ── EXPANSION DECISION ENGINE GUARD ──
+        update_substage("Calculating Work-Unit Budget (Expansion Engine)...", "CHECKING_BUDGET")
+        
+        code_artifact = {
+            "artifact_id": f"code-{thread_id}",
+            "artifact_type": "CODE",
+            "category": "mvp",
+            "content": {"files": result4["generated_changes"]},
+            "confidence": 95
+        }
+        attach_units(code_artifact, state.get("scope_contract", {}))
 
+        decision = decide_single(
+            thread_id=thread_id,
+            asp=state.get("scope_contract", {}),
+            artifact=code_artifact,
+            accepted_units_so_far=0
+        )
+
+        if decision["verdict"] == "reject":
+            update_substage(f"Code Rejected by Engine: {decision['reason']}", "ERROR")
+            pipeline_store[thread_id].update({"status": "ERROR", "error": f"Expansion Engine Rejected: {decision['reason']}"})
+            return
+            
+        elif decision["verdict"] == "queue_for_approval":
+            update_substage(f"Budget Exceeded. Reason: {decision['reason']}. Awaiting manual approval.", "WAITING_PHASE_4_APPROVAL")
+            pipeline_store[thread_id].update({"status": "WAITING_PHASE_4_APPROVAL"})
+            save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+            return
+
+        update_substage(f"Budget check passed! Cost: {decision['recomputed_units']} units.", "PHASE_5_RUNNING")
+        # ──────────────────────────────────────
+
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
         run_phase6(thread_id, "")
+        
     except Exception as e:
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
 

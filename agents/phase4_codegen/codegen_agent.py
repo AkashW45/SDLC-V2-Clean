@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 import psycopg2
 from agents.prompts.system_prompts import CODEGEN_SYSTEM
 from agents.critic.critic_agent import critique
-
+from agents.context_packet_builder import build_context_packet as build_context_packet_rag, inject_into_user_message
 load_dotenv()
 
 from core.llm_gateway import gateway
@@ -351,16 +351,25 @@ def build_context_packet(state: CodegenState) -> dict:
 
 def generate_code_changes(state: CodegenState) -> CodegenState:
     print("\n[Phase 4] Generating Diff-Based Polyglot Code Changes...")
-
+    
     if state.get("status") == "NEW_PROJECT_NO_CODE":
         return generate_fresh_project(state)
 
     context = build_context_packet(state)
+    asp = state.get("scope_contract", {}) 
+    requirement = state.get("requirement", "")
+    
+    # ── CLAUDE'S RAG CONTEXT BUILDER ──
+    packet = build_context_packet_rag(
+        requirement=requirement,
+        asp=asp,
+        top_k=8, max_files=4
+    )
+
     adr = state.get("adr", {})
     adr_text = json.dumps(adr, indent=2) if adr else "ADR not provided."
     generated_changes = []
     all_errors = []
-
     workspace_path = state.get('workspace_path', '')
 
     for file_info in context["files"]:
@@ -368,19 +377,15 @@ def generate_code_changes(state: CodegenState) -> CodegenState:
         current_content = file_info["current_content"]
         print(f"\n  Processing: {file_path}")
 
-        # 1. Teammate's Context Windowing
         file_outline = extract_file_outline(current_content)
         windowed_content = extract_relevant_context(current_content, file_info["existing_symbols"])
-
-        # If the file is small, send the whole thing, otherwise send the windowed chunk
         content_for_llm = current_content if len(current_content.split("\n")) <= 100 else windowed_content
 
-        # 2. Combined Prompt (Polyglot + Diff Instructions)
-        prompt = f"""
+        base_prompt = f"""
 You are an Expert Polyglot Software Engineer modifying an existing codebase.
 
 ADR (Agreed Tech Stack): {adr_text}
-REQUIREMENT: {context['requirement']}
+REQUIREMENT: {requirement}
 RISK LEVEL: {context['risk_level']}
 
 FILE TO MODIFY: {file_path}
@@ -395,8 +400,8 @@ INSTRUCTIONS:
 1. Read the ADR and file extension to determine the programming language.
 2. Modify this file to implement the requirement. Keep existing functionality working.
 3. Return ONLY the exact blocks of code that need to be changed.
-4. The 'search_block' MUST match the existing file content exactly character-by-character (copy/paste from the provided content). Do not skip whitespace or indentation.
-5. The 'replace_block' is the new code that will replace the search_block.
+4. The 'search_block' MUST match the existing file content exactly character-by-character.
+5. EVERY file change MUST include a 'traces_to' field mapping back to the ASP.
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -408,60 +413,51 @@ Return ONLY valid JSON in this exact format:
     }}
   ],
   "change_summary": "what was changed and why",
-  "new_symbols_added": ["symbol1"],
-  "existing_symbols_modified": ["symbol1"]
+  "traces_to": ["capability phrase from ASP"]
 }}
 """
+        # Inject Qdrant chunks!
+        prompt = inject_into_user_message(base_prompt, packet)
+
         max_retries = 3
         success = False
 
         for attempt in range(1, max_retries + 1):
             response = call_llm(prompt, max_tokens=4000)
-
             if response.startswith("```"):
                 response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
 
             try:
                 change_data = json.loads(response)
-
-                # Start with a fresh copy of the current file for this attempt
                 modified_content = current_content
                 diff_errors = []
-
-                # 3. Teammate's Patching Logic
+                
                 if change_data.get("changes"):
                     for diff in change_data["changes"]:
                         search_block = diff.get("search_block", "")
                         replace_block = diff.get("replace_block", "")
-
+                        
                         if not search_block:
-                            diff_errors.append(f"{file_path}: missing 'search_block' in diff.")
                             continue
-
                         if search_block not in modified_content:
-                            diff_errors.append(f"{file_path}: 'search_block' not found in current content. Ensure exact character-by-character matching including indentation.")
+                            diff_errors.append(f"{file_path}: 'search_block' not found in current content.")
                             continue
-
-                        # Apply the diff replacement
                         modified_content = modified_content.replace(search_block, replace_block, 1)
 
                     if diff_errors:
                         errors = diff_errors
                     else:
-                        # Patch succeeded! Save full code to dict and run Polyglot Validation
                         change_data["content"] = modified_content
                         errors = validate_python(modified_content, file_path)
                 else:
                     errors = [f"{file_path}: No 'changes' array provided by LLM."]
 
-                # Handle Errors & Retry
                 if errors:
                     print(f"  ⚠️  Attempt {attempt}/{max_retries} — errors: {errors}")
                     if attempt < max_retries:
-                        prompt += f"\n\nPREVIOUS ATTEMPT FAILED:\n{json.dumps(errors)}\nFix the 'search_block' to exactly match the file, fix syntax errors, and return corrected JSON."
+                        prompt += f"\n\nPREVIOUS ATTEMPT FAILED:\n{json.dumps(errors)}\nFix the 'search_block' to exactly match."
                     continue
 
-                # 4. Success: Save to local workspace if configured
                 if workspace_path:
                     full_path = os.path.join(workspace_path, change_data["file_path"])
                     os.makedirs(os.path.dirname(full_path), exist_ok=True)
@@ -469,7 +465,7 @@ Return ONLY valid JSON in this exact format:
                         f.write(modified_content)
 
                 generated_changes.append(change_data)
-                print(f"  ✅ Generated patch for: {file_path} | {change_data.get('change_summary', '')[:50]}")
+                print(f"  ✅ Generated patch for: {file_path}")
                 success = True
                 break
 
@@ -479,16 +475,12 @@ Return ONLY valid JSON in this exact format:
                     prompt += f"\n\nJSON ERROR: {e}\nReturn ONLY valid JSON."
 
         if not success:
-            error_msg = f"{file_path}: Failed after {max_retries} attempts"
-            print(f"  ❌ {error_msg}")
-            all_errors.append(error_msg)
+            all_errors.append(f"{file_path}: Failed after {max_retries} attempts")
 
-    return {
-        **state,
-        "generated_changes": generated_changes,
-        "validation_errors": all_errors,
-        "status": "CODE_GENERATED" if not all_errors else "CODE_GENERATION_FAILED"
-    }
+    return {**state, "generated_changes": generated_changes, "validation_errors": all_errors, "status": "CODE_GENERATED" if not all_errors else "CODE_GENERATION_FAILED"}
+
+# To avoid name clashing in Codegen, rename the imported builder at the top:
+# from agents.context_packet_builder import build_context_packet as build_context_packet_rag
 
 
 def validate_changes(state: CodegenState) -> CodegenState:

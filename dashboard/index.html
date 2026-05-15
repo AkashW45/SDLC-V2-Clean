@@ -198,7 +198,10 @@ async function launchPipeline() {
   try {
     const r = await fetch(`${API}/pipeline/start`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'X-API-Key': API_KEY 
+      },
       body: JSON.stringify({ requirement: req })
     });
     const d = await r.json();
@@ -250,7 +253,10 @@ async function approvePipeline(threadId, approved) {
   try {
     const r = await fetch(`${API}/pipeline/approve/${threadId}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'X-API-Key': API_KEY 
+      },
       body: JSON.stringify({ approved, feedback })
     });
     const d = await r.json();

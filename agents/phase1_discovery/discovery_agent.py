@@ -11,7 +11,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt
 from typing import TypedDict, Dict, Any
 from dotenv import load_dotenv
-
+from knowledge_layer.repo_summary import build_repo_summary
 from agents.prompts.system_prompts import (
     CLASSIFIER_SYSTEM, BRD_SYSTEM, PRD_SYSTEM,
     ADR_SYSTEM, ARCHITECTURE_SYSTEM
@@ -94,9 +94,30 @@ def _extract_yaml_context(artifact: dict, keys: list) -> str:
 # -----------------------------------------
 
 def classify_intent(state: DiscoveryState) -> DiscoveryState:
-    """Phase 0.5 — Produces Scope Contract (From Main)"""
-    print("[Phase 0.5] Classifying intent + producing Scope Contract...")
-    user_msg = f"PROJECT_REQUEST: {state['requirement']}"
+    """Phase 0.5 — Produces Adaptive Scope Profile (ASP) using REAL repo_summary"""
+    print("[Phase 0.5] Classifying intent + producing Adaptive Scope Profile...")
+    
+    requirement = state["requirement"]
+    selected_repos = state.get("selected_repos", [])
+    is_new = state.get("is_new_project", True)
+
+    # ── REAL REPO SUMMARY (NO MORE MOCKS!) ──
+    candidate_repo_name = selected_repos[0]["name"] if selected_repos else None
+    if is_new:
+        repo_summary = {
+            "exists": False,
+            "matched_repo": candidate_repo_name,
+            "match_score": 0.0,
+            "languages": [],
+            "symbol_overlap": 0.0,
+            "tests_present": False,
+            "top_symbols": []
+        }
+    else:
+        # Query the actual knowledge layer (Qdrant & Postgres)!
+        repo_summary = build_repo_summary(requirement, candidate_repo_name=candidate_repo_name)
+
+    user_msg = f"REQUIREMENT:\n{requirement}\n\nREPO_SUMMARY:\n{json.dumps(repo_summary, indent=2)}"
 
     response = client.chat.completions.create(
         model=MODEL,
@@ -109,31 +130,36 @@ def classify_intent(state: DiscoveryState) -> DiscoveryState:
         extra_body={"thinking": {"type": "enabled"}}
     )
 
-    parsed = safe_parse_json(response.choices[0].message.content)
+    parsed = safe_parse_json(response.choices[0].message.content, "classifier")
 
-    if parsed.get("ambiguity_detected") or not parsed.get("scope_contract"):
-        parsed["scope_contract"] = {
+    if parsed.get("ambiguity_detected") or not parsed.get("asp"):
+        print("  ⚠️ Ambiguity detected. Using fallback ASP.")
+        parsed["asp"] = {
             "depth_level": 3,
-            "depth_rationale": "Default — ambiguous requirement",
-            "scope_anchor": {
+            "policy_mode": "managed",
+            "allow_unbounded": False,
+            "anchors": {
                 "primary_domain": state["requirement"][:50],
-                "user_types": ["primary user"],
                 "core_capabilities": [state["requirement"][:100]],
+                "user_types": ["primary user"],
                 "explicit_integrations": [],
                 "explicit_compliance": [],
-                "explicit_scale": "unspecified",
                 "production_intent": False
             },
-            "hard_limits": {"max_functional_requirements": 10, "max_architecture_nodes": 8, "max_jira_tickets": 15, "max_code_files": 20, "max_sprints": 2},
+            "unit_budgets": {"FR":10, "NFR":4, "ADR":5, "ARCH_NODE":8, "JIRA":15, "CODE_FILE":20, "RISK":4, "KPI":3, "SPRINT":2},
             "forbidden_elements": ["microservices", "kafka", "kubernetes", "multi_region", "service_mesh"],
             "mandatory_elements": []
         }
 
-    contract = parsed["scope_contract"]
-    print(f"  ✅ Depth: {contract['depth_level']} | Domain: {contract['scope_anchor']['primary_domain']}")
-
-    return {**state, "classifier_output": parsed, "scope_contract": contract, "status": "INTENT_CLASSIFIED"}
-
+    contract = parsed["asp"]
+    print(f"  ✅ Depth: {contract.get('depth_level')} | Policy: {contract.get('policy_mode')}")
+    
+    return {
+        **state,
+        "classifier_output": parsed,
+        "scope_contract": contract, # We keep calling it scope_contract in state to not break other files
+        "status": "INTENT_CLASSIFIED"
+    }
 
 def generate_brd(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating BRD...")
