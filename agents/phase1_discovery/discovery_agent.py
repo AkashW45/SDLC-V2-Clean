@@ -68,7 +68,8 @@ def _llm_json(prompt: str, max_tokens: int = 8192) -> dict:
             if attempt == 2:
                 return {}
 
-def safe_parse_json(raw: str) -> dict:
+# CLAUDE FIX: signature updated with label: str = "json"
+def safe_parse_json(raw: str, label: str = "json") -> dict:
     if not raw: return {}
     raw = raw.strip()
     if raw.startswith("```"):
@@ -160,6 +161,51 @@ def classify_intent(state: DiscoveryState) -> DiscoveryState:
         "scope_contract": contract, # We keep calling it scope_contract in state to not break other files
         "status": "INTENT_CLASSIFIED"
     }
+# CLAUDE FIX: Moved Fallback functions out to Module Level
+def _fallback_asp(requirement: str, depth: int = 3) -> dict:
+    return {
+        "depth_level": depth,
+        "policy_mode": "managed",
+        "allow_unbounded": False,
+        "anchors": {
+            "primary_domain": requirement[:50],
+            "core_capabilities": [requirement[:100]],
+            "user_types": ["primary user"],
+            "explicit_integrations": [],
+            "explicit_compliance": [],
+            "production_intent": False
+        },
+        "unit_budgets": {"FR":10, "NFR":4, "ADR":5, "ARCH_NODE":8, "JIRA":15, "CODE_FILE":20, "RISK":4, "KPI":3, "SPRINT":2},
+        "forbidden_elements": ["microservices", "kafka", "kubernetes", "multi_region", "service_mesh"],
+        "mandatory_elements": []
+    }
+
+def _make_fallback_brd(requirement: str, contract: dict) -> dict:
+    return {"title": requirement[:80], "functional_requirements": []}
+
+
+def _make_fallback_prd(requirement: str, contract: dict) -> dict:
+    return {
+        "title": requirement[:80],
+        "functional_requirements": [],
+        "non_functional_requirements": [],
+        "technical_requirements": []
+    }
+
+def _make_fallback_adr(requirement: str, contract: dict) -> dict:
+    return {"decisions": []}
+
+def _make_fallback_architecture(requirement: str, contract: dict) -> dict:
+    return {
+        "system_name": requirement[:50],
+        "nodes": [],
+        "edges": [],
+        "mermaid": "graph LR\n    A[System]\n"
+    }
+
+
+
+    
 
 def generate_brd(state: DiscoveryState) -> DiscoveryState:
     print("\n[Phase 1] Generating BRD...")
@@ -347,28 +393,7 @@ def build_discovery_graph():
 
     g.set_entry_point("classify_intent")
     g.add_edge("classify_intent", "generate_brd")
-def _make_fallback_prd(requirement: str, contract: dict) -> dict:
-    return {
-        "title": requirement[:80],
-        "functional_requirements": [],
-        "non_functional_requirements": [],
-        "technical_requirements": []
-    }
-
-def _make_fallback_adr(requirement: str, contract: dict) -> dict:
-    return {"decisions": []}
-
-def _make_fallback_architecture(requirement: str, contract: dict) -> dict:
-    return {
-        "system_name": requirement[:50],
-        "nodes": [],
-        "edges": [],
-        "mermaid": "graph LR\n    A[System]\n"
-    }
-
-
-
-    g.add_node("classify_intent", classify_intent)   # NEW
+    
     g.add_edge("generate_brd", "generate_prd")
     g.add_edge("generate_prd", "generate_adr")
     g.add_edge("generate_adr", "generate_architecture")

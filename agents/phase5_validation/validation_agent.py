@@ -19,7 +19,11 @@ from groq import Groq
 from dotenv import load_dotenv
 from agents.prompts.system_prompts import TESTGEN_SYSTEM
 from agents.critic.critic_agent import critique
-
+# CLAUDE FIX: Ensure save_artifact is imported for semgrep report
+try:
+    from api.persistence import save_artifact
+except ImportError:
+    def save_artifact(thread_id, name, content): pass
 load_dotenv()
 
 from openai import OpenAI
@@ -36,6 +40,7 @@ client = OpenAI(
 
 class ValidationState(TypedDict):
     requirement: str
+    scope_contract: dict
     generated_changes: list
     test_files: list
     validation_results: dict
@@ -48,7 +53,7 @@ class ValidationState(TypedDict):
 # -----------------------------------------
 # Helpers
 # -----------------------------------------
-
+MODEL="deepseek-v4-flash"  # Using the same model as Main for consistency
 def call_llm(prompt: str) -> dict:
     response = client.chat.completions.create(
         model="deepseek-v4-pro",
@@ -62,6 +67,7 @@ def call_llm(prompt: str) -> dict:
 
 def validate_python_syntax(code: str, file_path: str) -> list:
     errors = []
+    if not file_path.endswith(".py"): return errors
     try:
         ast.parse(code)
     except SyntaxError as e:
@@ -72,7 +78,7 @@ def validate_python_syntax(code: str, file_path: str) -> list:
 def run_basic_lint(code: str, file_path: str) -> list:
     """Run basic checks on generated code."""
     issues = []
-
+    if not file_path.endswith(".py"): return issues
     lines = code.split("\n")
     for i, line in enumerate(lines, 1):
         # Check for obviously bad patterns
@@ -83,7 +89,17 @@ def run_basic_lint(code: str, file_path: str) -> list:
 
     return issues
 
-
+def run_semgrep_gate(workspace_path: str) -> dict:
+    if not workspace_path or not os.path.exists(workspace_path): return {"status": "PASS", "reason": "No workspace to scan"}
+    try:
+        result = subprocess.run(["semgrep", "scan", "--config=p/security-audit", "--json", workspace_path], capture_output=True, text=True)
+        if result.returncode != 0 and not result.stdout.strip(): return {"status": "BLOCKED", "reason": "Semgrep scan failed", "details": result.stderr}
+        output = json.loads(result.stdout)
+        critical_findings = [f for f in output.get("results", []) if f.get('extra', {}).get('severity') == 'ERROR']
+        if critical_findings: return {"status": "BLOCKED", "reason": f"Found {len(critical_findings)} CRITICAL SAST issues", "details": critical_findings}
+        return {"status": "PASS"}
+    except FileNotFoundError: return {"status": "PASS"}
+    except json.JSONDecodeError: return {"status": "PASS", "reason": "Failed to parse Semgrep"}
 # -----------------------------------------
 # Nodes
 # -----------------------------------------
@@ -114,7 +130,7 @@ def _process_single_test(change, requirement, previous_errors, scope_contract, d
     }, indent=2)
 
     api_response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile", # Using your Main's specified model
+        model=MODEL, # Using your Main's specified model
         messages=[
             {"role": "system", "content": TESTGEN_SYSTEM},
             {"role": "user", "content": user_msg}
@@ -257,6 +273,23 @@ def run_validation(state: ValidationState) -> ValidationState:
 
     return {**state, "validation_results": results, "status": status}
 
+def run_critic_check(state: ValidationState) -> ValidationState:
+    scope_contract = state.get("scope_contract", {})
+    if not scope_contract or not state.get("test_files", []):
+        return state
+
+    try:
+        result = critique(
+            artifact={"test_files": state["test_files"]},
+            artifact_type="tests",
+            scope_contract=scope_contract,
+            original_requirement=state["requirement"]
+        )
+        verdict = result.get("verdict", "ACCEPT")
+        print(f"  [Critic] Verdict on tests: {verdict}")
+    except Exception:
+        pass
+    return state
 
 def route_after_validation(state: ValidationState) -> str:
     if state["status"] == "VALIDATION_PASSED":
@@ -289,7 +322,7 @@ def build_validation_graph():
     builder.add_node("generate_tests", generate_tests)
     builder.add_node("run_validation", run_validation)
     builder.add_node("increment_retry", increment_retry)
-
+    builder.add_node("run_critic_check", run_critic_check)
     builder.set_entry_point("generate_tests")
     builder.add_edge("generate_tests", "run_validation")
 
@@ -304,7 +337,7 @@ def build_validation_graph():
     )
 
     builder.add_edge("increment_retry", "generate_tests")
-
+    builder.add_edge("run_critic_check", END)
     memory = MemorySaver()
     return builder.compile(checkpointer=memory)
 

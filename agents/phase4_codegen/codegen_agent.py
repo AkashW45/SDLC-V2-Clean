@@ -14,6 +14,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from dotenv import load_dotenv
+from openai import OpenAI
 import psycopg2
 from agents.prompts.system_prompts import CODEGEN_SYSTEM
 from agents.critic.critic_agent import critique
@@ -23,7 +24,10 @@ load_dotenv()
 from core.llm_gateway import gateway
 from api.persistence import audit
 
-
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com"
+)
 # -----------------------------------------
 # State
 # -----------------------------------------
@@ -35,8 +39,8 @@ class CodegenState(TypedDict):
     adr: dict                  # Architecture Decision Record for tech stack enforcement
     existing_code: dict        # file_path -> current content
     generated_changes: list    # list of {file_path, content, change_summary}
-    existing_code: dict      # file_path -> current content
-    generated_changes: list  # list of {file_path, content, change_summary, ...}
+    
+   
     validation_errors: list
     status: str
     workspace_path: str
@@ -169,26 +173,51 @@ def extract_relevant_context(code: str, affected_symbols: list) -> str:
 
     return windowed_code
 
+def eval_first_check(state: CodegenState) -> CodegenState:
+    """Check for goldenset.yaml before proceeding with code generation."""
+    workspace_path = state.get('workspace_path', '')
+    goldenset_path = os.path.join(workspace_path, 'goldenset.yaml')
+
+    if os.path.exists(goldenset_path):
+        audit(state.get('thread_id', 'unknown'), 'phase4', 'INFO', 'system', {
+            'message': 'Eval-First Check Passed: goldenset.yaml found.'
+        })
+        print("  [Phase 4] Eval-First Check: PASSED (goldenset.yaml found)")
+    else:
+        audit(state.get('thread_id', 'unknown'), 'phase4', 'WARNING', 'system', {
+            'message': 'Eval-First Check Failed: goldenset.yaml missing. Proceeding in SOFT MODE.'
+        })
+        print("  [Phase 4] Eval-First Check: WARNING (goldenset.yaml missing — soft mode)")
+
+    return state
+
+def load_existing_code(state: CodegenState) -> CodegenState:
+    """Read current content of all affected files. For new projects, skip."""
+    print("\n[Phase 4] Loading existing code...")
+
+    impact = state.get("impact_report", {})
+    affected_files = impact.get("affected_files", [])
+
+    # If no affected files (new project) — skip loading
+    if not affected_files:
+        print("  [Phase 4] No existing files — NEW PROJECT, generating fresh")
+        return {**state, "existing_code": {}, "status": "NEW_PROJECT_NO_CODE"}
+
+    repo_path = os.getenv("REPO_PATH", r"C:\Users\user\leave-mgmt-backend")
+    existing_code = {}
+
+    for af in affected_files:
+        file_path = af["file_path"]
+        file_path_normalized = file_path.replace("\\", os.sep).replace("/", os.sep)
+        content = read_file_from_repo(repo_path, file_path_normalized)
+        if content:
+            existing_code[file_path] = content
+            print(f"  ✅ Loaded: {file_path} ({len(content)} chars)")
+
+    return {**state, "existing_code": existing_code, "status": "CODE_LOADED"}
+
 
 def generate_fresh_project(state: CodegenState) -> CodegenState:
-    """Generate complete project scaffold for a new requirement."""
-    print("  [Phase 4] Generating FRESH project scaffold...")
-
-    requirement = state["requirement"]
-    impact = state.get("impact_report", {})
-    architecture = impact.get("architecture", {})
-
-    # Build architecture context for grounded scaffolding
-    arch_context = ""
-    if architecture.get("nodes"):
-        arch_summary = []
-        for node in architecture.get("nodes", []):
-            arch_summary.append(f"- {node.get('name','')} ({node.get('type','service')}): {node.get('description','')}")
-            if node.get('tech_stack'):
-                arch_summary.append(f"  Tech: {', '.join(node['tech_stack'])}")
-        arch_context = "\n\nARCHITECTURE TO IMPLEMENT:\n" + "\n".join(arch_summary)
-
-    def generate_fresh_project(state: CodegenState) -> CodegenState:
         print("  [Phase 4] Generating FRESH Polyglot project scaffold...")
 
         requirement = state["requirement"]
@@ -263,53 +292,14 @@ def generate_fresh_project(state: CodegenState) -> CodegenState:
 
 
 
-def eval_first_check(state: CodegenState) -> CodegenState:
-    """Check for goldenset.yaml before proceeding with code generation."""
-    workspace_path = state.get('workspace_path', '')
-    goldenset_path = os.path.join(workspace_path, 'goldenset.yaml')
 
-    if os.path.exists(goldenset_path):
-        audit(state.get('thread_id', 'unknown'), 'phase4', 'INFO', 'system', {
-            'message': 'Eval-First Check Passed: goldenset.yaml found.'
-        })
-        print("  [Phase 4] Eval-First Check: PASSED (goldenset.yaml found)")
-    else:
-        audit(state.get('thread_id', 'unknown'), 'phase4', 'WARNING', 'system', {
-            'message': 'Eval-First Check Failed: goldenset.yaml missing. Proceeding in SOFT MODE.'
-        })
-        print("  [Phase 4] Eval-First Check: WARNING (goldenset.yaml missing — soft mode)")
-
-    return state
 
 
 # -----------------------------------------
 # Nodes
 # -----------------------------------------
 
-def load_existing_code(state: CodegenState) -> CodegenState:
-    """Read current content of all affected files. For new projects, skip."""
-    print("\n[Phase 4] Loading existing code...")
 
-    impact = state.get("impact_report", {})
-    affected_files = impact.get("affected_files", [])
-
-    # If no affected files (new project) — skip loading
-    if not affected_files:
-        print("  [Phase 4] No existing files — NEW PROJECT, generating fresh")
-        return {**state, "existing_code": {}, "status": "NEW_PROJECT_NO_CODE"}
-
-    repo_path = os.getenv("REPO_PATH", r"C:\Users\user\leave-mgmt-backend")
-    existing_code = {}
-
-    for af in affected_files:
-        file_path = af["file_path"]
-        file_path_normalized = file_path.replace("\\", os.sep).replace("/", os.sep)
-        content = read_file_from_repo(repo_path, file_path_normalized)
-        if content:
-            existing_code[file_path] = content
-            print(f"  ✅ Loaded: {file_path} ({len(content)} chars)")
-
-    return {**state, "existing_code": existing_code, "status": "CODE_LOADED"}
 
 
 def build_context_packet(state: CodegenState) -> dict:
@@ -354,7 +344,9 @@ def generate_code_changes(state: CodegenState) -> CodegenState:
     
     if state.get("status") == "NEW_PROJECT_NO_CODE":
         return generate_fresh_project(state)
-
+    
+    impact = state.get("impact_report", {})
+    affected_files = impact.get("affected_files", [])
     context = build_context_packet(state)
     asp = state.get("scope_contract", {}) 
     requirement = state.get("requirement", "")
@@ -531,7 +523,7 @@ def build_codegen_graph():
     builder.add_node("generate_fresh_project", generate_fresh_project)
     builder.add_node("generate_code_changes", generate_code_changes)
     builder.add_node("validate_changes", validate_changes)
-    builder.add_node("run_critic_check", run_critic_check)
+    
 
     builder.set_entry_point("eval_first_check")
     builder.add_edge("eval_first_check", "load_existing_code")
