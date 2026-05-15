@@ -1,7 +1,7 @@
 import os
 import sys
 import re
-sys.path.insert(0, r"C:\Users\user\SDLC-V2")
+
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver

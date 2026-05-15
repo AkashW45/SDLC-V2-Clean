@@ -3,7 +3,7 @@ import sys
 import json
 import re
 import yaml
-sys.path.insert(0, r"C:\Users\user\SDLC-V2")
+
 
 from openai import OpenAI
 from langgraph.graph import StateGraph, END
@@ -89,7 +89,26 @@ def _extract_yaml_context(artifact: dict, keys: list) -> str:
     extracted = {k: artifact.get(k) for k in keys if k in artifact}
     return yaml.dump(extracted, sort_keys=False, default_flow_style=False)
 
-
+def _unwrap_artifact(artifact: dict) -> dict:
+    """
+    The ASP system prompts return {"type":..., "title":..., "body":{...}, "unit_counts":..., ...}.
+    Downstream code (UI, exporters, critic) expects the body's fields at the TOP LEVEL.
+    This flattens body.* up while preserving title and metadata.
+    """
+    if not isinstance(artifact, dict) or not artifact:
+        return artifact or {}
+    body = artifact.get("body")
+    if not isinstance(body, dict):
+        return artifact  # already flat (fallback or non-ASP shape)
+    flat = {**body}                                  # body fields become top-level
+    if artifact.get("title") and "title" not in flat:
+        flat["title"] = artifact["title"]
+    # Preserve ASP metadata for the ExpansionDecisionEngine downstream
+    for meta_key in ("type", "category", "confidence", "marginal_benefit",
+                     "unit_counts", "evidence_links", "traces_to"):
+        if meta_key in artifact:
+            flat[meta_key] = artifact[meta_key]
+    return flat
 # -----------------------------------------
 # Nodes
 # -----------------------------------------
@@ -221,8 +240,9 @@ SCOPE CONTRACT ENFORCEMENT:
 REQUIREMENT:
 {state['requirement']}
 """
-    brd = _llm_json(prompt)
-    if not brd: brd = {"title": state["requirement"][:80], "functional_requirements": []}
+    brd = _unwrap_artifact(_llm_json(prompt))
+    if not brd or not brd.get("title"):
+        brd = {"title": state["requirement"][:80], "functional_requirements": []}
 
     verdict = critique(brd, "brd", contract, state["requirement"])
     if verdict.get("verdict") == "REGENERATE":
@@ -252,8 +272,9 @@ BRD CONTEXT (YAML):
 
 REQUIREMENT: {state['requirement']}
 """
-    prd = _llm_json(prompt)
-    if not prd: prd = {"title": state["requirement"][:80], "functional_requirements": []}
+    prd = _unwrap_artifact(_llm_json(prompt))
+    if not prd or not prd.get("functional_requirements"):
+        prd = {"title": state["requirement"][:80], "functional_requirements": []}
 
     verdict = critique(prd, "prd", contract, state["requirement"], prior_artifacts={"brd": state.get("brd")})
     if verdict.get("verdict") == "REGENERATE":
@@ -283,8 +304,9 @@ PRD CONTEXT (YAML):
 
 REQUIREMENT: {state['requirement']}
 """
-    adr = _llm_json(prompt)
-    if not adr: adr = {"decisions": []}
+    adr = _unwrap_artifact(_llm_json(prompt))
+    if not adr or "decisions" not in adr:
+        adr = {"decisions": []}
 
     verdict = critique(adr, "adr", contract, state["requirement"])
     if verdict.get("verdict") == "REGENERATE":
@@ -317,8 +339,9 @@ PRD CONTEXT (YAML):
 ADR CONTEXT (YAML):
 {adr_context}
 """
-    arch = _llm_json(prompt)
-    if not arch: arch = {"nodes": [], "edges": []}
+    arch = _unwrap_artifact(_llm_json(prompt))
+    if not arch:
+        arch = {"system_name": state["requirement"][:50], "nodes": [], "edges": []}
 
     # Shantanu's Beautiful Mermaid Logic
     mermaid_lines = ["graph TD"]
@@ -365,13 +388,8 @@ ADR CONTEXT (YAML):
 
 
 def human_approval_gate(state: DiscoveryState) -> DiscoveryState:
-    interrupt({
-        "type": "DISCOVERY_REVIEW",
-        "brd": state.get("brd"),
-        "prd": state.get("prd"),
-        "adr": state.get("adr"),
-        "architecture": state.get("architecture")
-    })
+    # Static interrupt configured at compile-time (interrupt_before=...)
+    # This node body just passes state through.
     return state
 
 
@@ -399,6 +417,11 @@ def build_discovery_graph():
     g.add_edge("generate_adr", "generate_architecture")
     g.add_edge("generate_architecture", "human_approval_gate")
     g.add_edge("human_approval_gate", "process_approval")
+    
+
     g.add_edge("process_approval", END)
 
-    return g.compile(checkpointer=MemorySaver())
+    return g.compile(
+        checkpointer=MemorySaver(),
+        interrupt_before=["human_approval_gate"],
+    )

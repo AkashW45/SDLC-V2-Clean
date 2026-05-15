@@ -362,6 +362,51 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
     elif next_phase == "7": background_tasks.add_task(run_phase7, thread_id, "")
 
     return {"status": "APPROVED", "next_phase": next_phase}
+@app.post("/pipeline/{thread_id}/resume")
+def pipeline_resume(
+    thread_id: str,
+    body: dict = Body(default={}),
+    background_tasks: BackgroundTasks = None,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Resume a stuck/errored pipeline from a specific phase, reusing all saved state
+    (BRD/PRD/ADR/Architecture/Sprint/Impact/Code/Tests) from PostgreSQL.
+
+    Body: {"phase": 2}   # which phase to re-run; saved state from earlier phases is kept.
+    If "phase" omitted, resumes from the phase recorded in DB.
+    """
+    if thread_id not in pipeline_store:
+        raise HTTPException(404, f"Thread {thread_id} not found")
+
+    entry = pipeline_store[thread_id]
+    requested_phase = body.get("phase")
+    try:
+        phase = int(requested_phase) if requested_phase is not None else int(entry.get("phase", 1) or 1)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"Invalid phase: {requested_phase!r}")
+
+    if phase < 1 or phase > 7:
+        raise HTTPException(400, "phase must be between 1 and 7")
+
+    # Clear error fields; keep current_state intact so prior artifacts are reused
+    entry["status"] = f"PHASE_{phase}_RUNNING"
+    entry["sub_stage"] = f"Resuming Phase {phase}..."
+    entry["error"] = None
+    entry["phase"] = phase
+    audit(thread_id, f"phase{phase}", "RESUMED", body.get("actor", "user"),
+          {"from_status": entry.get("status", ""), "requested_phase": phase})
+    save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
+
+    if   phase == 1: background_tasks.add_task(run_phase1, thread_id, entry["requirement"], "")
+    elif phase == 2: background_tasks.add_task(run_phase2, thread_id, "")
+    elif phase == 3: background_tasks.add_task(run_phase3, thread_id, "")
+    elif phase == 4: background_tasks.add_task(run_phase4, thread_id)
+    elif phase == 5: background_tasks.add_task(run_phase5, thread_id)
+    elif phase == 6: background_tasks.add_task(run_phase6, thread_id, "")
+    elif phase == 7: background_tasks.add_task(run_phase7, thread_id, "")
+
+    return {"thread_id": thread_id, "status": "RESUMED", "resuming_from_phase": phase}
 
 @app.get("/pipeline/list")
 def pipeline_list():
@@ -438,33 +483,62 @@ def download_all(thread_id: str):
     entry = _get_pipeline_or_404(thread_id)
     state = entry["current_state"]
 
+    def _safe_write(z, name, producer):
+        """Run an exporter; on failure, log it and write a placeholder so the zip still builds."""
+        try:
+            content = producer()
+            if content is None:
+                content = f"# {name}\n\n_Not generated yet (phase has not run)._"
+            z.writestr(name, content)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[Download] '{name}' skipped: {e}")
+            placeholder = f"# {name}\n\n_Could not be exported — {type(e).__name__}: {e}_"
+            try:
+                z.writestr(name, placeholder)
+            except Exception:
+                pass
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(f"01_BRD.md", export_brd_markdown(state.get("brd", {})))
-        z.writestr(f"02_PRD.md", export_prd_markdown(state.get("prd", {})))
-        z.writestr(f"03_ADR.md", export_adr_markdown(state.get("adr", {})))
-        z.writestr(f"04_Architecture.md", export_architecture_markdown(state.get("architecture", {})))
-        z.writestr(f"05_SprintPlan.md", export_sprint_plan_markdown(state.get("sprint_plan", {}), state.get("jira_tickets", [])))
-        z.writestr(f"06_ImpactReport.md", export_impact_markdown(state.get("impact_report", {})))
-        z.writestr(f"07_Runbook.xlsx", export_runbook_excel(entry))
+        _safe_write(z, "01_BRD.md",          lambda: export_brd_markdown(state.get("brd", {})))
+        _safe_write(z, "02_PRD.md",          lambda: export_prd_markdown(state.get("prd", {})))
+        _safe_write(z, "03_ADR.md",          lambda: export_adr_markdown(state.get("adr", {})))
+        _safe_write(z, "04_Architecture.md", lambda: export_architecture_markdown(state.get("architecture", {})))
 
-        for change in state.get("generated_changes", []):
-            fname = change.get("file_path", "unknown.txt").replace("/", "_").replace("\\", "_")
-            z.writestr(f"08_code/{fname}", change.get("content", ""))
+        # Phase 2+ artifacts — may legitimately not exist yet
+        if state.get("sprint_plan") or state.get("jira_tickets"):
+            _safe_write(z, "05_SprintPlan.md",
+                        lambda: export_sprint_plan_markdown(state.get("sprint_plan", {}),
+                                                            state.get("jira_tickets", [])))
+        if state.get("impact_report"):
+            _safe_write(z, "06_ImpactReport.md",
+                        lambda: export_impact_markdown(state.get("impact_report", {})))
+        if state.get("sprint_plan") or state.get("runbook") or state.get("jira_tickets"):
+            _safe_write(z, "07_Runbook.xlsx", lambda: export_runbook_excel(entry))
 
-        for test in state.get("test_files", []):
-            fname = test.get("test_file_path", "test.py").replace("/", "_").replace("\\", "_")
-            z.writestr(f"09_tests/{fname}", test.get("content", ""))
+        # Phase 4 — generated code
+        for change in state.get("generated_changes", []) or []:
+            fname = (change.get("file_path") or "unknown.txt").replace("/", "_").replace("\\", "_")
+            _safe_write(z, f"08_code/{fname}", lambda c=change: c.get("content", ""))
 
-        from api.test_cases_export import export_test_cases_excel
-        try:
-            z.writestr("10_TestCases.xlsx", export_test_cases_excel(entry))
-        except Exception as e:
-            print(f"[Download] test cases skipped: {e}")
+        # Phase 5 — tests
+        for test in state.get("test_files", []) or []:
+            fname = (test.get("test_file_path") or "test.py").replace("/", "_").replace("\\", "_")
+            _safe_write(z, f"09_tests/{fname}", lambda t=test: t.get("content", ""))
+
+        # Test cases excel — only if Jira tickets exist
+        if state.get("jira_tickets"):
+            from api.test_cases_export import export_test_cases_excel
+            _safe_write(z, "10_TestCases.xlsx", lambda: export_test_cases_excel(entry))
 
     buf.seek(0)
-    return Response(content=buf.getvalue(), media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=Pipeline_{thread_id}_FullPackage.zip"})
-
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=Pipeline_{thread_id}_FullPackage.zip"},
+    ) 
 
 # ── Knowledge Layer Endpoints ─────────────────────────────────────────────────
 @app.post("/knowledge/index")
@@ -553,14 +627,17 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
 
         graph = build_discovery_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p1"}}
-        initial_state = DiscoveryState(requirement=requirement, brd={}, prd={}, adr={}, architecture={}, human_feedback=feedback, approved=False, status="STARTED")
+        initial_state = DiscoveryState(requirement=requirement,scope_contract={}, 
+            classifier_output={}, brd={}, prd={}, adr={}, architecture={}, human_feedback=feedback, approved=False, status="STARTED")
 
         for chunk in graph.stream(initial_state, config, stream_mode="updates"):
             for node_name, node_state in chunk.items():
                 if not isinstance(node_state, dict): continue
                 current = pipeline_store[thread_id].get("current_state", {})
                 for k, v in node_state.items():
-                    if k in ("brd", "prd", "adr", "architecture", "status"): current[k] = v
+                    if k in ("brd", "prd", "adr", "architecture", "status",
+                     "scope_contract", "classifier_output"): current[k] = v
+                      
                 pipeline_store[thread_id]["current_state"] = current
 
                 if node_name == "generate_brd": pipeline_store[thread_id]["sub_stage"] = "BRD Done — Generating PRD..."
@@ -573,7 +650,27 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
 
     except Exception as e:
-        pipeline_store[thread_id].update({"status": "ERROR", "error": f"Phase 1 error: {str(e)}"})
+        # GraphInterrupt is how LangGraph signals a pause for human approval — it is NOT an error.
+        from langgraph.errors import GraphInterrupt
+        if isinstance(e, GraphInterrupt):
+            pipeline_store[thread_id].update({
+                "status": "WAITING_PHASE_1_APPROVAL",
+                "sub_stage": "Discovery complete — Awaiting Review",
+            })
+            save_pipeline(
+                thread_id,
+                pipeline_store[thread_id],
+                _safe_state(pipeline_store[thread_id].get("current_state", {})),
+            )
+            return
+        import traceback
+        traceback.print_exc()   # so the real error shows in the uvicorn log
+        pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
+        save_pipeline(
+            thread_id,
+            pipeline_store[thread_id],
+            _safe_state(pipeline_store[thread_id].get("current_state", {})),
+        )
 
 def run_phase2(thread_id: str, feedback: str = ""):
     try:
@@ -595,7 +692,14 @@ def run_phase2(thread_id: str, feedback: str = ""):
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "status": "WAITING_PHASE_2_APPROVAL", "sub_stage": "Sprint plan ready — Awaiting approval"})
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # so the real error shows in the uvicorn log
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
+        save_pipeline(
+            thread_id,
+            pipeline_store[thread_id],
+            _safe_state(pipeline_store[thread_id].get("current_state", {})),
+        )
 
 def run_phase3(thread_id: str, feedback: str = ""):
     try:
@@ -616,7 +720,14 @@ def run_phase3(thread_id: str, feedback: str = ""):
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "status": "WAITING_PHASE_3_APPROVAL", "sub_stage": "Impact report ready — Awaiting approval"})
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # so the real error shows in the uvicorn log
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
+        save_pipeline(
+            thread_id,
+            pipeline_store[thread_id],
+            _safe_state(pipeline_store[thread_id].get("current_state", {})),
+        )
 
 def run_phase4(thread_id: str):
     try:
@@ -659,7 +770,14 @@ def run_phase4(thread_id: str):
        
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # so the real error shows in the uvicorn log
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
+        save_pipeline(
+            thread_id,
+            pipeline_store[thread_id],
+            _safe_state(pipeline_store[thread_id].get("current_state", {})),
+        )
 def run_phase5(thread_id: str):
     try:
         import sys
@@ -733,8 +851,14 @@ def run_phase5(thread_id: str):
 
         run_phase6(thread_id, "")
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # so the real error shows in the uvicorn log
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id].get("current_state", {})))
+        save_pipeline(
+            thread_id,
+            pipeline_store[thread_id],
+            _safe_state(pipeline_store[thread_id].get("current_state", {})),
+        )
 def run_phase6(thread_id: str, feedback: str = ""):
     try:
         from agents.phase6_delivery.delivery_agent import build_delivery_graph, DeliveryState
@@ -779,7 +903,14 @@ def run_phase6(thread_id: str, feedback: str = ""):
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # so the real error shows in the uvicorn log
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
+        save_pipeline(
+            thread_id,
+            pipeline_store[thread_id],
+            _safe_state(pipeline_store[thread_id].get("current_state", {})),
+        )
 
 
 def run_phase7(thread_id: str, feedback: str = ""):
@@ -804,7 +935,14 @@ def run_phase7(thread_id: str, feedback: str = ""):
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "status": "WAITING_PHASE_7_APPROVAL", "sub_stage": "Deployment plan ready — Awaiting production approval"})
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # so the real error shows in the uvicorn log
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
+        save_pipeline(
+            thread_id,
+            pipeline_store[thread_id],
+            _safe_state(pipeline_store[thread_id].get("current_state", {})),
+        )
 
 
 def _safe_state(state: dict) -> dict:

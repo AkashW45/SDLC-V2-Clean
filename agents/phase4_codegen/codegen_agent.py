@@ -51,13 +51,14 @@ class CodegenState(TypedDict):
 # Helpers
 # -----------------------------------------
 
-def call_llm(prompt: str) -> dict:
+def call_llm(prompt: str, max_tokens: int = 8192) -> str:
     response = client.chat.completions.create(
         model="deepseek-v4-pro",
         messages=[{"role": "user", "content": prompt}],
         stream=False,
         reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}}
+        extra_body={"thinking": {"type": "enabled"}},
+        max_tokens=max_tokens
     )
     return response.choices[0].message.content.strip()
 
@@ -106,8 +107,10 @@ def read_file_from_repo(repo_path: str, file_path: str) -> str:
 
 
 def validate_python(code: str, file_path: str) -> list:
-    """Validate Python syntax."""
+    """Validate Python syntax. Skip non-Python files (HTML, MD, JS, JSON, YAML, etc.)."""
     errors = []
+    if not file_path.endswith(".py"):
+        return errors
     try:
         ast.parse(code)
     except SyntaxError as e:
@@ -523,35 +526,31 @@ def build_codegen_graph():
     builder.add_node("generate_fresh_project", generate_fresh_project)
     builder.add_node("generate_code_changes", generate_code_changes)
     builder.add_node("validate_changes", validate_changes)
-    
 
+    # Single linear flow into the router
     builder.set_entry_point("eval_first_check")
     builder.add_edge("eval_first_check", "load_existing_code")
-    builder.add_edge("load_existing_code", "generate_code_changes")
-    builder.set_entry_point("load_existing_code")
 
+    # load_existing_code routes to ONE of two generators — no extra edges
     def route_after_load(state: CodegenState) -> str:
-        return "fresh" if state["status"] == "NEW_PROJECT_NO_CODE" else "existing"
+        return "fresh" if state.get("status") == "NEW_PROJECT_NO_CODE" else "existing"
 
     builder.add_conditional_edges(
         "load_existing_code",
         route_after_load,
-        {"fresh": "generate_fresh_project", "existing": "generate_code_changes"}
+        {"fresh": "generate_fresh_project", "existing": "generate_code_changes"},
     )
 
+    # Both generators converge on validation
     builder.add_edge("generate_fresh_project", "validate_changes")
     builder.add_edge("generate_code_changes", "validate_changes")
 
+    # Validation terminates the graph
     builder.add_conditional_edges(
         "validate_changes",
         route_after_validation,
-        {
-            "pass": END,
-            "fail": END
-        }
+        {"pass": END, "fail": END},
     )
-
-    builder.add_edge("run_critic_check", END)
 
     memory = MemorySaver()
     return builder.compile(checkpointer=memory)
@@ -561,12 +560,13 @@ def build_codegen_graph():
 # Run
 # -----------------------------------------
 
-def run_codegen(requirement: str, impact_report: dict, workspace_path: str, thread_id: str = "thread-codegen", adr: dict = None):
+def run_codegen(requirement: str, impact_report: dict, workspace_path: str, thread_id: str = "thread-codegen", adr: dict = None, scope_contract: dict = None):
     graph = build_codegen_graph()
     config = {"configurable": {"thread_id": thread_id}}
 
     initial_state = CodegenState(
         requirement=requirement,
+        scope_contract=scope_contract or {},
         impact_report=impact_report,
         adr=adr or {},
         existing_code={},

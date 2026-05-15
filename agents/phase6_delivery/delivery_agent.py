@@ -202,6 +202,14 @@ def create_pr(state: DeliveryState) -> DeliveryState:
     # Extract repo name from URL
     repo_name = repo_url.rstrip(".git").split("/")[-1]
 
+    # New project: code was pushed directly to default branch — no PR needed.
+    # GitHub can't open a PR from main → main, so we record the repo URL instead.
+    if branch_name in ("main", "master"):
+        push_url = f"https://github.com/{GITHUB_OWNER}/{repo_name}"
+        print(f"  ℹ️  New project — code pushed to {branch_name}, no PR needed.")
+        print(f"  Repo: {push_url}")
+        return {**state, "pr_urls": [push_url], "status": "PR_SKIPPED_NEW_PROJECT"}
+
     # Build PR body
     changes_summary = "\n".join([
         f"- `{c['file_path']}`: {c.get('change_summary', '')[:80]}"

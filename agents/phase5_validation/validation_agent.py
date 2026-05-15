@@ -54,13 +54,14 @@ class ValidationState(TypedDict):
 # Helpers
 # -----------------------------------------
 MODEL="deepseek-v4-flash"  # Using the same model as Main for consistency
-def call_llm(prompt: str) -> dict:
+def call_llm(prompt: str, max_tokens: int = 8192) -> str:
     response = client.chat.completions.create(
         model="deepseek-v4-pro",
         messages=[{"role": "user", "content": prompt}],
         stream=False,
         reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}}
+        extra_body={"thinking": {"type": "enabled"}},
+        max_tokens=max_tokens
     )
     return response.choices[0].message.content.strip()
 
@@ -198,6 +199,105 @@ def run_semgrep_gate(workspace_path: str) -> dict:
     except Exception:
         return {"status": "PASS", "reason": "Semgrep failed or not installed"}
 
+def run_pytest_sandbox(generated_changes: list, test_files: list, timeout: int = 120) -> dict:
+    """
+    Concurrent Pytest Sandbox:
+    1. Materialize generated code + test files into a temp directory
+    2. Install minimal deps (pytest itself; project deps optional via requirements.txt if generated)
+    3. Run pytest with --json-report-like flags, parse results
+    4. Return summary {passed, failed, errors, total, output, sandbox_path}
+
+    Tests that import the generated code resolve correctly because the temp dir
+    is added to PYTHONPATH for the subprocess.
+    """
+    import sys as _sys
+
+    # No Python files to test — nothing to do, but don't fail the phase
+    py_tests = [t for t in (test_files or []) if (t.get("test_file_path") or "").endswith(".py")]
+    if not py_tests:
+        return {"status": "SKIPPED", "reason": "No Python test files to execute",
+                "passed": 0, "failed": 0, "total": 0}
+
+    sandbox = tempfile.mkdtemp(prefix="sdlc_v2_pytest_")
+    try:
+        # 1. Write generated source files
+        for change in (generated_changes or []):
+            fpath = change.get("file_path", "")
+            content = change.get("content", "")
+            if not fpath or not content:
+                continue
+            full = os.path.join(sandbox, fpath.replace("\\", "/"))
+            os.makedirs(os.path.dirname(full) or sandbox, exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(content)
+
+        # 2. Write test files
+        for test in py_tests:
+            tpath = test.get("test_file_path", "")
+            tcontent = test.get("content", "")
+            if not tpath or not tcontent:
+                continue
+            full = os.path.join(sandbox, tpath.replace("\\", "/"))
+            os.makedirs(os.path.dirname(full) or sandbox, exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(tcontent)
+
+        # 3. Run pytest. Sandbox is on PYTHONPATH so tests can import generated code.
+        env = os.environ.copy()
+        env["PYTHONPATH"] = sandbox + os.pathsep + env.get("PYTHONPATH", "")
+
+        cmd = [_sys.executable, "-m", "pytest", sandbox, "-q",
+               "--tb=short", "--maxfail=50", "--no-header", "--disable-warnings"]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True, text=True,
+                cwd=sandbox, env=env, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "TIMEOUT", "reason": f"pytest exceeded {timeout}s",
+                    "passed": 0, "failed": 0, "total": 0,
+                    "sandbox_path": sandbox, "output": ""}
+        except FileNotFoundError:
+            return {"status": "SKIPPED", "reason": "pytest not installed in this Python",
+                    "passed": 0, "failed": 0, "total": 0,
+                    "sandbox_path": sandbox, "output": ""}
+
+        stdout = (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+        # 4. Parse pytest's summary line — works across pytest versions.
+        passed = failed = errors = 0
+        m = re.search(r"(\d+)\s+passed", stdout)
+        if m: passed = int(m.group(1))
+        m = re.search(r"(\d+)\s+failed", stdout)
+        if m: failed = int(m.group(1))
+        m = re.search(r"(\d+)\s+error", stdout)
+        if m: errors = int(m.group(1))
+        total = passed + failed + errors
+
+        # pytest exit codes: 0=ok, 1=tests failed, 2=interrupted, 5=no tests collected
+        if proc.returncode == 0:
+            status = "PASS"
+        elif proc.returncode == 5:
+            status = "NO_TESTS_COLLECTED"
+        else:
+            status = "FAIL"
+
+        return {
+            "status": status,
+            "passed": passed,
+            "failed": failed,
+            "errors": errors,
+            "total": total,
+            "exit_code": proc.returncode,
+            "output": stdout[-4000:],   # cap so it doesn't bloat the state
+            "sandbox_path": sandbox,
+        }
+    except Exception as e:
+        return {"status": "ERROR", "reason": str(e),
+                "passed": 0, "failed": 0, "total": 0,
+                "sandbox_path": sandbox, "output": ""}
 
 def run_validation(state: ValidationState) -> ValidationState:
     """Run all validation checks on generated code and tests."""
@@ -212,8 +312,9 @@ def run_validation(state: ValidationState) -> ValidationState:
         "total": 0
     }
 
+    
     # Validate generated code files
-    for change in state["generated_changes"]:
+    for change in state.get("generated_changes", []) or []:
         file_path = change.get("file_path", "")
         content = change.get("content", "")
 
@@ -236,7 +337,8 @@ def run_validation(state: ValidationState) -> ValidationState:
         results["total"] += 1
 
     # Validate test files
-    for test_file in state["test_files"]:
+    # Validate test files
+    for test_file in state.get("test_files", []) or []:
         test_path = test_file.get("test_file_path", "")
         test_content = test_file.get("content", "")
 
@@ -249,47 +351,52 @@ def run_validation(state: ValidationState) -> ValidationState:
                 print(f"  ✅ {test_path}: test syntax valid")
 
     # Run Semgrep security gate
+    # Run Semgrep security gate
     print("\n[Phase 5] Running Semgrep security analysis...")
-    gate_result = run_semgrep_gate(state['workspace_path'])
+    gate_result = run_semgrep_gate(state.get('workspace_path', ''))
     if gate_result['status'] == 'BLOCKED':
         print(f"  ❌ Security gate BLOCKED: {gate_result['reason']}")
-        save_artifact(state['thread_id'], 'semgrep_report', json.dumps(gate_result))
+        save_artifact(state.get('thread_id', 'unknown'), 'semgrep_report', json.dumps(gate_result))
         return {**state, "status": "BLOCKED", "validation_results": results}
-    else:
-        print("  ✅ Security gate PASSED")
+    print("  ✅ Security gate PASSED")
 
-    # Determine overall status
+    # ── PYTEST SANDBOX EXECUTION ────────────────────────────────────────
+    print("\n[Phase 5] Executing pytest in sandbox...")
+    pytest_result = run_pytest_sandbox(
+        generated_changes=state.get("generated_changes", []) or [],
+        test_files=state.get("test_files", []) or [],
+        timeout=120,
+    )
+    results["pytest"] = pytest_result
+    print(f"  pytest status: {pytest_result['status']} | "
+          f"{pytest_result['passed']} passed, {pytest_result['failed']} failed, "
+          f"{pytest_result.get('errors', 0)} errors")
+
+    # If no Python files were generated (e.g., pure HTML/MD project), there's
+    # nothing meaningful to test or retry — accept and move on.
+    has_python_files = any(
+        (c.get("file_path") or "").endswith(".py")
+        for c in state.get("generated_changes", []) or []
+    )
+    if not has_python_files:
+        print("  ℹ️  No Python files in this project — skipping test requirement.")
+        return {**state, "validation_results": results, "status": "VALIDATION_PASSED"}
+
+    # Standard pass/fail decision
     has_errors = (
-        len(results["syntax_checks"]) > 0 or
-        len(results["test_syntax_checks"]) > 0
+        len(results["syntax_checks"]) > 0
+        or len(results["test_syntax_checks"]) > 0
+        or pytest_result["status"] in ("FAIL", "TIMEOUT", "ERROR")
     )
 
     if has_errors:
-        status = "VALIDATION_FAILED"
         print(f"\n  ❌ Validation failed — {results['failed']}/{results['total']} files have errors")
-    else:
-        status = "VALIDATION_PASSED"
-        print(f"\n  ✅ Validation passed — {results['passed']}/{results['total']} files clean")
+        return {**state, "validation_results": results, "status": "VALIDATION_FAILED"}
 
-    return {**state, "validation_results": results, "status": status}
+    print(f"\n  ✅ Validation passed — {results['passed']}/{results['total']} files clean")
+    return {**state, "validation_results": results, "status": "VALIDATION_PASSED"}
 
-def run_critic_check(state: ValidationState) -> ValidationState:
-    scope_contract = state.get("scope_contract", {})
-    if not scope_contract or not state.get("test_files", []):
-        return state
 
-    try:
-        result = critique(
-            artifact={"test_files": state["test_files"]},
-            artifact_type="tests",
-            scope_contract=scope_contract,
-            original_requirement=state["requirement"]
-        )
-        verdict = result.get("verdict", "ACCEPT")
-        print(f"  [Critic] Verdict on tests: {verdict}")
-    except Exception:
-        pass
-    return state
 
 def route_after_validation(state: ValidationState) -> str:
     if state["status"] == "VALIDATION_PASSED":
@@ -322,25 +429,20 @@ def build_validation_graph():
     builder.add_node("generate_tests", generate_tests)
     builder.add_node("run_validation", run_validation)
     builder.add_node("increment_retry", increment_retry)
-    builder.add_node("run_critic_check", run_critic_check)
+
     builder.set_entry_point("generate_tests")
     builder.add_edge("generate_tests", "run_validation")
 
     builder.add_conditional_edges(
         "run_validation",
         route_after_validation,
-        {
-            "pass": END,
-            "retry": "increment_retry",
-            "fail": END
-        }
+        {"pass": END, "retry": "increment_retry", "fail": END},
     )
 
     builder.add_edge("increment_retry", "generate_tests")
-    builder.add_edge("run_critic_check", END)
+
     memory = MemorySaver()
     return builder.compile(checkpointer=memory)
-
 
 # -----------------------------------------
 # Run
@@ -349,18 +451,23 @@ def build_validation_graph():
 def run_validation_phase(
     requirement: str,
     generated_changes: list,
-    thread_id: str = "thread-validation"
+    thread_id: str = "thread-validation",
+    scope_contract: dict = None,
+    workspace_path: str = "",
 ) -> dict:
     graph = build_validation_graph()
     config = {"configurable": {"thread_id": thread_id}}
 
     initial_state = ValidationState(
         requirement=requirement,
+        scope_contract=scope_contract or {},
         generated_changes=generated_changes,
         test_files=[],
         validation_results={},
         retry_count=0,
-        status="STARTED"
+        status="STARTED",
+        thread_id=thread_id,
+        workspace_path=workspace_path,
     )
 
     print("\n" + "="*50)

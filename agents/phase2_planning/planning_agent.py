@@ -18,7 +18,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from api.jira_client import fetch_jira_metadata
 from api.persistence import save_artifact
-from core.llm_gateway import gateway
+
 from dotenv import load_dotenv
 
 load_dotenv()
