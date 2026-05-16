@@ -158,7 +158,8 @@ body { background:var(--bg); color:var(--text); font-family:'JetBrains Mono',mon
 <div class="toast" id="toast"></div>
 
 <script>
-const API = 'http://localhost:8001';
+const API = '';  // empty = same-origin requests, works whether you use localhost or 127.0.0.1
+const API_KEY = 'sdlc-dev-key-12345';
 let activePipelines = {};  // thread_id -> pipeline data
 let selectedThread = null;
 let pollInterval = null;
@@ -188,46 +189,179 @@ async function checkHealth() {
 }
 
 async function launchPipeline() {
-  const req = document.getElementById('req-input').value.trim();
-  if (!req) { showToast('Enter a requirement first', 'error'); return; }
-
-  const btn = document.getElementById('launch-btn');
-  btn.disabled = true;
-  btn.textContent = '...';
+  const inputEl = document.getElementById('req-input');
+  if (!inputEl) {
+    alert('Could not find requirement input. Element id "req-input" missing.');
+    return;
+  }
+  const req = inputEl.value.trim();
+  if (!req) return alert('Please enter a requirement first.');
 
   try {
-    const r = await fetch(`${API}/pipeline/start`, {
+    const resp = await fetch('/pipeline/preview-routing', {
       method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'X-API-Key': API_KEY 
-      },
-      body: JSON.stringify({ requirement: req })
+      headers: {'X-API-Key': API_KEY, 'Content-Type': 'application/json'},
+      body: JSON.stringify({requirement: req}),
     });
-    const d = await r.json();
-
-    if (d.thread_id) {
-      activePipelines[d.thread_id] = {
-        thread_id: d.thread_id,
-        requirement: req,
-        status: 'STARTING',
-        phase: 1,
-        current_state: {},
-        pr_urls: []
-      };
-      selectedThread = d.thread_id;
-      showToast(`Pipeline started: ${d.thread_id}`, 'success');
-      renderSidebar();
-      renderContent();
-    } else {
-      showToast('Failed to start pipeline', 'error');
+    if (!resp.ok) {
+      const text = await resp.text();
+      return alert(`Preview failed (${resp.status}): ${text}`);
     }
-  } catch(e) {
-    showToast('Cannot reach API: ' + e.message, 'error');
+    const preview = await resp.json();
+    showRoutingModal(req, preview);
+  } catch (e) {
+    alert('Network error: ' + e.message);
+  }
+}
+
+function ensureModalContainer() {
+  let el = document.getElementById('modal-container');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'modal-container';
+    el.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.8);
+      display: none; align-items: center; justify-content: center;
+      z-index: 9999; padding: 20px;`;
+    el.addEventListener('click', (e) => {
+      if (e.target === el) closeModal();
+    });
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+function showRoutingModal(requirement, preview) {
+  const container = ensureModalContainer();
+  const candidates = preview.candidates || [];
+  const allProjects = preview.all_projects || [];
+  const newSlug = preview.new_project_preview?.slug || 'new-project';
+
+  // Collect unique repo names across all registered projects (for manual mode)
+  const allRepos = Array.from(new Set(
+    allProjects.flatMap(p => p.repos || []).filter(r => typeof r === 'string')
+  )).sort();
+
+  const candidatesHtml = candidates.length ? candidates.map((c, i) => `
+    <label style="display:block;padding:12px;border:1px solid #2a3a4a;border-radius:6px;margin-bottom:6px;cursor:pointer;background:#0f1620">
+      <input type="radio" name="route" value="existing:${c.id}" data-repos='${JSON.stringify(c.repos || [])}' ${i===0?'checked':''} />
+      <strong style="color:#00ff88">${c.name || c.id}</strong>
+      <span style="font-size:10px;color:#00d4ff;margin-left:8px">match: ${(c.score*100).toFixed(0)}%</span>
+      <div style="font-size:10px;color:#888;margin-top:4px">
+        ${(c.repos || []).join(', ') || 'no repos'}
+      </div>
+      <div style="font-size:10px;color:#666;margin-top:2px">${(c.description || '').slice(0, 100)}</div>
+    </label>
+  `).join('') : '<div style="color:#888;font-size:11px;padding:10px">No semantic matches found.</div>';
+
+  const reposHtml = allRepos.map(r => `
+    <label style="display:inline-block;padding:5px 10px;margin:3px;border:1px solid #2a3a4a;border-radius:14px;font-size:10px;cursor:pointer;color:#ccc">
+      <input type="checkbox" name="manual_repo" value="${r}" /> ${r}
+    </label>
+  `).join('');
+
+  container.innerHTML = `
+    <div style="background:#0a0e14;border:1px solid #1a2532;border-radius:10px;padding:24px;max-width:640px;width:100%;max-height:85vh;overflow-y:auto;color:#ccc;font-family:'JetBrains Mono',monospace">
+      <div style="font-size:11px;color:#888;letter-spacing:1.5px;margin-bottom:14px">
+        WHERE SHOULD THIS REQUIREMENT GO?
+      </div>
+      <div style="font-size:13px;color:#fff;margin-bottom:18px;padding:10px;background:#0f1620;border-radius:6px;border-left:3px solid #00ff88">
+        "${requirement.replace(/</g,'&lt;')}"
+      </div>
+
+      <div style="font-size:9px;color:#666;margin-bottom:8px">SUGGESTED MATCHES</div>
+      ${candidatesHtml}
+
+      <div style="font-size:9px;color:#666;margin:16px 0 8px">— OR —</div>
+
+      <label style="display:block;padding:12px;border:1px solid #2a3a4a;border-radius:6px;margin-bottom:6px;cursor:pointer;background:#0f1620">
+        <input type="radio" name="route" value="new" />
+        <strong style="color:#00d4ff">⚡ Start fresh</strong>
+        <span style="color:#888;margin-left:8px">— new project <code style="color:#fff">${newSlug}</code></span>
+      </label>
+
+      <label style="display:block;padding:12px;border:1px solid #2a3a4a;border-radius:6px;margin-bottom:6px;cursor:pointer;background:#0f1620">
+        <input type="radio" name="route" value="manual" />
+        <strong style="color:#ffaa00">✋ Let me pick repos manually</strong>
+      </label>
+
+      <div id="manual-repo-picker" style="display:none;margin-top:10px;padding:10px;background:#0f1620;border-radius:6px">
+        <div style="font-size:9px;color:#666;margin-bottom:8px">SELECT REPO(S)</div>
+        ${reposHtml || '<div style="color:#888;font-size:10px">No repos registered yet. Run /knowledge/projects/sync first.</div>'}
+      </div>
+
+      <div style="margin-top:20px;display:flex;gap:8px;justify-content:flex-end">
+        <button onclick="closeModal()" style="background:#1a2532;color:#ccc;padding:10px 18px;border:none;border-radius:5px;cursor:pointer;font-family:inherit">
+          Cancel
+        </button>
+        <button id="commit-routing-btn" style="background:#00ff88;color:#000;font-weight:700;padding:10px 18px;border:none;border-radius:5px;cursor:pointer;font-family:inherit">
+          ▶ Launch Pipeline
+        </button>
+      </div>
+    </div>
+  `;
+  container.style.display = 'flex';
+
+  // Wire up the commit button without inline onclick (avoids quote-escaping bugs)
+  document.getElementById('commit-routing-btn').onclick = () => commitRouting(requirement);
+
+  // Toggle manual picker visibility
+  container.querySelectorAll('input[name="route"]').forEach(r => {
+    r.addEventListener('change', () => {
+      const manualBox = document.getElementById('manual-repo-picker');
+      manualBox.style.display = (r.value === 'manual' && r.checked) ? 'block' : 'none';
+    });
+  });
+}
+
+function closeModal() {
+  const el = document.getElementById('modal-container');
+  if (el) el.style.display = 'none';
+}
+
+async function commitRouting(requirement) {
+  const chosen = document.querySelector('input[name="route"]:checked');
+  if (!chosen) return alert('Pick a routing option first');
+
+  let routing_choice;
+  const value = chosen.value;
+
+  if (value === 'new') {
+    routing_choice = {mode: 'new'};
+  } else if (value === 'manual') {
+    const repos = Array.from(
+      document.querySelectorAll('input[name="manual_repo"]:checked')
+    ).map(c => c.value);
+    if (!repos.length) return alert('Pick at least one repo or choose "Start fresh"');
+    routing_choice = {mode: 'manual', repo_names: repos};
+  } else if (value.startsWith('existing:')) {
+    const project_id = value.slice('existing:'.length);
+    let repo_names = [];
+    try {
+      repo_names = JSON.parse(chosen.getAttribute('data-repos') || '[]');
+    } catch (e) {}
+    routing_choice = {mode: 'existing', project_id, repo_names};
   }
 
-  btn.disabled = false;
-  btn.textContent = '▶ Launch Pipeline';
+  try {
+    const resp = await fetch('/pipeline/start', {
+      method: 'POST',
+      headers: {'X-API-Key': API_KEY, 'Content-Type': 'application/json'},
+      body: JSON.stringify({requirement, routing_choice}),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      return alert(`Launch failed (${resp.status}): ${text}`);
+    }
+    const data = await resp.json();
+    closeModal();
+    // The dashboard polls /pipeline/status — it'll pick up the new thread automatically
+    if (typeof watchPipeline === 'function') {
+      watchPipeline(data.thread_id);
+    }
+  } catch (e) {
+    alert('Network error: ' + e.message);
+  }
 }
 
 async function pollAll() {
@@ -688,13 +822,20 @@ function renderContent() {
           </div>`).join('')}
       </div>`;
 
-      // Use pre-generated mermaid from backend
       if (arch.mermaid) {
-        html += `<div style="background:var(--surface2);border-radius:8px;padding:16px;margin-bottom:12px;overflow-x:auto">
-          <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px">Architecture Diagram</div>
-          <div class="mermaid">${arch.mermaid}</div>
-        </div>`;
-      }
+  // Base64-encode the mermaid source so HTML parsing doesn't mangle quotes/newlines
+  const encoded = btoa(unescape(encodeURIComponent(arch.mermaid)));
+  // Use the encoded string as a stable key so we know whether it changed
+  const cacheKey = 'mer-' + encoded.slice(0, 32);
+  const cached = mermaidCache[encoded];
+
+  html += `<div style="background:var(--surface2);border-radius:8px;padding:16px;margin-bottom:12px;overflow-x:auto">
+    <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px">Architecture Diagram</div>
+    <div class="mermaid-container" data-mermaid="${encoded}" data-cache-key="${cacheKey}">
+      ${cached || '<div style="color:var(--text3);font-size:11px;padding:20px;text-align:center"><span class="spinner" style="display:inline-block;margin-right:6px"></span>Rendering diagram...</div>'}
+    </div>
+  </div>`;
+}
 
       // Component cards
       html += `<div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin:10px 0 6px">Components</div>`;
@@ -979,31 +1120,56 @@ function renderContent() {
     html += sectionClose();
   }
   
-    // ADD THESE TWO LINES:
-    el.innerHTML = html; 
-    // *** ANTI-FLICKER RENDERING EXECUTION ***
-  // Only process nodes that haven't been cached and rendered yet.
+    el.innerHTML = html;
+
+  // Render Mermaid diagrams that aren't cached yet
   setTimeout(async () => {
     const nodes = el.querySelectorAll('.mermaid-container');
-    for (let node of nodes) {
-      const rawCode = decodeURIComponent(escape(atob(node.getAttribute('data-raw'))));
-      try {
-        const id = 'mermaid-svg-' + Date.now() + '-' + Math.floor(Math.random()*1000);
-        const { svg } = await mermaid.render(id, rawCode);
+    for (const node of nodes) {
+      // Skip if this node already contains an SVG (cached or already rendered)
+      if (node.querySelector('svg')) continue;
 
-        // Save to cache so the next poll uses the SVG instantly!
-        mermaidCache[rawCode] = svg;
-        node.outerHTML = svg;
-      } catch(err) {
-        console.warn('Mermaid error:', err);
-        const errHtml = `<pre style="color:var(--danger);font-size:10px">${esc(rawCode)}</pre>`;
-        mermaidCache[rawCode] = errHtml; // Cache the error so it stops trying
-        node.outerHTML = errHtml;
+      const encoded = node.getAttribute('data-mermaid');
+      if (!encoded) continue;
+
+      // Check cache first
+      if (mermaidCache[encoded]) {
+        node.innerHTML = mermaidCache[encoded];
+        continue;
+      }
+
+      let rawCode;
+      try {
+        rawCode = decodeURIComponent(escape(atob(encoded)));
+      } catch (e) {
+        node.innerHTML = `<div style="color:var(--danger);font-size:10px;padding:10px">Failed to decode mermaid source</div>`;
+        continue;
+      }
+
+      // Ensure newlines — backend should send these but defensive
+      if (!rawCode.includes('\n') && rawCode.length > 30) {
+        // Try to split a one-line graph TD into separate statements
+        rawCode = rawCode
+          .replace(/^graph\s+(TD|LR|BT|RL)\s+/, 'graph $1\n  ')
+          .replace(/\s+(classDef\s)/g, '\n  $1')
+          .replace(/\s+(class\s+[A-Z_0-9]+\s+\w+Style)/g, '\n  $1')
+          .replace(/(\]|\))\s+([A-Z_][A-Z_0-9]*\s*(\[|\(|--))/g, '$1\n  $2');
+      }
+
+      try {
+        const id = 'mermaid-svg-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
+        const { svg } = await mermaid.render(id, rawCode);
+        mermaidCache[encoded] = svg;
+        node.innerHTML = svg;
+      } catch (err) {
+        console.warn('Mermaid render error:', err, '\nSource:\n', rawCode);
+        const errHtml = `<details style="font-size:10px"><summary style="color:var(--danger);cursor:pointer;padding:8px">Diagram render failed — click to see source</summary><pre style="color:var(--text2);background:var(--surface3);padding:10px;border-radius:4px;margin-top:6px;white-space:pre-wrap;font-size:10px">${esc(rawCode)}</pre></details>`;
+        mermaidCache[encoded] = errHtml;
+        node.innerHTML = errHtml;
       }
     }
   }, 50);
-
-}    
+}
 // ── UI Helpers ──────────────────────────────────────────────────────
 
 function sectionHeader(num, title, needsApproval) {
@@ -1111,6 +1277,42 @@ function selectThread(tid) {
   renderPipelineBar();
   renderContent();
 }
+function watchPipeline(threadId) {
+  // Register the new pipeline so pollAll() picks it up
+  if (!activePipelines[threadId]) {
+    activePipelines[threadId] = { thread_id: threadId, status: 'STARTED' };
+  }
+  selectedThread = threadId;
+  pollAll();        // immediate first poll, don't wait 3s
+  renderSidebar();
+  renderContent();
+}
+
+async function discoverActivePipelines() {
+  // On page load, ask backend for all known pipelines so they show in sidebar
+  try {
+    const r = await fetch(`${API}/pipeline/list`, {
+      headers: { 'X-API-Key': API_KEY }
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    const pipelines = data.pipelines || data || [];
+    for (const p of pipelines) {
+      const tid = p.thread_id || p.id;
+      if (tid && !activePipelines[tid]) {
+        activePipelines[tid] = p;
+      }
+    }
+    if (!selectedThread && pipelines.length) {
+      selectedThread = pipelines[0].thread_id || pipelines[0].id;
+    }
+    renderSidebar();
+    renderPipelineBar();
+    renderContent();
+  } catch(e) {
+    console.warn('Pipeline discovery failed:', e);
+  }
+}
 
 function showToast(msg, type='info') {
   const t = document.getElementById('toast');
@@ -1122,6 +1324,7 @@ function showToast(msg, type='info') {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 checkHealth();
+discoverActivePipelines();   // ← NEW: load existing pipelines into UI
 setInterval(checkHealth, 30000);
 setInterval(pollAll, 3000);
 renderContent();

@@ -78,13 +78,27 @@ def _encode(query: str) -> tuple:
     return tuple(embedder.encode(query).tolist())
 
 
-def semantic_search(query: str, top_k: int = 3) -> list:
-    """Find the most relevant files. top_k=3 to enforce Context Precision."""
+def semantic_search(query: str, top_k: int = 3, repo_names: list = None) -> list:
+    """
+    Find the most relevant files. If repo_names is provided, results are scoped
+    to those repos only — preventing impact analysis from bleeding into projects
+    the user didn't select.
+    """
+    from qdrant_client.http.models import Filter, FieldCondition, MatchAny
+
     query_vector = list(_encode(query))
+
+    qdrant_filter = None
+    if repo_names:
+        # Filter to repos the user actually selected
+        qdrant_filter = Filter(
+            must=[FieldCondition(key="repo_name", match=MatchAny(any=repo_names))]
+        )
 
     results = qdrant_client.query_points(
         collection_name="code_embeddings",
         query=query_vector,
+        query_filter=qdrant_filter,
         limit=top_k,
         with_payload=True,
     )
@@ -284,7 +298,8 @@ Assess the risk and return ONLY valid JSON:
 # Main Impact Analysis Runner
 # -----------------------------------------
 
-def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None) -> dict:
+def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None,
+                        selected_repos: list = None) -> dict:
     """
     Execution order:
     1. Semantic search (Qdrant) — sequential
@@ -304,7 +319,14 @@ def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None) ->
 
     # 1. Semantic Search
     print("\n[Step 1] Semantic search across indexed repos...")
-    hits = semantic_search(requirement, top_k=3)
+    # Scope semantic search to the selected repos so we don't bleed into other projects
+    selected_repo_names = [
+    r if isinstance(r, str) else r.get("name")
+    for r in (selected_repos or [])
+    if (r if isinstance(r, str) else r.get("name"))
+]
+    hits = semantic_search(requirement, top_k=8, repo_names=selected_repo_names or None)
+    print(f"  Scoped to repos: {selected_repo_names or 'ALL'}")
     print(f"  Found {len(hits)} relevant symbols")
 
     if not hits:

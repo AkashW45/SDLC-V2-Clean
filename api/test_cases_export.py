@@ -18,51 +18,36 @@ GREEN_LIGHT = "E8F5E9"
 WHITE = "FFFFFF"
 
 
-def generate_test_cases_for_story(story: dict) -> list:
-    """Generate test cases for a single user story using LLM."""
-    title = story.get("title", "")
-    description = story.get("description", "")
-    ac_list = story.get("acceptance_criteria", [])
+def generate_test_cases_for_story(story: dict, epic: dict = None) -> list:
+    """Generate test cases using the anti-hallucination generator from AI Control Plane."""
+    from services.test_case_generator import generate_test_cases, story_to_jira_context
 
-    prompt = f"""
-You are a senior QA engineer.
-Generate test cases for this user story.
+    ctx = story_to_jira_context(story, epic=epic, project="SDLC")
+    result = generate_test_cases(ctx)
+    suite = result.get("test_suite", []) or []
 
-STORY: {title}
-DESCRIPTION: {description}
-ACCEPTANCE CRITERIA:
-{json.dumps(ac_list, indent=2)}
-
-Return ONLY valid JSON:
-{{
-  "test_cases": [
-    {{
-      "tc_id": "TC-001",
-      "title": "test case title",
-      "type": "positive | negative | edge | security",
-      "preconditions": "what must be true before",
-      "steps": ["step 1", "step 2", "step 3"],
-      "expected_result": "what should happen",
-      "priority": "P1 | P2 | P3"
-    }}
-  ]
-}}
-
-Generate 4-6 test cases covering positive, negative, edge cases.
-"""
-    try:
-        content = gateway.generate(
-            prompt=prompt,
-            model="deepseek-chat",
-            temperature=0.2,
-            max_tokens=2000
-        ).strip()
-        if content.startswith("```"):
-            content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
-        return json.loads(content).get("test_cases", [])
-    except Exception as e:
-        print(f"[TestCases] generation failed for {title}: {e}")
-        return []
+    # Adapt the AI Control Plane output shape to your existing Excel writer's expectations.
+    # Excel writer expects: tc_id, title, type, preconditions, steps, expected_result, priority
+    adapted = []
+    for tc in suite:
+        cat = (tc.get("category") or "").lower()
+        # Map AI Control Plane categories → your existing color/type mapping
+        if cat in ("negative", "edge case"):
+            t = "negative" if cat == "negative" else "edge"
+        elif cat in ("functional", "integration", "regression", "reproduction"):
+            t = "positive"
+        else:
+            t = "positive"
+        adapted.append({
+            "tc_id": tc.get("id", ""),
+            "title": tc.get("title", ""),
+            "type": t,
+            "preconditions": tc.get("preconditions", ""),
+            "steps": tc.get("steps", []),
+            "expected_result": tc.get("expected_result", ""),
+            "priority": tc.get("priority", "P2"),
+        })
+    return adapted
 
 
 def export_test_cases_excel(pipeline_state: dict) -> bytes:
@@ -115,7 +100,7 @@ def export_test_cases_excel(pipeline_state: dict) -> bytes:
                 # Story tickets are usually indexed after epic tickets
                 pass
 
-            test_cases = generate_test_cases_for_story(story)
+            test_cases = generate_test_cases_for_story(story, epic=epic)
 
             for tc in test_cases:
                 tc_id = f"TC-{tc_counter:03d}"

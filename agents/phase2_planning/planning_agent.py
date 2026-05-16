@@ -86,45 +86,97 @@ def call_llm(prompt: str) -> dict:
 
 def generate_sprint_plan(state: PlanningState) -> PlanningState:
     print("\n[Phase 2] Generating sprint plan...")
+    from agents.prompts.system_prompts import SPRINT_PLANNER_SYSTEM
 
+    scope_contract = state.get("scope_contract", {})
     prd = state["prd"]
-    requirements = prd.get("functional_requirements", [])
+    selected_repos = state.get("selected_repos", [])
 
-    sprint_plan = call_llm(f"""
-You are a senior Scrum Master and Product Owner.
-Generate a sprint plan from this PRD.
-Return ONLY valid JSON:
-{{
-  "project": "LEAVE-MGMT",
-  "sprint_duration": "2 weeks",
-  "epics": [
-    {{
-      "epic_id": "EP-001",
-      "title": "...",
-      "description": "...",
-      "business_goal": "...",
-      "affected_repos": ["leave-mgmt-backend"],
-      "risk_level": "medium",
-      "stories": [
-        {{
-          "story_id": "US-001",
-          "title": "...",
-          "description": "As a [user] I want [goal] so that [benefit]",
-          "acceptance_criteria": ["...", "..."],
-          "story_points": 3,
-          "affected_repo": "leave-mgmt-backend",
-          "labels": ["backend"]
-        }}
-      ]
-    }}
-  ]
-}}
+    prompt = f"""{SPRINT_PLANNER_SYSTEM}
 
-PRD functional requirements:
-{json.dumps(requirements, indent=2)}
+SCOPE CONTRACT:
+{json.dumps(scope_contract, indent=2)}
 
-Requirement: {state['requirement']}
-""")
+PRD:
+{json.dumps(prd, indent=2)}
+
+TARGET REPOSITORIES (use real repo names in affected_repos):
+{json.dumps(selected_repos, indent=2)}
+
+USER REQUIREMENT: {state['requirement']}
+
+Generate the sprint plan and Jira tickets per the ABSOLUTE RULES above.
+"""
+
+    sprint_plan = call_llm(prompt)
+
+    # SPRINT_PLANNER_SYSTEM returns the data wrapped in `body` — unwrap it
+    # to keep backward compatibility with the rest of the planning_agent code.
+    if isinstance(sprint_plan, dict) and "body" in sprint_plan:
+        body = sprint_plan["body"]
+        # Convert ASP shape (sprint_plan + jira_tickets) → legacy shape (epics + stories)
+        if "sprint_plan" in body or "jira_tickets" in body:
+            tickets = body.get("jira_tickets", [])
+            sprints = body.get("sprint_plan", {}).get("sprints", [])
+
+            # Group tickets by epic if hierarchy exists, else flatten as single epic
+            epics_map = {}
+            standalone = []
+            for t in tickets:
+                if t.get("type") == "Epic":
+                    epics_map[t["id"]] = {
+                        "epic_id": t["id"],
+                        "title": t.get("summary", ""),
+                        "description": t.get("description", ""),
+                        "business_goal": t.get("description", "")[:200],
+                        "affected_repos": [r.get("name") for r in selected_repos if isinstance(r, dict)],
+                        "risk_level": "medium",
+                        "stories": [],
+                    }
+                elif t.get("type") in ("Story", "Task", "Subtask"):
+                    standalone.append(t)
+
+            for t in standalone:
+                story = {
+                    "story_id": t["id"],
+                    "title": t.get("summary", ""),
+                    "description": t.get("description", ""),
+                    "acceptance_criteria": t.get("acceptance_criteria", []),
+                    "story_points": t.get("story_points", 3),
+                    "affected_repo": (selected_repos[0].get("name") if selected_repos
+                                      and isinstance(selected_repos[0], dict) else ""),
+                    "labels": t.get("labels", []),
+                    "priority": t.get("priority", "P2"),
+                    "depends_on": t.get("depends_on", []),
+                    "traces_to_prd": t.get("traces_to_prd", ""),
+                    "sprint": t.get("sprint", 1),
+                }
+                parent = t.get("parent_ticket")
+                if parent and parent in epics_map:
+                    epics_map[parent]["stories"].append(story)
+                else:
+                    # No parent Epic — create a default one if none exist
+                    if not epics_map:
+                        epics_map["EP-001"] = {
+                            "epic_id": "EP-001",
+                            "title": prd.get("title", "Main Epic"),
+                            "description": "Auto-generated default epic",
+                            "business_goal": "",
+                            "affected_repos": [r.get("name") for r in selected_repos
+                                               if isinstance(r, dict)],
+                            "risk_level": "medium",
+                            "stories": [],
+                        }
+                    list(epics_map.values())[0]["stories"].append(story)
+
+            sprint_plan = {
+                "project": prd.get("title", "PROJECT"),
+                "sprint_duration": f"{body.get('sprint_plan', {}).get('sprint_length_days', 14)} days",
+                "epics": list(epics_map.values()),
+                "_total_sprints": body.get("sprint_plan", {}).get("total_sprints", 1),
+                "_raw_sprints": sprints,
+                "_unit_counts": sprint_plan.get("unit_counts", {}),
+            }
 
     epics = sprint_plan.get("epics", [])
     total_stories = sum(len(e.get("stories", [])) for e in epics)

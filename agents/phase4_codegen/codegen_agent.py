@@ -53,7 +53,7 @@ class CodegenState(TypedDict):
 
 def call_llm(prompt: str, max_tokens: int = 8192) -> str:
     response = client.chat.completions.create(
-        model="deepseek-v4-pro",
+        model="deepseek-v4-flash",
         messages=[{"role": "user", "content": prompt}],
         stream=False,
         reasoning_effort="high",

@@ -99,6 +99,15 @@ class SearchRequest(BaseModel):
     query: str
     top_k: Optional[int] = 10
 
+class PipelineStartRequest(BaseModel):
+    requirement: str
+    # If set, Phase 0 is BYPASSED and this choice is used directly.
+    routing_choice: Optional[dict] = None
+    # Examples of routing_choice:
+    #   {"mode": "existing", "project_id": "conduit", "repo_names": ["conduit-django-api"]}
+    #   {"mode": "new"}    -> creates new project
+    #   {"mode": "manual", "repo_names": ["flask-contacts-api"]} -> use raw repos    
+
 
 # In run_phase1, near the top, after thread_id is known:
 def _warn_if_stale_index(thread_id: str, matched_repo: str):
@@ -354,36 +363,60 @@ def serve_dashboard():
 
 
 
+@app.post("/pipeline/preview-routing")
+def preview_routing(req: dict = Body(...), api_key: str = Depends(verify_api_key)):
+    """
+    Run Phase 0 search ONLY, return candidates. Don't commit anything.
+    The dashboard shows these to the user, who picks one (or 'new', or 'manual').
+    """
+    requirement = req.get("requirement", "").strip()
+    if not requirement:
+        raise HTTPException(400, "requirement is required")
+
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from agents.phase0_selector.selector_agent import search_projects, slugify
+    from knowledge_layer.project_registry import list_all_projects
+
+    # Top-5 semantic matches — give the user a real menu
+    candidates = search_projects(requirement, top_k=5)
+
+    # Also list ALL projects (so user can pick something semantic search didn't surface)
+    all_projects = list_all_projects()
+
+    return {
+        "requirement": requirement,
+        "suggested_match": candidates[0] if candidates else None,
+        "candidates": candidates,                  # ranked by similarity
+        "all_projects": all_projects,              # full menu
+        "new_project_preview": {
+            "slug": slugify(requirement),
+            "backend_repo": f"{slugify(requirement)}-backend",
+            "frontend_repo": f"{slugify(requirement)}-frontend",
+        },
+    }
+
+
+# Update existing POST /pipeline/start to accept an explicit routing choice:
+
+
+
+
 @app.post("/pipeline/start")
-def pipeline_start(req: StartRequest, background_tasks: BackgroundTasks, api_key: str = Depends(verify_api_key)):
-    """Starts Phase 0 routing, then automatically chains to Phase 1."""
-    thread_id = req.thread_id or f"pipeline-{uuid.uuid4().hex[:8]}"
-
-    if thread_id in pipeline_store:
-        return JSONResponse(status_code=400, content={"error": f"Thread {thread_id} exists."})
-
+def pipeline_start(req: PipelineStartRequest, background_tasks: BackgroundTasks,
+                   api_key: str = Depends(verify_api_key)):
+    thread_id = f"pipeline-{uuid.uuid4().hex[:8]}"
     pipeline_store[thread_id] = {
         "thread_id": thread_id,
         "requirement": req.requirement,
+        "routing_choice": req.routing_choice,   # NEW: passed to run_phase0_and_phase1
         "phase": 0,
-        "status": "STARTING",
-        "sub_stage": "Routing to project...",
-        "current_state": {},
-        "graph": None,
-        "config": None,
-        "pr_urls": [],
-        "error": None
-    }
-
-    # IMPORTANT: Run Phase 0 routing first
-    background_tasks.add_task(run_phase0_and_phase1, thread_id, req.requirement)
-
-    return {
-        "thread_id": thread_id,
         "status": "STARTED",
-        "message": "Pipeline started. Polling Phase 0 -> Phase 1.",
-        "next": f"/pipeline/status/{thread_id}"
+        "current_state": {},
     }
+    save_pipeline(thread_id, pipeline_store[thread_id], {})
+    background_tasks.add_task(run_phase0_and_phase1, thread_id, req.requirement)
+    return {"thread_id": thread_id, "status": "STARTED"}
 
 @app.get("/pipeline/status/{thread_id}")
 def pipeline_status(thread_id: str):
@@ -406,6 +439,21 @@ def pipeline_status(thread_id: str):
         "current_state": safe
     }
 
+@app.get("/pipeline/list")
+def pipeline_list(api_key: str = Depends(verify_api_key)):
+    """List all known pipelines (loaded from PostgreSQL on startup + any new ones)."""
+    pipelines = []
+    for tid, entry in pipeline_store.items():
+        pipelines.append({
+            "thread_id": tid,
+            "requirement": entry.get("requirement", ""),
+            "status": entry.get("status", ""),
+            "phase": entry.get("phase", 0),
+            "sub_stage": entry.get("sub_stage", ""),
+        })
+    # Sort newest first
+    pipelines.sort(key=lambda p: p["thread_id"], reverse=True)
+    return {"pipelines": pipelines, "total": len(pipelines)}
 
 @app.post("/pipeline/approve/{thread_id}")
 def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: BackgroundTasks = None, api_key: str = Depends(verify_api_key)):
@@ -984,50 +1032,144 @@ def list_repo_overrides(api_key: str = Depends(verify_api_key)):
 # ── Background Pipeline Runners ───────────────────────────────────────────────
 
 def run_phase0_and_phase1(thread_id: str, requirement: str):
-    """Main's Smart Repo Routing logic."""
+    """Phase 0 (project/repo routing) + Phase 1 (Discovery) runner."""
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agents.phase0_selector.selector_agent import search_projects, slugify
 
+        # ── Phase 0: route to existing project or create new ────────────
         pipeline_store[thread_id]["phase"] = 0
         pipeline_store[thread_id]["status"] = "PHASE_0_RUNNING"
-        pipeline_store[thread_id]["sub_stage"] = "Searching for matching project..."
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id].get("current_state", {})))
+        pipeline_store[thread_id]["sub_stage"] = "Routing requirement..."
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(pipeline_store[thread_id].get("current_state", {})))
         audit(thread_id, "phase0", "PHASE_STARTED")
 
-        candidates = search_projects(requirement, top_k=3)
+        entry = pipeline_store[thread_id]
+        choice = entry.get("routing_choice")
+        github_owner = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
 
-        if candidates and candidates[0]["score"] >= 0.7:
-            selected = candidates[0]
-            is_new = False
-            selected_repos = [{"name": r, "type": "backend", "exists": True} if isinstance(r, str) else r for r in selected.get("repos", [])]
-            print(f"[Phase 0] ✅ Matched existing project: {selected['name']}")
-            # ── TEAMMATE'S FIX: FIRE-AND-FORGET DRIFT CHECK ──
-            matched_repo = selected_repos[0]["name"] if selected_repos else None
-            if matched_repo:
-                threading.Thread(target=_warn_if_stale_index, args=(thread_id, matched_repo), daemon=True).start()
-            # ─────────────────────────────────────────────────
+        # ── Path A: User made an explicit choice — honor it ─────────────
+        if choice:
+            mode = choice.get("mode")
+
+            if mode == "existing":
+                project_id = choice["project_id"]
+                # Look up real repos for this project from the registry
+                from knowledge_layer.project_registry import list_all_projects
+                all_proj = {p["project_id"]: p for p in list_all_projects()}
+                proj = all_proj.get(project_id, {})
+
+                selected = {
+                    "id": project_id,
+                    "name": proj.get("project_name", project_id),
+                    "description": proj.get("description", ""),
+                }
+                repo_names = choice.get("repo_names") or proj.get("repos", [])
+                selected_repos = [
+                    {"name": n, "type": "backend", "exists": True,
+                     "url": f"https://github.com/{github_owner}/{n}.git"}
+                    for n in repo_names
+                ]
+                is_new = False
+                print(f"[Phase 0] ✅ User chose existing project: {selected['name']} with repos {repo_names}")
+
+            elif mode == "manual":
+                repo_names = choice.get("repo_names", [])
+                selected = {"id": "manual", "name": "User-selected repos",
+                            "description": "Manual repo selection"}
+                selected_repos = [
+                    {"name": n, "type": "backend", "exists": True,
+                     "url": f"https://github.com/{github_owner}/{n}.git"}
+                    for n in repo_names
+                ]
+                is_new = False
+                print(f"[Phase 0] ✅ User picked repos manually: {repo_names}")
+
+            elif mode == "new":
+                slug = slugify(requirement)
+                selected = {"id": f"new-{slug}", "name": requirement[:60],
+                            "description": requirement}
+                selected_repos = [
+                    {"name": f"{slug}-backend", "type": "backend",
+                     "url": f"https://github.com/{github_owner}/{slug}-backend.git",
+                     "exists": False},
+                    {"name": f"{slug}-frontend", "type": "frontend",
+                     "url": f"https://github.com/{github_owner}/{slug}-frontend.git",
+                     "exists": False},
+                ]
+                is_new = True
+                print(f"[Phase 0] ✅ User chose NEW project: {slug}")
+
+            else:
+                raise ValueError(f"Unknown routing mode: {mode}")
+
+        # ── Path B: No explicit choice — fall back to auto-matching ─────
         else:
-            slug = slugify(requirement)
-            is_new = True
-            github_owner = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
-            selected_repos = [
-                {"name": f"{slug}-backend", "type": "backend", "url": f"https://github.com/{github_owner}/{slug}-backend.git", "exists": False},
-                {"name": f"{slug}-frontend", "type": "frontend", "url": f"https://github.com/{github_owner}/{slug}-frontend.git", "exists": False}
-            ]
-            selected = {"id": f"new-{slug}", "name": requirement[:60], "repos": selected_repos, "is_new": True}
-            print(f"[Phase 0] 🆕 NEW PROJECT: {slug}")
+            candidates = search_projects(requirement, top_k=3)
+            THRESHOLD = float(os.getenv("PHASE0_MATCH_THRESHOLD", "0.55"))
 
-        current = pipeline_store[thread_id].get("current_state", {})
-        current.update({"selected_project": selected, "selected_repos": selected_repos, "is_new_project": is_new, "candidates": candidates})
-        pipeline_store[thread_id].update({"current_state": current, "status": "PHASE_0_DONE", "sub_stage": f"Project routed to: {selected['name'][:50]}"})
-        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(current))
+            if candidates and candidates[0]["score"] >= THRESHOLD:
+                top = candidates[0]
+                selected = top
+                repo_names = top.get("repos", [])
+                selected_repos = [
+                    {"name": n if isinstance(n, str) else n.get("name"),
+                     "type": "backend", "exists": True,
+                     "url": f"https://github.com/{github_owner}/{n if isinstance(n, str) else n.get('name')}.git"}
+                    for n in repo_names
+                ]
+                is_new = False
+                print(f"[Phase 0] ✅ Auto-matched: {selected.get('name')} (score={top['score']})")
 
-        run_phase1(thread_id, requirement)
+                # Fire-and-forget drift check
+                matched_repo = selected_repos[0]["name"] if selected_repos else None
+                if matched_repo:
+                    threading.Thread(target=_warn_if_stale_index,
+                                     args=(thread_id, matched_repo),
+                                     daemon=True).start()
+            else:
+                slug = slugify(requirement)
+                selected = {"id": f"new-{slug}", "name": requirement[:60],
+                            "description": requirement}
+                selected_repos = [
+                    {"name": f"{slug}-backend", "type": "backend",
+                     "url": f"https://github.com/{github_owner}/{slug}-backend.git",
+                     "exists": False},
+                    {"name": f"{slug}-frontend", "type": "frontend",
+                     "url": f"https://github.com/{github_owner}/{slug}-frontend.git",
+                     "exists": False},
+                ]
+                is_new = True
+                print(f"[Phase 0] 🆕 No match (best score < {THRESHOLD}) — creating NEW project: {slug}")
+
+        # ── Persist Phase 0 result ──────────────────────────────────────
+        pipeline_store[thread_id]["selected_project"] = selected
+        pipeline_store[thread_id]["selected_repos"] = selected_repos
+        pipeline_store[thread_id]["is_new_project"] = is_new
+        pipeline_store[thread_id]["current_state"] = {
+            **(pipeline_store[thread_id].get("current_state") or {}),
+            "selected_project": selected,
+            "selected_repos": selected_repos,
+            "is_new_project": is_new,
+        }
+        audit(thread_id, "phase0", "PHASE_COMPLETED",
+              {"project": selected.get("name"), "is_new": is_new,
+               "repos": [r["name"] for r in selected_repos]})
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(pipeline_store[thread_id]["current_state"]))
+
+        # ── Phase 1: Discovery (BRD/PRD/ADR/Architecture) ───────────────
+        run_phase1(thread_id, requirement, "")
 
     except Exception as e:
-        pipeline_store[thread_id].update({"status": "ERROR", "error": f"Phase 0 error: {str(e)}"})
+        import traceback
+        traceback.print_exc()
+        pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(pipeline_store[thread_id].get("current_state", {})))
+        
 
 def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
     try:
@@ -1119,28 +1261,45 @@ def run_phase3(thread_id: str, feedback: str = ""):
         entry = pipeline_store[thread_id]
         prev_state = entry["current_state"]
 
-        pipeline_store[thread_id].update({"status": "PHASE_3_RUNNING", "sub_stage": "Analyzing code impact...", "phase": 3})
+        pipeline_store[thread_id].update({
+            "status": "PHASE_3_RUNNING",
+            "sub_stage": "Analyzing code impact...",
+            "phase": 3
+        })
 
         graph = get_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p3"}}
-        initial = {"requirement": entry["requirement"], "impact_report": {}, "human_approved": False, "human_feedback": feedback, "status": "STARTED"}
+        initial = {
+            "requirement": entry["requirement"],
+            "prd": prev_state.get("prd", {}),                   # NEW
+            "selected_repos": prev_state.get("selected_repos", []),   # NEW
+            "scope_contract": prev_state.get("scope_contract", {}),   # NEW
+            "impact_report": {},
+            "human_approved": False,
+            "human_feedback": feedback,
+            "status": "STARTED"
+        }
         result = graph.invoke(initial, config)
 
         merged = {**prev_state}
-        if "impact_report" in result: merged["impact_report"] = result["impact_report"]
+        if "impact_report" in result:
+            merged["impact_report"] = result["impact_report"]
 
-        pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "status": "WAITING_PHASE_3_APPROVAL", "sub_stage": "Impact report ready — Awaiting approval"})
+        pipeline_store[thread_id].update({
+            "graph": graph,
+            "config": config,
+            "current_state": merged,
+            "status": "WAITING_PHASE_3_APPROVAL",
+            "sub_stage": "Impact report ready — Awaiting approval"
+        })
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
     except Exception as e:
         import traceback
-        traceback.print_exc()   # so the real error shows in the uvicorn log
+        traceback.print_exc()
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
-        save_pipeline(
-            thread_id,
-            pipeline_store[thread_id],
-            _safe_state(pipeline_store[thread_id].get("current_state", {})),
-        )
-
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(pipeline_store[thread_id].get("current_state", {})))
+        
 def run_phase4(thread_id: str):
     try:
         import sys

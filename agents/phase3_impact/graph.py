@@ -37,6 +37,9 @@ class ImpactState(TypedDict):
     requirement: str
     impact_report: dict
     adr: dict
+    prd: dict                    # NEW
+    selected_repos: list         # NEW
+    scope_contract: dict         # NEW
     human_approved: bool
     human_feedback: str
     status: str
@@ -50,7 +53,9 @@ def analyze_impact(state: ImpactState) -> ImpactState:
     print("[Node] analyze_impact — running...")
     report = run_impact_analysis(
         state["requirement"],
-        adr=state.get("adr", {})
+        prd=state.get("prd", {}),
+        adr=state.get("adr", {}),
+        selected_repos=state.get("selected_repos", []),
     )
     return {
         **state,
