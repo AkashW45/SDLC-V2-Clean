@@ -553,12 +553,85 @@ def index_dependency_graph(driver, repo_name: str, file_path: str, imports: list
 # Main Indexer
 # -----------------------------------------
 
-def index_repo(repo_path: str, repo_name: str):
+import os
+import subprocess
+
+def _get_current_sha(repo_path: str) -> str:
+    """Return the HEAD commit SHA of the local clone."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _get_last_indexed_sha(repo_name: str) -> str:
+    """Look up the SHA at the time this repo was last indexed."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(
+            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+            port=os.getenv("POSTGRES_PORT", "5433"),
+            user=os.getenv("POSTGRES_USER", "sdlc"),
+            password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
+            dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
+        )
+        cur = conn.cursor()
+        # Idempotent column add — safe to run every call
+        cur.execute("""
+            ALTER TABLE repo_maps
+            ADD COLUMN IF NOT EXISTS last_indexed_sha VARCHAR(64) DEFAULT ''
+        """)
+        conn.commit()
+        cur.execute("SELECT last_indexed_sha FROM repo_maps WHERE repo_name = %s", (repo_name,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row[0] if row and row[0] else ""
+    except Exception as e:
+        print(f"[indexer] last_indexed_sha lookup failed: {e}")
+        return ""
+
+
+def _save_indexed_sha(repo_name: str, sha: str):
+    """Persist the SHA so future indexing runs can compare."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(
+            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+            port=os.getenv("POSTGRES_PORT", "5433"),
+            user=os.getenv("POSTGRES_USER", "sdlc"),
+            password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
+            dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
+        )
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE repo_maps SET last_indexed_sha = %s, last_indexed = NOW() WHERE repo_name = %s",
+            (sha, repo_name),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[indexer] last_indexed_sha save failed: {e}")
+
+
+def index_repo(repo_path: str, repo_name: str, force: bool = False):
     print(f"\n{'='*50}")
     print(f"Indexing repo: {repo_name}")
     print(f"Path: {repo_path}")
     print(f"{'='*50}")
-
+    
+     # ── Change detection: skip if nothing changed since last index ──
+    current_sha = _get_current_sha(repo_path)
+    last_sha = _get_last_indexed_sha(repo_name)
+    if current_sha and last_sha and current_sha == last_sha and not force:
+        print(f"  [Indexer] No changes since last index (sha={current_sha[:8]}) — SKIPPED")
+        return {"status": "SKIPPED_NO_CHANGES", "sha": current_sha}
+    
     # Connect to all stores
     conn = get_postgres()
     qdrant = get_qdrant()
@@ -640,6 +713,11 @@ def index_repo(repo_path: str, repo_name: str):
     print(f"   Source files indexed: {indexed_count}/{len(source_files)}")
     print(f"   Protocol contracts indexed: {contract_count}")
     print(f"{'='*50}\n")
+    # At the very end, after all your indexing finishes successfully:
+    if current_sha:
+        _save_indexed_sha(repo_name, current_sha)
+
+    return {"status": "INDEXED", "sha": current_sha}
 
 
 # -----------------------------------------

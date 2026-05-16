@@ -5,21 +5,28 @@ Unified Version: Blends Surgical Replays & API Security with Phase 0 Smart Routi
 import io
 import os
 import re
+from time import time
 import uuid
 import json
 import asyncio
 import requests
 from typing import Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Body, Depends, Security
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Body, Depends, Security, logger
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import zipfile
-
+from agents.repo_workspace import get_repo_local_path
+import time
+import threading
 from langgraph.types import Command
+import logging
 
+# ADD THESE TWO LINES TO FIX THE CRASH
+logger = logging.getLogger("reconciliation")
+logger.setLevel(logging.INFO)
 from api.runbook_export import (
     export_runbook_excel, export_brd_markdown, export_prd_markdown,
     export_adr_markdown, export_architecture_markdown, export_sprint_plan_markdown,
@@ -92,6 +99,108 @@ class SearchRequest(BaseModel):
     query: str
     top_k: Optional[int] = 10
 
+
+# In run_phase1, near the top, after thread_id is known:
+def _warn_if_stale_index(thread_id: str, matched_repo: str):
+    """Non-blocking drift check; logs warning only."""
+    if not matched_repo:
+        return
+    try:
+        from agents.github_auth import get_github_headers
+        from knowledge_layer.indexer import _get_last_indexed_sha
+        import requests
+        owner = os.getenv("GITHUB_REPO_OWNER", "")
+        resp = requests.get(
+            f"https://api.github.com/repos/{owner}/{matched_repo}",
+            headers=get_github_headers(), timeout=5,
+        )
+        if resp.status_code != 200:
+            return
+        default_branch = resp.json().get("default_branch", "main")
+        br = requests.get(
+            f"https://api.github.com/repos/{owner}/{matched_repo}/branches/{default_branch}",
+            headers=get_github_headers(), timeout=5,
+        )
+        if br.status_code != 200:
+            return
+        current_sha = br.json()["commit"]["sha"]
+        stored_sha = _get_last_indexed_sha(matched_repo)
+        if stored_sha and current_sha != stored_sha:
+            logger.warning(f"[Phase 0] Stale index for {matched_repo}: "
+                          f"stored={stored_sha[:8]} current={current_sha[:8]}")
+            audit(thread_id, "phase0", "STALE_INDEX_WARNING",
+                  {"repo": matched_repo, "stored": stored_sha, "current": current_sha})
+    except Exception as e:
+        logger.debug(f"[Phase 0] drift check skipped: {e}")
+
+# At top of api/main.py
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+_scheduler: BackgroundScheduler = None
+
+
+def _reconciliation_job():
+    """Detect drift between GitHub default-branch SHAs and what we have indexed."""
+    try:
+        from agents.github_discovery import list_all_repos
+        from agents.indexer_queue import get_queue
+        from agents.github_auth import get_github_headers
+        from knowledge_layer.indexer import _get_last_indexed_sha
+        import requests
+
+        repos = list_all_repos()
+        queue = get_queue()
+        drift = 0
+        for r in repos:
+            try:
+                resp = requests.get(
+                    f"https://api.github.com/repos/{r['full_name']}/branches/{r['default_branch']}",
+                    headers=get_github_headers(), timeout=10,
+                )
+                if resp.status_code != 200:
+                    continue
+                current_sha = resp.json()["commit"]["sha"]
+                stored_sha = _get_last_indexed_sha(r["name"])
+                if current_sha != stored_sha:
+                    queue.enqueue(r["name"], r["url"], r["default_branch"])
+                    drift += 1
+            except Exception as e:
+                logger.warning(f"[Reconciliation] {r['name']}: {e}")
+        logger.info(f"[Reconciliation] checked {len(repos)} repos, enqueued {drift} drifted")
+    except Exception as e:
+        logger.error(f"[Reconciliation] global error: {e}")
+
+
+@app.on_event("startup")
+def start_reconciliation():
+    global _scheduler
+    interval_min = int(os.getenv("RECONCILIATION_INTERVAL_MIN", "60"))
+    _scheduler = BackgroundScheduler()
+    _scheduler.add_job(
+        _reconciliation_job,
+        IntervalTrigger(minutes=interval_min, jitter=300),
+        id="indexing_reconciliation",
+        max_instances=1,           # don't pile up if one run is slow
+        coalesce=True,             # collapse missed runs into one
+        replace_existing=True,
+    )
+    _scheduler.start()
+    logger.info(f"[Reconciliation] scheduled every {interval_min} min")
+
+
+@app.on_event("shutdown")
+def stop_reconciliation():
+    if _scheduler:
+        _scheduler.shutdown(wait=False)
+
+
+@app.post("/admin/reconciliation/run")
+def trigger_reconciliation(api_key: str = Depends(verify_api_key)):
+    """Manual trigger for the drift check. Runs in background."""
+    if _scheduler:
+        _scheduler.add_job(_reconciliation_job, id=f"recon-manual-{int(time.time())}")
+    return {"status": "TRIGGERED"}
 
 # ── Shantanu's Surgical Replay Logic ──────────────────────────────────────────
 def extract_target_artifact(payload: dict) -> str:
@@ -242,6 +351,7 @@ def serve_dashboard():
     api_key_script = f"const API_KEY = '{VALID_API_KEY}';\nconsole.log('API_KEY injected');"
     html = html.replace("const API = 'http://localhost:8001';", f"const API = 'http://localhost:8001';\n{api_key_script}")
     return HTMLResponse(content=html)
+
 
 
 @app.post("/pipeline/start")
@@ -573,6 +683,303 @@ def knowledge_repos():
     conn.close()
     return {"repos": repos, "total": len(repos)}
 
+# ─────────────────────────────────────────────────────────────────────
+# GitHub-driven project discovery + sync + indexer queue
+# ─────────────────────────────────────────────────────────────────────
+from pydantic import BaseModel
+
+
+class DiscoverRequest(BaseModel):
+    owner: Optional[str] = None
+    min_group_size: int = 2
+
+
+class SyncRequest(BaseModel):
+    owner: Optional[str] = None
+    min_group_size: int = 2
+    dry_run: bool = False
+    project_ids: Optional[list] = None   # if set, only sync these; otherwise all discovered
+    force_reindex: bool = False   # NEW — defaults to False
+
+@app.post("/knowledge/projects/discover")
+def projects_discover(req: DiscoverRequest, api_key: str = Depends(verify_api_key)):
+    """
+    Preview what GitHub-driven discovery would register.
+    Returns the project groupings WITHOUT writing anything.
+    Use this to review before calling /sync.
+    """
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from agents.github_discovery import discover_projects
+    try:
+        preview = discover_projects(owner=req.owner, min_group_size=req.min_group_size)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, f"Discovery failed: {e}")
+    return preview
+
+
+@app.post("/knowledge/projects/sync")
+def projects_sync(req: SyncRequest, api_key: str = Depends(verify_api_key)):
+    """
+    Discover GitHub repos, group by prefix, register each project, and queue
+    each repo for cloning + indexing. Returns immediately with a job manifest.
+
+    Use dry_run=true to see exactly what would happen without writing.
+    Use project_ids=["billing", "conduit"] to limit the sync to specific groups.
+    """
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from agents.github_discovery import discover_projects
+    from knowledge_layer.project_registry import register_project
+    from agents.indexer_queue import get_queue
+
+    try:
+        preview = discover_projects(owner=req.owner, min_group_size=req.min_group_size)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, f"Discovery failed: {e}")
+
+    projects = preview["projects"]
+    if req.project_ids:
+        filter_set = set(req.project_ids)
+        projects = [p for p in projects if p["project_id"] in filter_set]
+
+    if req.dry_run:
+        return {
+            "dry_run": True,
+            "would_register": len(projects),
+            "would_index_repos": sum(len(p["repos"]) for p in projects),
+            "projects": projects,
+        }
+
+    queue = get_queue()
+    registered = []
+    queued_jobs = []
+    errors = []
+
+    for proj in projects:
+        try:
+            repo_names = [r["name"] for r in proj["repos"]]
+            register_project(
+                project_id=proj["project_id"],
+                project_name=proj["project_name"],
+                description=proj["description"],
+                domain=proj["domain"],
+                tech_stack=proj["tech_stack"],
+                repos=repo_names,
+                owner_team=proj["owner_team"],
+            )
+            registered.append(proj["project_id"])
+
+            for repo in proj["repos"]:
+                job_id = queue.enqueue(
+                    repo_name=repo["name"],
+                    repo_url=repo["url"],
+                    branch=repo.get("branch", "main"),
+                    force=req.force_reindex,     # NEW
+                )
+                queued_jobs.append({"repo": repo["name"], "job_id": job_id})
+        except Exception as e:
+            errors.append({"project_id": proj["project_id"], "error": str(e)})
+
+    return {
+        "status": "SYNC_STARTED",
+        "registered_projects": registered,
+        "queued_indexing_jobs": queued_jobs,
+        "total_queued": len(queued_jobs),
+        "errors": errors,
+        "tip": "Poll GET /knowledge/jobs to track indexing progress.",
+    }
+
+
+@app.get("/knowledge/jobs")
+def indexer_jobs_list(status: Optional[str] = None):
+    """List indexer jobs. Filter with ?status=RUNNING|SUCCESS|FAILED|QUEUED|RETRYING."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from agents.indexer_queue import get_queue
+    q = get_queue()
+    return {"summary": q.summary(), "jobs": q.list_jobs(status=status)}
+
+
+@app.get("/knowledge/jobs/{job_id}")
+def indexer_job_detail(job_id: str):
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from agents.indexer_queue import get_queue
+    q = get_queue()
+    job = q.get_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job not found: {job_id}")
+    return job
+
+
+# ─────────────────────────────────────────────────────────────────────
+# GitHub webhook (stub — NOT active until you configure GitHub to call it)
+# ─────────────────────────────────────────────────────────────────────
+import hmac, hashlib
+from fastapi import Request
+
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+
+
+def _verify_github_signature(payload_body: bytes, signature_header: str) -> bool:
+    """Verify the GitHub webhook signature. Required for production webhook use."""
+    if not GITHUB_WEBHOOK_SECRET:
+        return False
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(
+        GITHUB_WEBHOOK_SECRET.encode(),
+        msg=payload_body,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+
+
+@app.post("/webhooks/github")
+async def github_webhook(request: Request):
+    """
+    GitHub webhook handler — STUB. Wire up later by:
+      1. Setting GITHUB_WEBHOOK_SECRET in .env
+      2. Configuring your GitHub org webhook to POST here on:
+         repository.created, repository.deleted, push, repository.archived
+      3. Exposing this endpoint publicly (ngrok / load balancer)
+    """
+    if not GITHUB_WEBHOOK_SECRET:
+        raise HTTPException(503, "Webhooks not configured — set GITHUB_WEBHOOK_SECRET in .env")
+
+    body = await request.body()
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    if not _verify_github_signature(body, sig):
+        raise HTTPException(401, "Invalid webhook signature")
+
+    event = request.headers.get("X-GitHub-Event", "")
+    payload = await request.json()
+    action = payload.get("action", "")
+    repo = payload.get("repository", {}) or {}
+    repo_name = repo.get("name", "")
+    repo_url = repo.get("clone_url", "")
+    branch = repo.get("default_branch", "main")
+
+    # Minimal handling — wire to your queue when you're ready
+    if event == "repository" and action == "created" and repo_name:
+        from agents.indexer_queue import get_queue
+        job_id = get_queue().enqueue(repo_name=repo_name, repo_url=repo_url, branch=branch)
+        return {"received": True, "action": "indexed", "job_id": job_id}
+
+    if event == "push" and repo_name:
+        # Only re-index if the push was to the repo's default branch
+        ref = payload.get("ref", "")  # e.g. "refs/heads/main"
+        default_branch = repo.get("default_branch", "main")
+        if ref != f"refs/heads/{default_branch}":
+            return {"received": True, "action": "ignored",
+                    "reason": f"push to non-default branch ({ref})"}
+
+        from agents.indexer_queue import get_queue
+        job_id = get_queue().enqueue(repo_name=repo_name, repo_url=repo_url, branch=default_branch)
+        return {"received": True, "action": "reindexed", "job_id": job_id}
+
+class RepoOverrideRequest(BaseModel):
+    action: str  # "include" or "exclude"
+    reason: str = ""
+
+
+@app.post("/knowledge/repos/{repo_name}/override")
+def set_repo_override(
+    repo_name: str,
+    req: RepoOverrideRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """Manually mark a repo as include or exclude. Persists across syncs."""
+    if req.action not in ("include", "exclude"):
+        raise HTTPException(400, "action must be 'include' or 'exclude'")
+    import psycopg2
+    conn = psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+        port=os.getenv("POSTGRES_PORT", "5437"),
+        user=os.getenv("POSTGRES_USER", "sdlc"),
+        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
+        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
+    )
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS repo_overrides (
+            repo_name VARCHAR(255) PRIMARY KEY,
+            action VARCHAR(20) NOT NULL,
+            reason TEXT,
+            set_by VARCHAR(255),
+            set_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        INSERT INTO repo_overrides (repo_name, action, reason, set_by)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (repo_name) DO UPDATE
+        SET action = EXCLUDED.action,
+            reason = EXCLUDED.reason,
+            set_by = EXCLUDED.set_by,
+            set_at = NOW()
+    """, (repo_name, req.action, req.reason, "api"))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"repo_name": repo_name, "action": req.action, "reason": req.reason}
+
+
+@app.delete("/knowledge/repos/{repo_name}/override")
+def clear_repo_override(repo_name: str, api_key: str = Depends(verify_api_key)):
+    """Remove the manual override so default heuristics apply again."""
+    import psycopg2
+    conn = psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+        port=os.getenv("POSTGRES_PORT", "5437"),
+        user=os.getenv("POSTGRES_USER", "sdlc"),
+        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
+        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
+    )
+    cur = conn.cursor()
+    cur.execute("DELETE FROM repo_overrides WHERE repo_name = %s", (repo_name,))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"repo_name": repo_name, "cleared": deleted > 0}
+
+
+@app.get("/knowledge/repos/overrides")
+def list_repo_overrides(api_key: str = Depends(verify_api_key)):
+    """List every manual override currently active."""
+    import psycopg2
+    conn = psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+        port=os.getenv("POSTGRES_PORT", "5433"),
+        user=os.getenv("POSTGRES_USER", "sdlc"),
+        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
+        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
+    )
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS repo_overrides (
+            repo_name VARCHAR(255) PRIMARY KEY,
+            action VARCHAR(20) NOT NULL,
+            reason TEXT,
+            set_by VARCHAR(255),
+            set_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("SELECT repo_name, action, reason, set_by, set_at FROM repo_overrides ORDER BY set_at DESC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {
+        "overrides": [
+            {"repo_name": r[0], "action": r[1], "reason": r[2],
+             "set_by": r[3], "set_at": str(r[4])}
+            for r in rows
+        ]
+    }
 
 # ── Background Pipeline Runners ───────────────────────────────────────────────
 
@@ -596,6 +1003,11 @@ def run_phase0_and_phase1(thread_id: str, requirement: str):
             is_new = False
             selected_repos = [{"name": r, "type": "backend", "exists": True} if isinstance(r, str) else r for r in selected.get("repos", [])]
             print(f"[Phase 0] ✅ Matched existing project: {selected['name']}")
+            # ── TEAMMATE'S FIX: FIRE-AND-FORGET DRIFT CHECK ──
+            matched_repo = selected_repos[0]["name"] if selected_repos else None
+            if matched_repo:
+                threading.Thread(target=_warn_if_stale_index, args=(thread_id, matched_repo), daemon=True).start()
+            # ─────────────────────────────────────────────────
         else:
             slug = slugify(requirement)
             is_new = True
@@ -859,6 +1271,8 @@ def run_phase5(thread_id: str):
             pipeline_store[thread_id],
             _safe_state(pipeline_store[thread_id].get("current_state", {})),
         )
+
+
 def run_phase6(thread_id: str, feedback: str = ""):
     try:
         from agents.phase6_delivery.delivery_agent import build_delivery_graph, DeliveryState
@@ -901,7 +1315,21 @@ def run_phase6(thread_id: str, feedback: str = ""):
         merged = {**state, "pr_urls": pr_urls, "target_repo": target_repo_name}
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "pr_urls": pr_urls, "status": "WAITING_PHASE_6_APPROVAL", "sub_stage": f"Pushed to {target_repo_name} — Awaiting PR approval"})
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
-
+        # ── FIX 5: RE-INDEX BROWNFIELD REPOS (BACKGROUND THREAD) ──
+        if not state.get("is_new_project", False):
+            import threading
+            def _bg_index(r_name):
+                # Calculate the path to your local 'repos' folder
+                repo_dir = os.path.join(os.getcwd(), "repos", r_name)
+                if os.path.isdir(repo_dir):
+                    print(f"  [Phase 6] Re-indexing {r_name} in background...")
+                    run_indexer(repo_dir, r_name)
+            
+            for repo in state.get("selected_repos", []):
+                rname = repo.get("name") if isinstance(repo, dict) else repo
+                if rname:
+                    threading.Thread(target=_bg_index, args=(rname,)).start()
+        # ──────────────────────────────────────────────────────────
     except Exception as e:
         import traceback
         traceback.print_exc()   # so the real error shows in the uvicorn log

@@ -1,4 +1,4 @@
-# SDLC-V2 — AI-Powered Software Development Lifecycle Automation Platform
+<!-- # SDLC-V2 — AI-Powered Software Development Lifecycle Automation Platform
 
 > **Plain English in → Working code, PRs, Jira tickets, runbooks, and deployment plans out.**
 > Eight LangGraph agent phases. Five human approval gates. Full audit trail. Survives server restarts.
@@ -707,4 +707,80 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/...
 | No artifact validation | CriticAgent validates every artifact before acceptance |
 | No evidence checking | EvidenceResolver validates all artifact evidence links |
 | No duplicate PR protection | PRManager with SHA-256 idempotency key |
-| Monolingual (Python only) | Polyglot codegen and indexing (Python/JS/TS/Java/C#) |
+| Monolingual (Python only) | Polyglot codegen and indexing (Python/JS/TS/Java/C#) | -->
+# Current Working State — as of 2026-05-15
+
+This file documents what is verified end-to-end. The main `README.md` describes the
+full design intent; this file is the ground truth on what runs today.
+
+ndexing policy: change-driven, never run-driven.
+
+Pipeline runs (/pipeline/start) NEVER trigger indexing — they only read from the pre-built Knowledge Layer.
+Indexing is triggered by: (a) GitHub webhook on push-to-default-branch, (b) GitHub webhook on repository created/deleted, (c) explicit admin call to /knowledge/projects/sync.
+All three paths compare current commit SHA against repo_maps.last_indexed_sha and skip when equal. Force with force_reindex: true in the sync API.
+Cost scales with repo changes, not with pipeline runs. A team running 10 pipelines/day against a stable codebase pays zero embedding cost beyond the initial index.
+
+## Verified end-to-end
+
+| Phase | Greenfield (new project) | Brownfield (existing project) |
+|------:|--------------------------|-------------------------------|
+| 0     | ✅ Routes to new slug, creates repo entries | ✅ Matches by Qdrant score ≥ 0.7 |
+| 0.5   | ✅ Generates ASP with `build_mode=greenfield` | ✅ Generates ASP with `build_mode=modify_existing` when repo_summary.symbol_overlap > 0.3; injects `repo_summary` into ASP |
+| 1     | ✅ BRD + PRD + ADR + Architecture, body fields flattened to top-level | ✅ Same, plus traces against existing repo |
+| 2     | ✅ Sprint + Jira + Runbook | ✅ Same |
+| 3     | Skipped for new projects | ✅ Qdrant + Neo4j + Postgres affected-files |
+| 4     | ✅ Fresh polyglot scaffold; non-Python files (HTML/MD/JSON) no longer parsed with Python AST | ✅ Auto-clones repo via RepoWorkspaceManager; reads files local-first with GitHub API fallback; diff-based search_block/replace_block |
+| 5     | ✅ Concurrent test gen, semgrep, pytest sandbox; early-exits cleanly when no Python source exists | ✅ Same |
+| 6     | ✅ Pushes directly to main (no PR), idempotent | ✅ Creates feature branch, opens PR via PRManager |
+| 7     | ✅ Deployment plan + monitoring + rollback | ✅ Same |
+
+## Production-grade brownfield path
+
+When a requirement targets an indexed project:
+
+1. **Phase 0** matches the project via `project_embeddings` (score ≥ 0.7).
+2. **Phase 0.5** builds a `repo_summary` from the Knowledge Layer and sets `build_mode = modify_existing`.
+3. **Phase 3** runs Impact Analysis: Qdrant semantic search → top-K affected files; Neo4j → dependents; Postgres → OpenAPI/gRPC contracts; LLM → risk_level.
+4. **Phase 4**:
+   - `RepoWorkspaceManager` auto-clones the target repo into `WORKSPACE_ROOT/<repo_name>` if missing.
+   - `load_existing_code` reads each affected file: local clone first, GitHub Contents API fallback.
+   - `context_packet_builder` injects top-8 RAG chunks + top-4 full files into the codegen prompt.
+   - LLM emits `search_block` / `replace_block` diffs; pipeline applies them with up to 3 retries per file.
+5. **Phase 5** runs syntax check + Semgrep + pytest sandbox on the patched code.
+6. **Phase 6** opens a feature branch and PR (idempotent via SHA-256 request ID).
+7. After push, the Knowledge Layer auto-reindexes the repo so the next pipeline sees the new symbols.
+
+## What is NOT yet verified
+
+- Brownfield end-to-end on a non-trivial repo (the indexed conduit/flask/django repos haven't been pipeline-tested yet).
+- Multi-repo changes in a single requirement (Phase 4 loops affected files but Phase 6 only pushes to one repo at a time).
+- Neo4j path traversal under high fan-out (no perf benchmark).
+- Phase 7 actual deployment — currently simulated.
+
+## Known issues that don't block the pipeline
+
+- `audit_log` schema mismatch: `agents/stage2_store.audit()` writes column `action`, table has column `event`. Audit rows from Stage 2 store are silently dropped. Pipeline continues. Fix with `ALTER TABLE audit_log ADD COLUMN action VARCHAR(100)` OR change the stage2_store column name to `event`.
+- Phase 4's `goldenset.yaml` check warns when missing — this is intentional ("soft mode"); only matters if you want eval-driven codegen.
+
+## Setup quickstart for brownfield
+
+```bash
+# 1. Index every repo you want the system to be able to modify
+python knowledge_layer/indexer.py --repo-path ./repos/<repo> --repo-name <repo>
+
+# 2. Register the project that groups those repos
+python knowledge_layer/project_registry.py
+# (edit the file to add your project definition)
+
+# 3. Verify it's discoverable
+curl http://localhost:8001/knowledge/repos
+
+# 4. Launch a brownfield pipeline
+curl -X POST http://localhost:8001/pipeline/start \
+  -H "Content-Type: application/json" \
+  -d '{"requirement": "Add a /v1/orders endpoint that returns paginated orders to conduit-django-api"}'
+```
+
+## Resume after a crash
+
+POST `/pipeline/{thread_id}/resume` with `{"phase": N}` re-runs Phase N using saved state from PostgreSQL. No re-payment of earlier-phase LLM tokens.

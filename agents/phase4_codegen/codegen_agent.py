@@ -20,8 +20,8 @@ from agents.prompts.system_prompts import CODEGEN_SYSTEM
 from agents.critic.critic_agent import critique
 from agents.context_packet_builder import build_context_packet as build_context_packet_rag, inject_into_user_message
 load_dotenv()
+from agents.repo_workspace import ensure_repo_cloned, read_file as ws_read_file, get_repo_local_path
 
-from core.llm_gateway import gateway
 from api.persistence import audit
 
 client = OpenAI(
@@ -195,30 +195,51 @@ def eval_first_check(state: CodegenState) -> CodegenState:
     return state
 
 def load_existing_code(state: CodegenState) -> CodegenState:
-    """Read current content of all affected files. For new projects, skip."""
+    """
+    Read current content of all affected files for brownfield codegen.
+    For new projects (no affected files), skip entirely.
+    For existing projects, auto-clone the target repo if needed, then read files
+    with GitHub API fallback.
+    """
     print("\n[Phase 4] Loading existing code...")
 
     impact = state.get("impact_report", {})
     affected_files = impact.get("affected_files", [])
 
-    # If no affected files (new project) — skip loading
     if not affected_files:
         print("  [Phase 4] No existing files — NEW PROJECT, generating fresh")
         return {**state, "existing_code": {}, "status": "NEW_PROJECT_NO_CODE"}
 
-    repo_path = os.getenv("REPO_PATH", r"C:\Users\user\leave-mgmt-backend")
+    # Group affected files by repo so we clone each repo at most once
+    repos_seen = set()
     existing_code = {}
 
     for af in affected_files:
-        file_path = af["file_path"]
-        file_path_normalized = file_path.replace("\\", os.sep).replace("/", os.sep)
-        content = read_file_from_repo(repo_path, file_path_normalized)
+        repo_name = af.get("repo_name", "")
+        file_path = af.get("file_path", "")
+        if not repo_name or not file_path:
+            continue
+
+        if repo_name not in repos_seen:
+            # Best-effort clone before first file read for that repo
+            ensure_repo_cloned(repo_name)
+            repos_seen.add(repo_name)
+
+        content = ws_read_file(repo_name, file_path)
         if content:
-            existing_code[file_path] = content
-            print(f"  ✅ Loaded: {file_path} ({len(content)} chars)")
+            # Key by "<repo>:<path>" so codegen knows which repo each file lives in
+            existing_code[f"{repo_name}:{file_path}"] = content
+            print(f"  ✅ Loaded: {repo_name}/{file_path} ({len(content)} chars)")
+        else:
+            print(f"  ⚠️  Could not read: {repo_name}/{file_path} (both local + API failed)")
+
+    if not existing_code:
+        # Affected files declared but none readable — fall back to greenfield path
+        # rather than crashing. The LLM will get nothing useful otherwise.
+        print("  ⚠️  Phase 3 declared affected files but none could be read — treating as fresh")
+        return {**state, "existing_code": {}, "status": "NEW_PROJECT_NO_CODE"}
 
     return {**state, "existing_code": existing_code, "status": "CODE_LOADED"}
-
 
 def generate_fresh_project(state: CodegenState) -> CodegenState:
         print("  [Phase 4] Generating FRESH Polyglot project scaffold...")
@@ -329,7 +350,11 @@ def build_context_packet(state: CodegenState) -> dict:
         symbols = get_symbols_for_file(repo_name, file_path)
 
         # Get current content
-        current_content = state["existing_code"].get(file_path, "")
+        # existing_code is keyed by "<repo>:<path>" — fall back to bare path for safety
+        current_content = (
+            state["existing_code"].get(f"{repo_name}:{file_path}")
+            or state["existing_code"].get(file_path, "")
+        )
 
         context["files"].append({
             "file_path": file_path,

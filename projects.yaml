@@ -1,0 +1,36 @@
+# projects.yaml — the source of truth for projects the SDLC pipeline can route to.
+# Each project groups one or more real GitHub repos. Phase 0 matches incoming
+# requirements against the descriptions here via Qdrant vector search.
+
+projects:
+  - project_id: flask-contacts
+    project_name: Flask Contacts API
+    description: >
+      Personal CRM REST API. Stores contacts (name, email, phone, address),
+      supports CRUD, search, and bulk import. SQLite by default, PostgreSQL in prod.
+    domain: CRM
+    tech_stack: [Python, Flask, SQLAlchemy]
+    owner_team: Platform Team
+    repos:
+      - name: flask-contacts-api
+        url: https://github.com/AkashW45/flask-contacts-api.git
+        type: backend
+        branch: main
+
+  - project_id: conduit-blog
+    project_name: Conduit Blog Platform
+    description: >
+      Medium-style blogging platform. Articles, tags, comments, favorites,
+      user profiles, follow/following.
+    domain: Content
+    tech_stack: [Python, Django, PostgreSQL]
+    owner_team: Content Team
+    repos:
+      - name: conduit-django-api
+        url: https://github.com/AkashW45/conduit-django-api.git
+        type: backend
+        branch: main
+      - name: conduit-react-ui
+        url: https://github.com/AkashW45/conduit-react-ui.git
+        type: frontend
+        branch: main

@@ -172,13 +172,24 @@ def classify_intent(state: DiscoveryState) -> DiscoveryState:
         }
 
     contract = parsed["asp"]
-    print(f"  ✅ Depth: {contract.get('depth_level')} | Policy: {contract.get('policy_mode')}")
-    
+
+    # Inject repo_summary into the ASP so downstream agents (codegen)
+    # can find asp.repo_summary.matched_repo and fetch existing code.
+    contract["repo_summary"] = repo_summary
+    contract["_is_new_project"] = is_new
+    contract.setdefault("build_mode",
+                        "modify_existing" if (repo_summary.get("exists") and
+                                              repo_summary.get("symbol_overlap", 0) > 0.3)
+                        else "greenfield")
+
+    print(f"  ✅ Depth: {contract.get('depth_level')} | Policy: {contract.get('policy_mode')} "
+          f"| build_mode: {contract['build_mode']}")
+
     return {
         **state,
         "classifier_output": parsed,
-        "scope_contract": contract, # We keep calling it scope_contract in state to not break other files
-        "status": "INTENT_CLASSIFIED"
+        "scope_contract": contract,
+        "status": "INTENT_CLASSIFIED",
     }
 # CLAUDE FIX: Moved Fallback functions out to Module Level
 def _fallback_asp(requirement: str, depth: int = 3) -> dict:

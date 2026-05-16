@@ -28,11 +28,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_OWNER = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
 AGENT_VERSION = os.getenv("AGENT_VERSION", "v2.0")
 
-GH_HEADERS = {
-    "Authorization": f"Bearer {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json",
-}
-GH_API = "https://api.github.com"
+from agents.github_auth import get_github_headers
 
 
 def _request_id(asp_id: str, artifact_id: str) -> str:
@@ -44,14 +40,14 @@ def _request_id(asp_id: str, artifact_id: str) -> str:
 # GitHub primitives
 # ────────────────────────────────────────────────────────────────────
 def _repo_exists(repo_name: str) -> bool:
-    r = requests.get(f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}", headers=GH_HEADERS, timeout=10)
+    r = requests.get(f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}", headers=get_github_headers(), timeout=10)
     return r.status_code == 200
 
 
 def _create_repo(repo_name: str, description: str) -> bool:
     r = requests.post(
         f"{GH_API}/user/repos",
-        headers=GH_HEADERS,
+        headers=get_github_headers(),
         json={
             "name": repo_name,
             "description": description[:200],
@@ -64,7 +60,7 @@ def _create_repo(repo_name: str, description: str) -> bool:
 
 
 def _get_default_branch(repo_name: str) -> str:
-    r = requests.get(f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}", headers=GH_HEADERS, timeout=10)
+    r = requests.get(f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}", headers=get_github_headers(), timeout=10)
     if r.status_code == 200:
         return r.json().get("default_branch", "main")
     return "main"
@@ -73,7 +69,7 @@ def _get_default_branch(repo_name: str) -> str:
 def _get_branch_sha(repo_name: str, branch: str) -> str:
     r = requests.get(
         f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}/git/ref/heads/{branch}",
-        headers=GH_HEADERS,
+        headers=get_github_headers(),
         timeout=10,
     )
     if r.status_code == 200:
@@ -88,7 +84,7 @@ def _branch_exists(repo_name: str, branch: str) -> bool:
 def _create_branch(repo_name: str, new_branch: str, from_sha: str) -> bool:
     r = requests.post(
         f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}/git/refs",
-        headers=GH_HEADERS,
+        headers=get_github_headers(),
         json={"ref": f"refs/heads/{new_branch}", "sha": from_sha},
         timeout=10,
     )
@@ -99,7 +95,7 @@ def _get_file_sha(repo_name: str, path: str, branch: str) -> str:
     """Return the blob sha of an existing file, or None if it doesn't exist."""
     r = requests.get(
         f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}/contents/{path}?ref={branch}",
-        headers=GH_HEADERS,
+        headers=get_github_headers(),
         timeout=10,
     )
     if r.status_code == 200:
@@ -121,7 +117,7 @@ def _commit_file(repo_name: str, path: str, content: str, branch: str,
 
     r = requests.put(
         f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}/contents/{path}",
-        headers=GH_HEADERS,
+        headers=get_github_headers(),
         json=payload,
         timeout=15,
     )
@@ -132,7 +128,7 @@ def _open_pr(repo_name: str, head_branch: str, base_branch: str,
              title: str, body: str) -> dict:
     r = requests.post(
         f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}/pulls",
-        headers=GH_HEADERS,
+        headers=get_github_headers(),
         json={"title": title, "head": head_branch, "base": base_branch, "body": body},
         timeout=15,
     )
@@ -143,7 +139,7 @@ def _open_pr(repo_name: str, head_branch: str, base_branch: str,
     if r.status_code == 422:
         existing = requests.get(
             f"{GH_API}/repos/{GITHUB_OWNER}/{repo_name}/pulls?head={GITHUB_OWNER}:{head_branch}&state=open",
-            headers=GH_HEADERS,
+            headers=get_github_headers(),
             timeout=10,
         )
         if existing.status_code == 200 and existing.json():
