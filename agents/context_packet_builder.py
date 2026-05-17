@@ -318,64 +318,90 @@ def _format_packet(chunks: List[Dict[str, Any]], file_contents: Dict[str, str],
 # Public API
 # ─────────────────────────────────────────────────────────────────────
 def build_context_packet(requirement: str, asp: Dict[str, Any],
-                         top_k: int = 8, max_files: int = 4) -> str:
+                         top_k: int = 8, max_files: int = 4,
+                         selected_repos: list = None) -> str:
     """
-    Build the existing-code context packet for codegen.
-
-    GREENFIELD: returns "" (no existing code to fetch).
-    BROWNFIELD: returns a formatted block with top-K relevant chunks + top-N full files.
-
-    Failure-tolerant: any step (Qdrant down, Postgres down, embedding fails) degrades
-    gracefully and returns either a partial packet or "".
+    Robust brownfield/greenfield detection — multiple signals, not just ASP.
     """
-    build_mode = (asp.get("build_mode") or "greenfield").lower()
-    if build_mode != "modify_existing":
-        logger.info("[ContextPacket] greenfield — no existing code to fetch")
+    # DEBUG — temporary, remove after diagnosis
+    print(f"[ContextPacket DEBUG] asp keys: {list(asp.keys())}")
+    print(f"[ContextPacket DEBUG] asp.build_mode = {asp.get('build_mode')!r}")
+    print(f"[ContextPacket DEBUG] asp.repo_summary = {asp.get('repo_summary')}")
+    print(f"[ContextPacket DEBUG] selected_repos = {selected_repos}")
+    print(f"[ContextPacket DEBUG] asp._is_new_project = {asp.get('_is_new_project')}")
+    # ── Robust brownfield detection: check 4 signals ────────────────
+    build_mode_raw = asp.get("build_mode", "")
+    is_brownfield = False
+    brownfield_reason = ""
+
+    # Signal 1: ASP explicitly says modify_existing
+    if str(build_mode_raw).lower() in ("modify_existing", "modify-existing", "brownfield"):
+        is_brownfield = True
+        brownfield_reason = f"asp.build_mode={build_mode_raw}"
+
+    # Signal 2: ASP has a matched repo
+    elif asp.get("repo_summary", {}).get("matched_repo"):
+        is_brownfield = True
+        brownfield_reason = f"matched_repo={asp['repo_summary']['matched_repo']}"
+
+    # Signal 3: selected_repos was passed in (user picked specific repos)
+    elif selected_repos:
+        is_brownfield = True
+        brownfield_reason = f"selected_repos={selected_repos}"
+
+    # Signal 4: ASP has _is_new_project explicitly False
+    elif asp.get("_is_new_project") is False:
+        is_brownfield = True
+        brownfield_reason = "_is_new_project=False"
+
+    if not is_brownfield:
+        logger.info(f"[ContextPacket] greenfield (no brownfield signals) — asp keys: {list(asp.keys())}")
         return ""
 
+    logger.info(f"[ContextPacket] BROWNFIELD detected: {brownfield_reason}")
+
+    # ── Resolve repo name with fallbacks ─────────────────────────────
     repo_summary = asp.get("repo_summary", {}) or {}
     repo_name = (
         repo_summary.get("matched_repo")
         or repo_summary.get("name")
         or repo_summary.get("repo_name")
+        or (selected_repos[0] if selected_repos else "")
         or ""
     )
+
+    # Normalize repo_name (handle dict vs string)
+    if isinstance(repo_name, dict):
+        repo_name = repo_name.get("name", "")
+
     if not repo_name:
-        logger.warning("[ContextPacket] build_mode=modify_existing but no repo_summary.matched_repo — returning empty")
+        logger.warning(f"[ContextPacket] brownfield but no repo name resolvable — asp.repo_summary={repo_summary}, selected_repos={selected_repos}")
         return ""
 
     logger.info(f"[ContextPacket] building for repo={repo_name}, top_k={top_k}, max_files={max_files}")
 
-    # Step 1: embed the requirement
+    # ── Step 1: embed the requirement (with fallback) ────────────────
     query_vec = _embed(requirement)
     if not query_vec:
-        logger.warning("[ContextPacket] embedding failed — returning empty packet")
-        return ""
+        logger.warning("[ContextPacket] embedding failed — returning minimal packet")
+        return f"RELEVANT EXISTING CODE — repo '{repo_name}' (embedding unavailable, ground patches in real file paths only)"
 
-    # Step 2: vector search
+    # ── Step 2: vector search ────────────────────────────────────────
     chunks = _search_code_chunks(query_vec, repo_name, top_k=top_k)
     if not chunks:
-        logger.warning(f"[ContextPacket] no chunks found in code_embeddings for {repo_name}")
-        # Still useful to tell the LLM the repo exists even without chunks
+        logger.warning(f"[ContextPacket] no chunks for {repo_name} — returning minimal packet")
         return (
             f"RELEVANT EXISTING CODE — repo '{repo_name}' is indexed but no specific "
-            f"code chunks matched this requirement closely. Emit PATCH artifacts that "
-            f"reference real file paths from repo_summary.top_symbols. Do NOT invent "
-            f"file paths."
+            f"code chunks matched this requirement. Emit PATCH artifacts that "
+            f"reference real file paths from repo_summary.top_symbols. Do NOT invent paths."
         )
 
-    # Step 3: enrich with symbols metadata
+    # Step 3-5 (unchanged)
     chunks = _enrich_with_symbols(chunks, repo_name)
-
-    # Step 4: fetch full files for top hits
     file_contents = _fetch_full_files(chunks, repo_name, max_files=max_files)
-
-    # Step 5: format
     packet = _format_packet(chunks, file_contents, repo_name, requirement)
-    logger.info(
-        f"[ContextPacket] built: {len(chunks)} chunks, {len(file_contents)} full files, "
-        f"{len(packet)} chars"
-    )
+
+    logger.info(f"[ContextPacket] built: {len(chunks)} chunks, {len(file_contents)} full files, {len(packet)} chars")
     return packet
 
 

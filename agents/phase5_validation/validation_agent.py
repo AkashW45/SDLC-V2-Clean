@@ -156,25 +156,146 @@ def _process_single_test(change, requirement, previous_errors, scope_contract, d
         return None
 
 
+def _detect_language(file_path: str) -> str:
+    """Map file extension to language."""
+    p = file_path.lower()
+    if p.endswith(".py"): return "python"
+    if p.endswith(".java"): return "java"
+    if p.endswith((".js", ".jsx", ".mjs")): return "javascript"
+    if p.endswith((".ts", ".tsx")): return "typescript"
+    if p.endswith(".go"): return "go"
+    if p.endswith((".cs",)): return "csharp"
+    if p.endswith((".rb",)): return "ruby"
+    if p.endswith((".rs",)): return "rust"
+    if p.endswith((".php",)): return "php"
+    if p.endswith((".kt",)): return "kotlin"
+    return "unknown"
+
+
+# Test framework + path conventions per language
+_LANG_TEST_CONVENTIONS = {
+    "python":    {"framework": "pytest",     "import": "import pytest", "ext": ".py",   "path_xform": lambda p: p.replace("app/", "tests/").replace(".py", "_test.py") if "/test" not in p else p},
+    "java":      {"framework": "JUnit 5",    "import": "import org.junit.jupiter.api.Test;", "ext": ".java", "path_xform": lambda p: p.replace("/main/", "/test/").replace(".java", "Tests.java") if "/test/" not in p else p},
+    "javascript":{"framework": "Jest",       "import": "const { test, expect } = require('@jest/globals');", "ext": ".test.js", "path_xform": lambda p: p.replace(".js", ".test.js") if ".test." not in p else p},
+    "typescript":{"framework": "Jest",       "import": "import { test, expect } from '@jest/globals';", "ext": ".test.ts", "path_xform": lambda p: p.replace(".ts", ".test.ts") if ".test." not in p else p},
+    "go":        {"framework": "testing pkg","import": "import \"testing\"", "ext": "_test.go", "path_xform": lambda p: p.replace(".go", "_test.go") if "_test.go" not in p else p},
+    "csharp":    {"framework": "xUnit",      "import": "using Xunit;", "ext": "Tests.cs", "path_xform": lambda p: p.replace(".cs", "Tests.cs") if "Tests.cs" not in p else p},
+    "ruby":      {"framework": "RSpec",      "import": "require 'rspec'", "ext": "_spec.rb", "path_xform": lambda p: p.replace(".rb", "_spec.rb").replace("lib/", "spec/") if "_spec.rb" not in p else p},
+    "kotlin":    {"framework": "JUnit 5",    "import": "import org.junit.jupiter.api.Test", "ext": "Tests.kt", "path_xform": lambda p: p.replace(".kt", "Tests.kt") if "Tests.kt" not in p else p},
+}
+
+
 def generate_tests(state: ValidationState) -> ValidationState:
-    print("\n[Phase 5] Generating tests (Concurrent)...")
+    """Polyglot test generator — detects language per file and uses appropriate framework."""
+    print("\n[Phase 5] Generating tests (polyglot)...")
+
     test_files = []
-    requirement = state.get("requirement", "")
-    previous_errors = state.get("last_errors", [])
-    scope_contract = state.get("scope_contract", {})
-    depth_level = scope_contract.get("depth_level", 3) if scope_contract else 3
 
-    # The Teammate's Concurrent Threading Logic
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [
-            executor.submit(_process_single_test, change, requirement, previous_errors, scope_contract, depth_level)
-            for change in state.get("generated_changes", [])
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                test_files.extend(res)
+    for change in state["generated_changes"]:
+        file_path = change.get("file_path", "")
+        content = change.get("content", "")
+        change_summary = change.get("change_summary", "")
+        new_symbols = change.get("new_symbols_added", [])
+        modified_symbols = change.get("existing_symbols_modified", [])
 
+        # Skip generating tests for test files themselves
+        if "/test/" in file_path.replace("\\", "/") or "/tests/" in file_path.replace("\\", "/") \
+           or file_path.lower().endswith(("_test.go", ".test.js", ".test.ts", "_spec.rb")) \
+           or "Tests.java" in file_path or "Tests.cs" in file_path or "Tests.kt" in file_path:
+            print(f"  ⏭️  Skipping test gen for test file: {file_path}")
+            continue
+
+        lang = _detect_language(file_path)
+        conv = _LANG_TEST_CONVENTIONS.get(lang)
+
+        if not conv:
+            print(f"  ⚠️  Unknown language for {file_path} — skipping test generation")
+            continue
+
+        print(f"\n  Generating {conv['framework']} tests for: {file_path}")
+
+        suggested_test_path = conv["path_xform"](file_path.replace("\\", "/"))
+
+        user_msg = json.dumps({
+            "language": lang,
+            "test_framework": conv["framework"],
+            "suggested_test_path": suggested_test_path,
+            "scope_contract": state.get("scope_contract", {}),
+            "file_path": file_path,
+            "content": content,
+            "change_summary": change_summary,
+            "new_symbols": new_symbols,
+            "modified_symbols": modified_symbols,
+            "requirement": state["requirement"],
+        }, indent=2)
+
+        system_prompt = (
+            f"You are a senior QA engineer writing {conv['framework']} tests in {lang}.\n"
+            f"\n"
+            f"RULES:\n"
+            f"1. Generate tests in {lang} using {conv['framework']}.\n"
+            f"2. Use the SUGGESTED test path (or a similar path matching the language's conventions).\n"
+            f"3. Cover: happy path, error path, edge cases — at least 3 tests.\n"
+            f"4. Tests must be syntactically valid — they will be compiled/parsed.\n"
+            f"5. Reference real symbols from the source — do NOT invent classes/functions.\n"
+            f"\n"
+            f"Return ONLY valid JSON in this shape:\n"
+            f"{{\n"
+            f'  "test_file_path": "...",  // language-appropriate path\n'
+            f'  "language": "{lang}",\n'
+            f'  "framework": "{conv["framework"]}",\n'
+            f'  "content": "...",  // full file content\n'
+            f'  "test_count": N,\n'
+            f'  "tests_cover": ["happy_path", "edge_case_X", ...]\n'
+            f"}}\n"
+        )
+
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-v4-pro",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=3000,
+            )
+
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"```(?:json)?", "", raw).strip().strip("```").strip()
+
+            test_file = json.loads(raw)
+
+            # Validate based on language
+            if lang == "python":
+                errors = validate_python_syntax(
+                    test_file.get("content", ""),
+                    test_file.get("test_file_path", ""),
+                )
+                if errors:
+                    test_file["syntax_errors"] = errors
+                    print(f"  ⚠️  Test syntax errors: {errors}")
+                else:
+                    print(f"  ✅ {conv['framework']} tests generated: {test_file.get('test_count', 0)} tests")
+            else:
+                # For non-Python languages, do a basic sanity check (non-empty + has framework keyword)
+                tc = test_file.get("content", "")
+                if not tc or len(tc) < 50:
+                    print(f"  ⚠️  Generated test file too short or empty for {file_path}")
+                    continue
+                print(f"  ✅ {conv['framework']} tests generated: {test_file.get('test_count', 'N/A')} tests")
+
+            test_file["language"] = lang
+            test_files.append(test_file)
+
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"  ❌ Failed to parse test response for {file_path}: {e}")
+            continue
+        except Exception as e:
+            print(f"  ❌ Test generation error for {file_path}: {e}")
+            continue
+
+    print(f"\n[Phase 5] Generated {len(test_files)} test files across multiple languages")
     return {**state, "test_files": test_files, "status": "TESTS_GENERATED"}
 
 def run_semgrep_gate(workspace_path: str) -> dict:
@@ -372,15 +493,42 @@ def run_validation(state: ValidationState) -> ValidationState:
           f"{pytest_result['passed']} passed, {pytest_result['failed']} failed, "
           f"{pytest_result.get('errors', 0)} errors")
 
-    # If no Python files were generated (e.g., pure HTML/MD project), there's
-    # nothing meaningful to test or retry — accept and move on.
-    has_python_files = any(
-        (c.get("file_path") or "").endswith(".py")
-        for c in state.get("generated_changes", []) or []
-    )
-    if not has_python_files:
-        print("  ℹ️  No Python files in this project — skipping test requirement.")
+        # Determine what languages we have
+    generated_changes = state.get("generated_changes", []) or []
+    languages_present = set()
+    for c in generated_changes:
+        lang = _detect_language(c.get("file_path", ""))
+        if lang != "unknown":
+            languages_present.add(lang)
+
+    print(f"  ℹ️  Languages detected: {sorted(languages_present)}")
+
+    # Only run pytest if Python is in the mix
+    has_python = "python" in languages_present
+    has_tests_generated = bool(state.get("test_files"))
+
+    if not has_python and has_tests_generated:
+        print(f"  ℹ️  No Python files — pytest skipped. {len(state.get('test_files', []))} test files generated for other languages.")
+        print(f"  ℹ️  Note: tests are generated but not executed in sandbox (requires JVM / Node / etc).")
         return {**state, "validation_results": results, "status": "VALIDATION_PASSED"}
+
+    if not has_python and not has_tests_generated:
+        print("  ⚠️  No Python files AND no test files generated — accepting anyway.")
+        return {**state, "validation_results": results, "status": "VALIDATION_PASSED"}
+
+    # Standard pass/fail decision for Python
+    has_errors = (
+        len(results["syntax_checks"]) > 0
+        or len(results["test_syntax_checks"]) > 0
+        or pytest_result["status"] in ("FAIL", "TIMEOUT", "ERROR")
+    )
+
+    if has_errors:
+        print(f"\n  ❌ Validation failed — {results['failed']}/{results['total']} files have errors")
+        return {**state, "validation_results": results, "status": "VALIDATION_FAILED"}
+
+    print(f"\n  ✅ Validation passed — {results['passed']}/{results['total']} files clean")
+    return {**state, "validation_results": results, "status": "VALIDATION_PASSED"}
 
     # Standard pass/fail decision
     has_errors = (

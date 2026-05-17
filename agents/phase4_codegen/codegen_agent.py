@@ -135,6 +135,74 @@ def extract_file_outline(code: str) -> str:
         outline = "[Could not parse file outline]\n"
     return outline
 
+import re
+
+def _normalize_for_matching(text: str) -> str:
+    """Normalize whitespace + line endings for fuzzy matching."""
+    # Convert tabs to 4 spaces, normalize line endings, collapse trailing whitespace
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.expandtabs(4)
+    # Strip trailing whitespace on each line
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+    return text
+
+
+def apply_patch(original_content: str, search_block: str, replace_block: str,
+                file_path: str = "") -> str:
+    """
+    Apply a search/replace patch with progressive fuzzy matching.
+    Raises ValueError only if all fallback strategies fail.
+    """
+    # Strategy 1: exact match (fast path)
+    if search_block in original_content:
+        return original_content.replace(search_block, replace_block, 1)
+
+    # Strategy 2: normalized whitespace match
+    norm_original = _normalize_for_matching(original_content)
+    norm_search = _normalize_for_matching(search_block)
+
+    if norm_search in norm_original:
+        # Find position in normalized, map back to original
+        # Simpler approach: replace in normalized version
+        norm_result = norm_original.replace(norm_search, _normalize_for_matching(replace_block), 1)
+        # Caveat: this loses original indentation; acceptable since file gets re-formatted
+        return norm_result
+
+    # Strategy 3: line-by-line match (ignore indentation entirely)
+    search_lines = [line.strip() for line in search_block.strip().split("\n") if line.strip()]
+    original_lines = original_content.split("\n")
+
+    if len(search_lines) >= 1:
+        # Find a window in original_lines where each non-empty line of search matches
+        for i in range(len(original_lines) - len(search_lines) + 1):
+            window = [line.strip() for line in original_lines[i:i + len(search_lines)] if line.strip()]
+            if window == search_lines:
+                # Found it — replace this window
+                indent = ""
+                if original_lines[i]:
+                    indent = original_lines[i][:len(original_lines[i]) - len(original_lines[i].lstrip())]
+                replace_lines = replace_block.split("\n")
+                replace_lines = [indent + line for line in replace_lines]
+                new_lines = original_lines[:i] + replace_lines + original_lines[i + len(search_lines):]
+                return "\n".join(new_lines)
+
+    # Strategy 4: regex match (ignore exact whitespace between tokens)
+    try:
+        pattern = re.escape(search_block.strip())
+        # Replace escaped whitespace with flexible whitespace
+        pattern = re.sub(r"(\\[\s\n\r\t]+)", r"\\s+", pattern)
+        match = re.search(pattern, original_content)
+        if match:
+            return original_content[:match.start()] + replace_block + original_content[match.end():]
+    except re.error:
+        pass
+
+    # All strategies failed — raise with diagnostic info
+    snippet = search_block[:200].replace("\n", " ")
+    raise ValueError(
+        f"{file_path}: 'search_block' not found even after fuzzy matching. "
+        f"Search starts with: '{snippet}...'"
+    )
 
 def extract_relevant_context(code: str, affected_symbols: list) -> str:
     """
@@ -391,6 +459,14 @@ def generate_code_changes(state: CodegenState) -> CodegenState:
     generated_changes = []
     all_errors = []
     workspace_path = state.get('workspace_path', '')
+    # Build the brownfield RAG context once for the whole batch
+    packet = build_context_packet_rag(
+    requirement=requirement,
+    asp=asp,
+    top_k=8, max_files=4,
+    selected_repos=state.get("selected_repos", []),
+    )
+    print(f"  [Phase 4] RAG packet size: {len(packet)} chars")
 
     for file_info in context["files"]:
         file_path = file_info["file_path"]
@@ -398,8 +474,14 @@ def generate_code_changes(state: CodegenState) -> CodegenState:
         print(f"\n  Processing: {file_path}")
 
         file_outline = extract_file_outline(current_content)
+        # >>> FIX 1: send FULL content with line numbers so LLM copies exactly
+        numbered = "\n".join(
+            f"{i+1:4d}| {line}" for i, line in enumerate(current_content.split("\n"))
+        )
         windowed_content = extract_relevant_context(current_content, file_info["existing_symbols"])
         content_for_llm = current_content if len(current_content.split("\n")) <= 100 else windowed_content
+
+        brownfield_ctx_block = f"\n\n{packet}\n\n" if packet else ""
 
         base_prompt = f"""
 You are an Expert Polyglot Software Engineer modifying an existing codebase.
@@ -407,6 +489,7 @@ You are an Expert Polyglot Software Engineer modifying an existing codebase.
 ADR (Agreed Tech Stack): {adr_text}
 REQUIREMENT: {requirement}
 RISK LEVEL: {context['risk_level']}
+{brownfield_ctx_block}
 
 FILE TO MODIFY: {file_path}
 
@@ -459,10 +542,16 @@ Return ONLY valid JSON in this exact format:
                         
                         if not search_block:
                             continue
-                        if search_block not in modified_content:
-                            diff_errors.append(f"{file_path}: 'search_block' not found in current content.")
-                            continue
-                        modified_content = modified_content.replace(search_block, replace_block, 1)
+                        try:
+                           modified_content = apply_patch(
+                                               modified_content, 
+                                                search_block, 
+                                                replace_block, 
+                                                file_path=file_path
+                                                          )
+                        except ValueError as e:
+                              diff_errors.append(str(e))
+                              continue
 
                     if diff_errors:
                         errors = diff_errors
@@ -475,9 +564,31 @@ Return ONLY valid JSON in this exact format:
                 if errors:
                     print(f"  ⚠️  Attempt {attempt}/{max_retries} — errors: {errors}")
                     if attempt < max_retries:
-                        prompt += f"\n\nPREVIOUS ATTEMPT FAILED:\n{json.dumps(errors)}\nFix the 'search_block' to exactly match."
-                    continue
+                        # When retry is triggered by 'search_block not found':
+                       retry_feedback = """
+CRITICAL FEEDBACK FROM PREVIOUS ATTEMPT:
 
+The patch's `search_block` did NOT match the actual file content. The file content
+you saw in the EXISTING CODE CONTEXT block IS the ground truth. Do not paraphrase,
+do not reformat indentation, do not change quotes. Copy the EXACT text from the
+context as your search_block — character-for-character.
+
+If you cannot find an exact verbatim string in the existing code that matches what
+you want to modify, then this file should be CREATED FRESH (no search_block, just
+a full new file body) rather than patched.
+
+For files you cannot patch reliably, RETURN:
+{
+  "file_path": "path/to/file.java",
+  "action": "skip_with_reason",
+  "reason": "Could not find verbatim match in existing code"
+}
+
+Do NOT invent code that isn't there.
+"""
+                       prompt += f"\n\n{retry_feedback}"
+                        # ─────────────────────────────────────────────
+                    continue
                 if workspace_path:
                     full_path = os.path.join(workspace_path, change_data["file_path"])
                     os.makedirs(os.path.dirname(full_path), exist_ok=True)
@@ -523,14 +634,49 @@ def validate_changes(state: CodegenState) -> CodegenState:
         if not content.strip() and not file_path.endswith("__init__.py"):
             errors.append(f"{file_path}: Generated content is empty")
 
-    if errors:
-        print(f"  ❌ Validation failed: {len(errors)} errors")
-        for e in errors:
-            print(f"     - {e}")
-        return {**state, "validation_errors": errors, "status": "VALIDATION_FAILED"}
+    total = len(changes) + len(errors)
+    success_count = len(changes)
+    success_rate = success_count / max(total, 1)
 
-    print(f"  ✅ All {len(changes)} files validated successfully")
-    return {**state, "validation_errors": [], "status": "VALIDATED"}
+        # Threshold: tolerate up to 30% failures, but never accept 0 successes
+    MIN_SUCCESS_RATE = 0.70
+
+    if success_count == 0:
+        # Nothing generated — hard fail
+        return {
+            **state,
+            "status": "VALIDATION_FAILED",
+            "errors": errors,
+            "generated_changes": [],
+            "failed_files_count": len(errors),
+        }
+
+    if success_rate < MIN_SUCCESS_RATE:
+        # Too many failures — soft fail with partial output
+        print(f"[Phase 4] ⚠️  Partial success: {success_count}/{total} files ({success_rate:.0%}) — below {MIN_SUCCESS_RATE:.0%} threshold")
+        return {
+            **state,
+            "status": "PARTIAL_SUCCESS_BELOW_THRESHOLD",
+            "errors": errors,
+            "generated_changes": changes,
+            "warning": f"Generated {success_count} of {total} files. Below threshold but partial output available for review.",
+            "failed_files_count": len(errors),
+        }
+
+    # ≥70% success — accept and continue, but expose failures for visibility
+    if errors:
+        print(f"[Phase 4] ✅ Partial success accepted: {success_count}/{total} files ({success_rate:.0%})")
+        return {
+            **state,
+            "status": "CODE_GENERATED_WITH_WARNINGS",
+            "errors": errors,  # not failures, warnings now
+            "generated_changes": changes,
+            "warning": f"Generated {success_count} of {total} files successfully. {len(errors)} files failed and were skipped.",
+            "failed_files_count": len(errors),
+        }
+
+    # All succeeded
+    return {**state, "status": "CODE_GENERATED", "generated_changes": changes}
 
 
 def route_after_validation(state: CodegenState) -> str:

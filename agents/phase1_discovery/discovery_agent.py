@@ -37,6 +37,8 @@ class DiscoveryState(TypedDict):
     human_feedback: str
     approved: bool
     status: str
+    selected_repos: list      # ← ADD
+    is_new_project: bool      # ← ADD
 
 
 # -----------------------------------------
@@ -175,15 +177,57 @@ def classify_intent(state: DiscoveryState) -> DiscoveryState:
 
     # Inject repo_summary into the ASP so downstream agents (codegen)
     # can find asp.repo_summary.matched_repo and fetch existing code.
-    contract["repo_summary"] = repo_summary
-    contract["_is_new_project"] = is_new
-    contract.setdefault("build_mode",
-                        "modify_existing" if (repo_summary.get("exists") and
-                                              repo_summary.get("symbol_overlap", 0) > 0.3)
-                        else "greenfield")
+    # ── HARD OVERRIDE: user's routing choice is the ground truth ──
+# The LLM doesn't know which repo the user selected — we do. Don't let
+# the LLM's guess override the actual user choice.
 
-    print(f"  ✅ Depth: {contract.get('depth_level')} | Policy: {contract.get('policy_mode')} "
-          f"| build_mode: {contract['build_mode']}")
+# Build a richer repo_summary using what we actually know from selected_repos
+    if selected_repos and not is_new:
+        # User selected a real repo — fetch real symbol data from the indexer
+        matched_repo_name = (
+            selected_repos[0]["name"]
+            if isinstance(selected_repos[0], dict)
+            else str(selected_repos[0])
+        )
+
+        try:
+            from knowledge_layer.repo_summary import build_repo_summary
+            repo_summary = build_repo_summary(
+                requirement=state["requirement"],
+                candidate_repo_name=matched_repo_name
+            )
+            print(f"  ✅ Real repo_summary loaded: {matched_repo_name} | "
+                f"symbol_overlap={repo_summary.get('symbol_overlap')} | "
+                f"top_symbols={len(repo_summary.get('top_symbols', []))}")
+        except Exception as e:
+            print(f"  ⚠️ Could not load real repo_summary, using deterministic fallback: {e}")
+            repo_summary = {
+                "exists": True,
+                "matched_repo": matched_repo_name,
+                "match_score": 1.0,           # user explicit pick
+                "symbol_overlap": 0.5,        # assume meaningful overlap
+                "languages": [],
+                "tests_present": False,
+                "top_symbols": [],
+            }
+
+        contract["repo_summary"] = repo_summary
+        contract["_is_new_project"] = False
+        contract["build_mode"] = "modify_existing"   # FORCE — overrides LLM
+        print(f"  🔒 FORCED build_mode=modify_existing (user picked: {matched_repo_name})")
+
+    else:
+        # No selected_repos — trust the classifier's greenfield assessment
+        contract["repo_summary"] = repo_summary
+        contract["_is_new_project"] = is_new
+        contract["build_mode"] = (
+            "modify_existing"
+            if (repo_summary.get("exists") and repo_summary.get("symbol_overlap", 0) > 0.3)
+            else "greenfield"
+        )
+
+    print(f"  ✅ Depth: {contract.get('depth_level')} | Policy: {contract.get('policy_mode')} | "
+        f"build_mode: {contract['build_mode']}")
 
     return {
         **state,

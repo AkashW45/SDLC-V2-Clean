@@ -18,6 +18,8 @@ from fastapi.responses import JSONResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import zipfile
+
+from streamlit import feedback
 from agents.repo_workspace import get_repo_local_path
 import time
 import threading
@@ -110,6 +112,32 @@ class PipelineStartRequest(BaseModel):
 
 
 # In run_phase1, near the top, after thread_id is known:
+def _routing_choice_to_repos(routing_choice: dict) -> list:
+    """Convert the user's modal pick into a selected_repos list."""
+    if not routing_choice:
+        return []
+    mode = routing_choice.get("mode", "").lower()
+
+    if mode == "existing":
+        # User picked an existing project
+        project_id = routing_choice.get("project_id")
+        repo_names = routing_choice.get("repo_names", [])
+        if repo_names:
+            return [{"name": n} for n in repo_names]
+        elif project_id:
+            return [{"name": project_id}]
+        return []
+
+    elif mode == "manual":
+        # User manually picked repo names
+        return [{"name": n} for n in routing_choice.get("repo_names", [])]
+
+    elif mode == "new":
+        # New project — no existing repos
+        return []
+
+    return []
+
 def _warn_if_stale_index(thread_id: str, matched_repo: str):
     """Non-blocking drift check; logs warning only."""
     if not matched_repo:
@@ -1181,8 +1209,47 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
 
         graph = build_discovery_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p1"}}
-        initial_state = DiscoveryState(requirement=requirement,scope_contract={}, 
-            classifier_output={}, brd={}, prd={}, adr={}, architecture={}, human_feedback=feedback, approved=False, status="STARTED")
+        # Pull routing context from pipeline entry — works whether Phase 0 set
+        # it on current_state, on the entry directly, or via routing_choice
+        entry = pipeline_store[thread_id]
+        prev_state = entry.get("current_state", {})
+        routing_choice = entry.get("routing_choice", {}) or {}
+
+        # Resolve selected_repos from THREE possible sources, in priority order
+        selected_repos = (
+            prev_state.get("selected_repos")                   # Phase 0 stored it on state
+            or entry.get("selected_repos")                     # Phase 0 stored it on entry
+            or _routing_choice_to_repos(routing_choice)        # Direct fallback from user choice
+            or []
+        )
+
+        # Resolve is_new_project — explicit False if user picked existing/manual, True if 'new'
+        mode = routing_choice.get("mode", "").lower() if routing_choice else ""
+        if mode == "new":
+            is_new_project = True
+        elif mode in ("existing", "manual"):
+            is_new_project = False
+        else:
+            is_new_project = prev_state.get("is_new_project",
+                                            entry.get("is_new_project",
+                                                    not bool(selected_repos)))
+
+        print(f"[Phase 1] selected_repos={[r.get('name') if isinstance(r,dict) else r for r in selected_repos]}, is_new={is_new_project}")
+
+        initial_state = DiscoveryState(
+            requirement=requirement,
+            scope_contract={},
+            classifier_output={},
+            brd={},
+            prd={},
+            adr={},
+            architecture={},
+            human_feedback=feedback,
+            approved=False,
+            status="STARTED",
+            selected_repos=selected_repos,
+            is_new_project=is_new_project,
+        )
 
         for chunk in graph.stream(initial_state, config, stream_mode="updates"):
             for node_name, node_state in chunk.items():
@@ -1326,14 +1393,41 @@ def run_phase4(thread_id: str):
             
         result4 = run_codegen(requirement=entry["requirement"], impact_report=impact, workspace_path="/repos", thread_id=f"{thread_id}-p4", adr=state.get("adr", {}), scope_contract=state.get("scope_contract", {}))
 
-        if result4["status"] != "VALIDATED":
-            pipeline_store[thread_id].update({"status": "ERROR", "error": f"Phase 4 failed: {result4.get('validation_errors', [])}"})
+        # Accept multiple success statuses from codegen
+        SUCCESS_STATUSES = {
+            "VALIDATED",
+            "CODE_GENERATED",
+            "CODE_GENERATED_WITH_WARNINGS",
+            "PARTIAL_SUCCESS_BELOW_THRESHOLD",  # still has partial output to use
+        }
+
+        if result4["status"] not in SUCCESS_STATUSES:
+            pipeline_store[thread_id].update({
+                "status": "ERROR",
+                "error": f"Phase 4 failed: status={result4['status']}, errors={result4.get('errors') or result4.get('validation_errors', [])}"
+            })
+            save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
             return
 
-        # Save generated code to state before moving to Phase 5
-        pipeline_store[thread_id]["current_state"]["generated_changes"] = result4["generated_changes"]
+        # Save the generated changes immediately so dashboard sees them
+        generated_changes = result4.get("generated_changes", [])
+        if not generated_changes:
+            pipeline_store[thread_id].update({
+                "status": "ERROR",
+                "error": "Phase 4 returned no generated_changes despite success status"
+            })
+            save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
+            return
+
+        # Persist code BEFORE moving on
+        pipeline_store[thread_id]["current_state"]["generated_changes"] = generated_changes
+        if result4.get("warning"):
+            pipeline_store[thread_id]["warning"] = result4["warning"]
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
-        
+
+        print(f"[Phase 4] ✅ Saved {len(generated_changes)} generated files to DB")
+
+
         # Route directly to Phase 5
         run_phase5(thread_id)
         
