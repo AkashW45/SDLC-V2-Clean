@@ -13,6 +13,7 @@ import re
 import subprocess
 import tempfile
 from typing import TypedDict
+from click import prompt
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from groq import Groq
@@ -56,7 +57,7 @@ class ValidationState(TypedDict):
 MODEL="deepseek-v4-flash"  # Using the same model as Main for consistency
 def call_llm(prompt: str, max_tokens: int = 8192) -> str:
     response = client.chat.completions.create(
-        model="deepseek-v4-pro",
+        model=MODEL,
         messages=[{"role": "user", "content": prompt}],
         stream=False,
         reasoning_effort="high",
@@ -104,57 +105,9 @@ def run_semgrep_gate(workspace_path: str) -> dict:
 # -----------------------------------------
 # Nodes
 # -----------------------------------------
-
-def _process_single_test(change, requirement, previous_errors, scope_contract, depth_level):
-    """Worker function to generate a test for a single file concurrently."""
-    file_path = change.get("file_path", "")
-    if not file_path.endswith(".py"): return None
-
-    content = change.get("content", "")
-    safe_file_name = file_path.replace("/", "_").replace("\\", "_").replace(".py", "")
-
-    error_feedback = ""
-    if previous_errors:
-        error_feedback = "IMPORTANT — YOUR PREVIOUS ATTEMPT FAILED WITH THESE ERRORS:\n" + "\n".join(f"  - {e}" for e in previous_errors)
-
-    user_msg = json.dumps({
-        "scope_contract": scope_contract,
-        "requirement": requirement,
-        "file_path": file_path,
-        "safe_test_file_name": f"tests/test_{safe_file_name}.py",
-        "file_content": content,
-        "change_summary": change.get("change_summary", ""),
-        "new_symbols_added": change.get("new_symbols_added", []),
-        "existing_symbols_modified": change.get("existing_symbols_modified", []),
-        "error_feedback": error_feedback or None,
-        "depth_level": depth_level
-    }, indent=2)
-
-    api_response = client.chat.completions.create(
-        model=MODEL, # Using your Main's specified model
-        messages=[
-            {"role": "system", "content": TESTGEN_SYSTEM},
-            {"role": "user", "content": user_msg}
-        ],
-        max_tokens=2000, stream=False
-    )
-    response = api_response.choices[0].message.content.strip()
-
-    if response.startswith("```"):
-        response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
-
-    try:
-        data = json.loads(response, strict=False)
-        items = data.get("test_files", []) if "test_files" in data else [data]
-        valid_tests = []
-        for test_file in items:
-            errors = validate_python_syntax(test_file.get("content", ""), test_file.get("test_file_path", ""))
-            if errors: test_file["errors"] = errors
-            valid_tests.append(test_file)
-        return valid_tests
-    except json.JSONDecodeError:
-        return None
-
+# ─────────────────────────────────────────────────────────────
+# Polyglot test generation — language detection + frameworks
+# ─────────────────────────────────────────────────────────────
 
 def _detect_language(file_path: str) -> str:
     """Map file extension to language."""
@@ -164,138 +117,369 @@ def _detect_language(file_path: str) -> str:
     if p.endswith((".js", ".jsx", ".mjs")): return "javascript"
     if p.endswith((".ts", ".tsx")): return "typescript"
     if p.endswith(".go"): return "go"
-    if p.endswith((".cs",)): return "csharp"
-    if p.endswith((".rb",)): return "ruby"
-    if p.endswith((".rs",)): return "rust"
-    if p.endswith((".php",)): return "php"
-    if p.endswith((".kt",)): return "kotlin"
+    if p.endswith(".cs"): return "csharp"
+    if p.endswith(".rb"): return "ruby"
+    if p.endswith(".rs"): return "rust"
+    if p.endswith(".php"): return "php"
+    if p.endswith(".kt"): return "kotlin"
     return "unknown"
 
 
-# Test framework + path conventions per language
 _LANG_TEST_CONVENTIONS = {
-    "python":    {"framework": "pytest",     "import": "import pytest", "ext": ".py",   "path_xform": lambda p: p.replace("app/", "tests/").replace(".py", "_test.py") if "/test" not in p else p},
-    "java":      {"framework": "JUnit 5",    "import": "import org.junit.jupiter.api.Test;", "ext": ".java", "path_xform": lambda p: p.replace("/main/", "/test/").replace(".java", "Tests.java") if "/test/" not in p else p},
-    "javascript":{"framework": "Jest",       "import": "const { test, expect } = require('@jest/globals');", "ext": ".test.js", "path_xform": lambda p: p.replace(".js", ".test.js") if ".test." not in p else p},
-    "typescript":{"framework": "Jest",       "import": "import { test, expect } from '@jest/globals';", "ext": ".test.ts", "path_xform": lambda p: p.replace(".ts", ".test.ts") if ".test." not in p else p},
-    "go":        {"framework": "testing pkg","import": "import \"testing\"", "ext": "_test.go", "path_xform": lambda p: p.replace(".go", "_test.go") if "_test.go" not in p else p},
-    "csharp":    {"framework": "xUnit",      "import": "using Xunit;", "ext": "Tests.cs", "path_xform": lambda p: p.replace(".cs", "Tests.cs") if "Tests.cs" not in p else p},
-    "ruby":      {"framework": "RSpec",      "import": "require 'rspec'", "ext": "_spec.rb", "path_xform": lambda p: p.replace(".rb", "_spec.rb").replace("lib/", "spec/") if "_spec.rb" not in p else p},
-    "kotlin":    {"framework": "JUnit 5",    "import": "import org.junit.jupiter.api.Test", "ext": "Tests.kt", "path_xform": lambda p: p.replace(".kt", "Tests.kt") if "Tests.kt" not in p else p},
+    "python":    {"framework": "pytest",     "import": "import pytest", "ext": ".py"},
+    "java":      {"framework": "JUnit 5",    "import": "import org.junit.jupiter.api.Test;", "ext": ".java"},
+    "javascript":{"framework": "Jest",       "import": "const { test, expect } = require('@jest/globals');", "ext": ".test.js"},
+    "typescript":{"framework": "Jest",       "import": "import { test, expect } from '@jest/globals';", "ext": ".test.ts"},
+    "go":        {"framework": "testing pkg","import": "import \"testing\"", "ext": "_test.go"},
+    "csharp":    {"framework": "xUnit",      "import": "using Xunit;", "ext": "Tests.cs"},
+    "ruby":      {"framework": "RSpec",      "import": "require 'rspec'", "ext": "_spec.rb"},
+    "kotlin":    {"framework": "JUnit 5",    "import": "import org.junit.jupiter.api.Test", "ext": "Tests.kt"},
+    "rust":      {"framework": "built-in",   "import": "#[cfg(test)]", "ext": ".rs"},
+    "php":       {"framework": "PHPUnit",    "import": "use PHPUnit\\Framework\\TestCase;", "ext": "Test.php"},
 }
 
+def _sanitize_for_json(obj):
+    """Strip non-serializable items (functions, lambdas, etc) from a nested dict."""
+    if callable(obj):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items() if not callable(v)}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj if not callable(v)]
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    # Fallback: try str repr
+    try:
+        json.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
 
-def generate_tests(state: ValidationState) -> ValidationState:
-    """Polyglot test generator — detects language per file and uses appropriate framework."""
-    print("\n[Phase 5] Generating tests (polyglot)...")
+def _suggest_test_path(file_path: str, lang: str) -> str:
+    """Generate a language-appropriate test file path."""
+    p = file_path.replace("\\", "/")
+    if lang == "python":
+        if "/test" in p or p.startswith("tests/"):
+            return p
+        safe = p.replace("/", "_").replace(".py", "")
+        return f"tests/test_{safe}.py"
+    if lang == "java":
+        if "/test/" in p:
+            return p
+        return p.replace("/main/", "/test/").replace(".java", "Tests.java")
+    if lang == "javascript":
+        if ".test." in p:
+            return p
+        return p.replace(".js", ".test.js")
+    if lang == "typescript":
+        if ".test." in p:
+            return p
+        return p.replace(".ts", ".test.ts")
+    if lang == "go":
+        if "_test.go" in p:
+            return p
+        return p.replace(".go", "_test.go")
+    if lang == "csharp":
+        if "Tests.cs" in p:
+            return p
+        return p.replace(".cs", "Tests.cs")
+    if lang == "ruby":
+        if "_spec.rb" in p:
+            return p
+        return p.replace(".rb", "_spec.rb").replace("lib/", "spec/")
+    if lang == "kotlin":
+        if "Tests.kt" in p:
+            return p
+        return p.replace(".kt", "Tests.kt")
+    return p + ".test"
 
-    test_files = []
 
-    for change in state["generated_changes"]:
-        file_path = change.get("file_path", "")
-        content = change.get("content", "")
-        change_summary = change.get("change_summary", "")
-        new_symbols = change.get("new_symbols_added", [])
-        modified_symbols = change.get("existing_symbols_modified", [])
+def _is_test_file(file_path: str) -> bool:
+    """Check if a file IS already a test file (don't generate tests for tests)."""
+    p = file_path.replace("\\", "/").lower()
+    if "/test/" in p or "/tests/" in p:
+        return True
+    if p.startswith("test/") or p.startswith("tests/"):
+        return True
+    if any(p.endswith(suffix) for suffix in (
+        "_test.go", ".test.js", ".test.ts", "_spec.rb",
+        "tests.java", "tests.cs", "tests.kt", "test.php"
+    )):
+        return True
+    # Python: test_*.py or *_test.py
+    fname = p.rsplit("/", 1)[-1]
+    if fname.startswith("test_") and fname.endswith(".py"):
+        return True
+    if fname.endswith("_test.py"):
+        return True
+    return False
 
-        # Skip generating tests for test files themselves
-        if "/test/" in file_path.replace("\\", "/") or "/tests/" in file_path.replace("\\", "/") \
-           or file_path.lower().endswith(("_test.go", ".test.js", ".test.ts", "_spec.rb")) \
-           or "Tests.java" in file_path or "Tests.cs" in file_path or "Tests.kt" in file_path:
-            print(f"  ⏭️  Skipping test gen for test file: {file_path}")
-            continue
+def _parse_delimited_test_response(response: str) -> dict:
+    """
+    Parse a delimited LLM response of the form:
+      <TEST_FILE_PATH>...</TEST_FILE_PATH>
+      <TEST_COUNT>...</TEST_COUNT>
+      <TESTS_COVER>...</TESTS_COVER>
+      <TEST_CONTENT>...</TEST_CONTENT>
+    Returns dict with keys: test_file_path, test_count, tests_cover, content.
+    """
+    result = {}
 
-        lang = _detect_language(file_path)
-        conv = _LANG_TEST_CONVENTIONS.get(lang)
+    # Strip any markdown fences the LLM might still include
+    response = re.sub(r"^```[\w]*\s*", "", response.strip(), flags=re.MULTILINE)
+    response = re.sub(r"\s*```$", "", response.strip(), flags=re.MULTILINE)
 
-        if not conv:
-            print(f"  ⚠️  Unknown language for {file_path} — skipping test generation")
-            continue
+    def extract(tag: str) -> str:
+        pattern = rf"<{tag}>(.*?)</{tag}>"
+        match = re.search(pattern, response, re.DOTALL)
+        return match.group(1).strip() if match else ""
 
-        print(f"\n  Generating {conv['framework']} tests for: {file_path}")
+    test_file_path = extract("TEST_FILE_PATH")
+    test_count_str = extract("TEST_COUNT")
+    tests_cover_str = extract("TESTS_COVER")
+    content = extract("TEST_CONTENT")
 
-        suggested_test_path = conv["path_xform"](file_path.replace("\\", "/"))
+    # ─── SALVAGE: handle unclosed <TEST_CONTENT> tag (LLM truncation) ───
+    if not content and "<TEST_CONTENT>" in response:
+        # Grab everything from <TEST_CONTENT> to end of string
+        start_idx = response.index("<TEST_CONTENT>") + len("<TEST_CONTENT>")
+        end_idx = response.find("</TEST_CONTENT>", start_idx)
+        if end_idx == -1:
+            # No closing tag — take the rest
+            content = response[start_idx:].strip()
+            print(f"  [Phase 5] ⚠️  Salvaged content from unclosed TEST_CONTENT tag")
+        else:
+            content = response[start_idx:end_idx].strip()
+    # If the content is wrapped in code fences, strip them
+    content_stripped = content
+    if content_stripped.startswith("```"):
+        lines = content_stripped.split("\n", 1)
+        if len(lines) > 1:
+            content_stripped = lines[1]
+        if content_stripped.endswith("```"):
+            content_stripped = content_stripped[:-3].rstrip()
+        elif "```" in content_stripped:
+            content_stripped = content_stripped.rsplit("```", 1)[0].rstrip()
 
-        user_msg = json.dumps({
-            "language": lang,
-            "test_framework": conv["framework"],
-            "suggested_test_path": suggested_test_path,
-            "scope_contract": state.get("scope_contract", {}),
-            "file_path": file_path,
-            "content": content,
-            "change_summary": change_summary,
-            "new_symbols": new_symbols,
-            "modified_symbols": modified_symbols,
-            "requirement": state["requirement"],
-        }, indent=2)
+    result["test_file_path"] = test_file_path or ""
+    result["content"] = content_stripped
 
-        system_prompt = (
-            f"You are a senior QA engineer writing {conv['framework']} tests in {lang}.\n"
-            f"\n"
-            f"RULES:\n"
-            f"1. Generate tests in {lang} using {conv['framework']}.\n"
-            f"2. Use the SUGGESTED test path (or a similar path matching the language's conventions).\n"
-            f"3. Cover: happy path, error path, edge cases — at least 3 tests.\n"
-            f"4. Tests must be syntactically valid — they will be compiled/parsed.\n"
-            f"5. Reference real symbols from the source — do NOT invent classes/functions.\n"
-            f"\n"
-            f"Return ONLY valid JSON in this shape:\n"
-            f"{{\n"
-            f'  "test_file_path": "...",  // language-appropriate path\n'
-            f'  "language": "{lang}",\n'
-            f'  "framework": "{conv["framework"]}",\n'
-            f'  "content": "...",  // full file content\n'
-            f'  "test_count": N,\n'
-            f'  "tests_cover": ["happy_path", "edge_case_X", ...]\n'
-            f"}}\n"
+    try:
+        result["test_count"] = int(test_count_str) if test_count_str else 0
+    except ValueError:
+        result["test_count"] = 0
+
+    if tests_cover_str:
+        result["tests_cover"] = [c.strip() for c in tests_cover_str.split(",") if c.strip()]
+    else:
+        result["tests_cover"] = []
+
+    return result
+
+
+def _process_single_test(change, requirement, previous_errors, scope_contract, depth_level):
+    """
+    Polyglot worker — generates tests for ONE source file.
+    Uses delimiter-based output (not JSON-wrapped) to avoid escape-hell.
+    """
+    file_path = change.get("file_path", "")
+    if not file_path:
+        return None
+
+    if _is_test_file(file_path):
+        return None
+
+    lang = _detect_language(file_path)
+    conv = _LANG_TEST_CONVENTIONS.get(lang)
+    if not conv:
+        print(f"  [Phase 5] ⏭️  Skipping unsupported language for: {file_path}")
+        return None
+
+    content = change.get("content", "")
+    suggested_test_path = _suggest_test_path(file_path, lang)
+
+    error_feedback = ""
+    if previous_errors:
+        error_feedback = (
+            "PREVIOUS ATTEMPT FAILED WITH THESE ERRORS:\n"
+            + "\n".join(f"  - {e}" for e in previous_errors)
         )
 
-        try:
-            response = client.chat.completions.create(
-                model="deepseek-v4-pro",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_msg},
-                ],
-                max_tokens=3000,
-            )
+    safe_scope = _sanitize_for_json(scope_contract) if scope_contract else {}
 
-            raw = response.choices[0].message.content.strip()
-            if raw.startswith("```"):
-                raw = re.sub(r"```(?:json)?", "", raw).strip().strip("```").strip()
+    # ─── DELIMITER-BASED PROMPT (no JSON-wrapped code) ───
+    system_prompt = f"""You are a senior QA engineer writing {conv['framework']} tests in {lang}.
 
-            test_file = json.loads(raw)
+You will receive a source file. Generate a test file for it.
 
-            # Validate based on language
-            if lang == "python":
-                errors = validate_python_syntax(
-                    test_file.get("content", ""),
-                    test_file.get("test_file_path", ""),
-                )
-                if errors:
-                    test_file["syntax_errors"] = errors
-                    print(f"  ⚠️  Test syntax errors: {errors}")
+OUTPUT FORMAT — strict, use these exact delimiters:
+
+<TEST_FILE_PATH>
+{suggested_test_path}
+</TEST_FILE_PATH>
+<TEST_COUNT>
+N
+</TEST_COUNT>
+<TESTS_COVER>
+happy_path, edge_case_x, error_path_y
+</TESTS_COVER>
+<TEST_CONTENT>
+// the complete test file content here — raw code, no escaping needed
+</TEST_CONTENT>
+
+RULES:
+1. Use {conv['framework']} as the test framework.
+2. Cover 3-6 tests: happy path, error path, edge cases.
+3. Tests must be valid {lang} that compiles/parses.
+4. Reference REAL symbols from the source — do NOT invent classes or methods.
+5. Use the SUGGESTED test path or a similar path following {lang} conventions.
+6. Do NOT include markdown fences, explanations, or any text outside the delimiters.
+"""
+
+    user_msg = f"""LANGUAGE: {lang}
+FRAMEWORK: {conv['framework']}
+SUGGESTED_TEST_PATH: {suggested_test_path}
+REQUIREMENT: {requirement}
+DEPTH_LEVEL: {depth_level}
+FILE_PATH: {file_path}
+
+CHANGE SUMMARY:
+{change.get('change_summary', '')}
+
+NEW SYMBOLS ADDED: {change.get('new_symbols_added', [])}
+EXISTING SYMBOLS MODIFIED: {change.get('existing_symbols_modified', [])}
+
+{error_feedback}
+
+SOURCE FILE CONTENT:
+```{lang}
+{content}
+```
+
+Now generate the test file using the delimited format above.
+"""
+
+    try:
+        api_response = client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=15000,
+            stream=False,
+        )
+        response = api_response.choices[0].message.content.strip()
+
+        # ─── HANDLE TRUNCATION ─────────────────────────────────────
+        # Check finish_reason: 'length' = truncated due to max_tokens
+        finish_reason = api_response.choices[0].finish_reason if api_response.choices else None
+        if finish_reason == "length":
+            print(f"  [Phase 5] ⚠️  Response truncated for {file_path} — attempting salvage")
+            # If we have an unclosed <TEST_CONTENT>, force-close it
+            if "<TEST_CONTENT>" in response and "</TEST_CONTENT>" not in response:
+                response = response + "\n</TEST_CONTENT>"
+
+        # Parse delimited response
+        parsed = _parse_delimited_test_response(response)
+        if not parsed:
+            print(f"  [Phase 5] ❌ Could not parse delimited response for {file_path}")
+            print(f"  [Phase 5] First 500 chars of LLM response:")
+            print(f"  ─── {response[:500]} ───")
+            return None
+
+        test_path = parsed.get("test_file_path") or suggested_test_path
+        test_content = parsed.get("content", "")
+
+        if not test_content or len(test_content) < 30:
+            print(f"  [Phase 5] ⚠️  Generated test content too short for {file_path}")
+            return None
+
+        test_file = {
+            "test_file_path": test_path,
+            "content": test_content,
+            "test_count": parsed.get("test_count", 0),
+            "tests_cover": parsed.get("tests_cover", []),
+            "language": lang,
+            "framework": conv["framework"],
+        }
+
+        # Validate
+        if lang == "python":
+            errors = validate_python_syntax(test_content, test_path)
+            if errors:
+                test_file["errors"] = errors
+        else:
+            markers = {
+                "java": ["@Test", "import"],
+                "javascript": ["test(", "describe(", "expect("],
+                "typescript": ["test(", "describe(", "expect("],
+                "go": ["func Test", "*testing.T"],
+                "csharp": ["[Fact]", "[Theory]"],
+                "ruby": ["describe", "it ", "expect("],
+                "kotlin": ["@Test", "fun "],
+                "rust": ["#[test]", "fn "],
+                "php": ["public function test", "extends TestCase"],
+            }
+            expected = markers.get(lang, [])
+            found = sum(1 for m in expected if m in test_content)
+            if expected and found == 0:
+                test_file["errors"] = [f"{test_path}: no {lang} test markers found"]
+
+        return [test_file]
+
+    except Exception as e:
+        print(f"  [Phase 5] ❌ Test gen error for {file_path}: {e}")
+        return None
+    
+
+def generate_tests(state: ValidationState) -> ValidationState:
+    print("\n[Phase 5] Generating tests (Concurrent, Polyglot)...")
+    test_files = []
+    requirement = state.get("requirement", "")
+    previous_errors = state.get("last_errors", [])
+    scope_contract = state.get("scope_contract", {})
+    depth_level = scope_contract.get("depth_level", 3) if scope_contract else 3
+
+    changes = state.get("generated_changes", []) or []
+    if not changes:
+        print("  [Phase 5] ⏭️  No generated changes to test")
+        return {**state, "test_files": [], "status": "TESTS_GENERATED"}
+
+    # Group by language for visibility
+    lang_counts = {}
+    for c in changes:
+        lang = _detect_language(c.get("file_path", ""))
+        lang_counts[lang] = lang_counts.get(lang, 0) + 1
+    print(f"  [Phase 5] Languages detected: {dict(lang_counts)}")
+
+    # Concurrent fan-out (teammate's pattern)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(
+                _process_single_test,
+                change, requirement, previous_errors, scope_contract, depth_level
+            ): change.get("file_path", "?")
+            for change in changes
+        }
+
+        completed = 0
+        for future in concurrent.futures.as_completed(futures):
+            file_path = futures[future]
+            completed += 1
+            try:
+                result = future.result()
+                if result:
+                    test_files.extend(result)
+                    test_count = sum(t.get("test_count", 0) for t in result)
+                    framework = result[0].get("framework", "?") if result else "?"
+                    print(f"  [Phase 5] ({completed}/{len(changes)}) ✅ {framework}: {test_count} tests for {file_path}")
                 else:
-                    print(f"  ✅ {conv['framework']} tests generated: {test_file.get('test_count', 0)} tests")
-            else:
-                # For non-Python languages, do a basic sanity check (non-empty + has framework keyword)
-                tc = test_file.get("content", "")
-                if not tc or len(tc) < 50:
-                    print(f"  ⚠️  Generated test file too short or empty for {file_path}")
-                    continue
-                print(f"  ✅ {conv['framework']} tests generated: {test_file.get('test_count', 'N/A')} tests")
+                    print(f"  [Phase 5] ({completed}/{len(changes)}) ⏭️  Skipped: {file_path}")
+            except Exception as e:
+                print(f"  [Phase 5] ({completed}/{len(changes)}) ❌ Worker exception for {file_path}: {e}")
 
-            test_file["language"] = lang
-            test_files.append(test_file)
-
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"  ❌ Failed to parse test response for {file_path}: {e}")
-            continue
-        except Exception as e:
-            print(f"  ❌ Test generation error for {file_path}: {e}")
-            continue
-
-    print(f"\n[Phase 5] Generated {len(test_files)} test files across multiple languages")
+    print(f"\n[Phase 5] Generated {len(test_files)} test files total")
     return {**state, "test_files": test_files, "status": "TESTS_GENERATED"}
 
 def run_semgrep_gate(workspace_path: str) -> dict:

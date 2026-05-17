@@ -14,7 +14,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from groq import Groq
 import sys
-
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from api.jira_client import fetch_jira_metadata
 from api.persistence import save_artifact
@@ -197,13 +198,15 @@ Generate the sprint plan and Jira tickets per the ABSOLUTE RULES above.
     return {**state, "sprint_plan": sprint_plan, "status": "SPRINT_PLAN_GENERATED"}
 
 def create_jira_tickets(state: PlanningState) -> PlanningState:
-    """Create Jira epics and stories from sprint plan."""
+    """Create Jira epics and stories from sprint plan, in parallel."""
     print("\n[Phase 2] Creating Jira tickets...")
 
     try:
         import os
         import base64
         import httpx
+        import concurrent.futures
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         from api.jira_client import fetch_jira_metadata
 
@@ -220,81 +223,101 @@ def create_jira_tickets(state: PlanningState) -> PlanningState:
             "Content-Type": "application/json"
         }
 
-        epics = state["sprint_plan"].get("epics", [])
-        created_tickets = []
-
-        for epic in epics:
-            # Create Epic
+        # ─── Helper: create one ticket (epic or story) ──────────────
+        def _create_one_ticket(ticket_data: dict, ticket_type: str) -> dict:
+            """Returns {'key': 'DEV-123', 'title': '...', 'type': 'Epic'} or {'error': ...}"""
             try:
-                epic_resp = httpx.post(
-                    f"https://{domain}/rest/api/3/issue",
-                    headers=headers,
-                    json={"fields": {
+                if ticket_type == "Epic":
+                    payload = {"fields": {
                         "project": {"key": project_key},
-                        "summary": epic["title"],
+                        "summary": ticket_data["title"],
                         "description": {
                             "type": "doc", "version": 1,
                             "content": [{"type": "paragraph", "content": [
-                                {"type": "text", "text": epic.get("description", "")}
+                                {"type": "text", "text": ticket_data.get("description", "")}
                             ]}]
                         },
                         "issuetype": {"id": jira_meta["issue_types"].get("Epic", "")},
                         "priority": {"id": jira_meta["priorities"].get("Medium", "")},
                         "labels": ["ai-generated", "sdlc-v2"]
-                    }},
-                    timeout=15
+                    }}
+                else:  # Story
+                    ac_list = ticket_data.get("acceptance_criteria", [])
+                    ac_text = ""
+                    if ac_list:
+                        ac_text = "\n\nAcceptance Criteria:\n" + "\n".join(f"- {ac}" for ac in ac_list)
+                    full_desc = ticket_data.get("description", "") + ac_text
+
+                    payload = {"fields": {
+                        "project": {"key": project_key},
+                        "summary": ticket_data["title"],
+                        "description": {
+                            "type": "doc", "version": 1,
+                            "content": [{"type": "paragraph", "content": [
+                                {"type": "text", "text": full_desc}
+                            ]}]
+                        },
+                        "issuetype": {"id": jira_meta["issue_types"].get("Story", "")},
+                        "priority": {"id": jira_meta["priorities"].get("Medium", "")},
+                        "labels": ["ai-generated", "sdlc-v2"]
+                    }}
+
+                resp = httpx.post(
+                    f"https://{domain}/rest/api/3/issue",
+                    headers=headers,
+                    json=payload,
+                    timeout=15,
                 )
-                if epic_resp.status_code == 201:
-                    epic_key = epic_resp.json()["key"]
-                    created_tickets.append(epic_key)
-                    print(f"  ✅ Epic: {epic_key} — {epic['title']}")
+
+                if resp.status_code == 201:
+                    return {
+                        "key": resp.json()["key"],
+                        "title": ticket_data["title"],
+                        "type": ticket_type,
+                    }
                 else:
-                    print(f"  ⚠️  Epic failed: {epic_resp.text[:100]}")
-                    continue
-
+                    return {"error": f"{ticket_type} '{ticket_data['title']}' failed: {resp.text[:200]}"}
             except Exception as e:
-                print(f"  ⚠️  Epic error: {e}")
-                continue
+                return {"error": f"{ticket_type} '{ticket_data.get('title', '?')}' exception: {e}"}
 
-            # Create Stories under Epic
+        # ─── Main flow ──────────────────────────────────────────────
+        epics = state["sprint_plan"].get("epics", [])
+        created_tickets = []
+
+        if not epics:
+            print("  ⚠️  No epics to create — skipping Jira phase")
+            return {**state, "jira_tickets": [], "status": "JIRA_SKIPPED"}
+
+        # Step 1: Create all Epics in parallel
+        print(f"  [Phase 2] Creating {len(epics)} epics in parallel...")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            epic_futures = {executor.submit(_create_one_ticket, e, "Epic"): e for e in epics}
+            for fut in as_completed(epic_futures):
+                result = fut.result()
+                if "error" in result:
+                    print(f"    ⚠️  {result['error']}")
+                else:
+                    created_tickets.append(result["key"])
+                    print(f"    ✅ Epic: {result['key']} — {result['title']}")
+
+        # Step 2: Collect all stories across all epics
+        all_stories = []
+        for epic in epics:
             for story in epic.get("stories", []):
-                try:
-                    ac_text = "\n".join(
-                        f"- {ac}" for ac in story.get("acceptance_criteria", [])
-                    )
-                    full_desc = (
-                        f"{story.get('description', '')}"
-                        f"\n\nAcceptance Criteria:\n{ac_text}"
-                    )
+                all_stories.append(story)
 
-                    story_resp = httpx.post(
-                        f"https://{domain}/rest/api/3/issue",
-                        headers=headers,
-                        json={"fields": {
-                            "project": {"key": project_key},
-                            "summary": story["title"],
-                            "description": {
-                                "type": "doc", "version": 1,
-                                "content": [{"type": "paragraph", "content": [
-                                    {"type": "text", "text": full_desc}
-                                ]}]
-                            },
-                            "issuetype": {"id": jira_meta["issue_types"].get("Story", "")},
-                            "priority": {"id": jira_meta["priorities"].get("Medium", "")},
-                            "labels": ["ai-generated", "sdlc-v2"]
-                        }},
-                        timeout=15
-                    )
-
-                    if story_resp.status_code == 201:
-                        story_key = story_resp.json()["key"]
-                        created_tickets.append(story_key)
-                        print(f"    ✅ Story: {story_key} — {story['title']}")
+        # Step 3: Create all Stories in parallel
+        if all_stories:
+            print(f"  [Phase 2] Creating {len(all_stories)} stories in parallel...")
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                story_futures = {executor.submit(_create_one_ticket, s, "Story"): s for s in all_stories}
+                for fut in as_completed(story_futures):
+                    result = fut.result()
+                    if "error" in result:
+                        print(f"    ⚠️  {result['error']}")
                     else:
-                        print(f"    ⚠️  Story failed: {story_resp.text[:100]}")
-
-                except Exception as e:
-                    print(f"    ⚠️  Story error: {e}")
+                        created_tickets.append(result["key"])
+                        print(f"    ✅ Story: {result['key']} — {result['title']}")
 
         print(f"\n  ✅ Total tickets created: {len(created_tickets)}")
         return {

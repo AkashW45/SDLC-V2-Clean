@@ -45,3 +45,6 @@ tenacity
 openpyxl
 psycopg_pool
 psycopg[binary]
+
+streamlit
+apscheduler
