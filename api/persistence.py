@@ -112,27 +112,28 @@ def save_pipeline(thread_id: str, entry: dict, safe_state: dict):
         conn = _conn()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO pipelines
-              (thread_id, requirement, status, phase, sub_stage, current_state, pr_urls, error, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (thread_id) DO UPDATE SET
-              status = EXCLUDED.status,
-              phase = EXCLUDED.phase,
-              sub_stage = EXCLUDED.sub_stage,
-              current_state = EXCLUDED.current_state,
-              pr_urls = EXCLUDED.pr_urls,
-              error = EXCLUDED.error,
-              updated_at = NOW()
-        """, (
-            thread_id,
-            entry.get("requirement", ""),
-            entry.get("status", ""),
-            entry.get("phase", ""),
-            entry.get("sub_stage", ""),
-            json.dumps(safe_state),
-            json.dumps(entry.get("pr_urls", [])),
-            entry.get("error") or ""
-        ))
+    INSERT INTO pipelines
+      (thread_id, user_id, requirement, status, phase, sub_stage, current_state, pr_urls, error, updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+    ON CONFLICT (thread_id) DO UPDATE SET
+      status = EXCLUDED.status,
+      phase = EXCLUDED.phase,
+      sub_stage = EXCLUDED.sub_stage,
+      current_state = EXCLUDED.current_state,
+      pr_urls = EXCLUDED.pr_urls,
+      error = EXCLUDED.error,
+      updated_at = NOW()
+""", (
+    thread_id,
+    entry.get("user_id", "anonymous"),
+    entry.get("requirement", ""),
+    entry.get("status", ""),
+    entry.get("phase", ""),
+    entry.get("sub_stage", ""),
+    json.dumps(safe_state),
+    json.dumps(entry.get("pr_urls", [])),
+    entry.get("error") or ""
+))
         conn.commit()
         cur.close()
         conn.close()
@@ -146,25 +147,26 @@ def load_all_pipelines() -> dict:
         conn = _conn()
         cur = conn.cursor()
         cur.execute("""
-            SELECT thread_id, requirement, status, phase, sub_stage,
-                   current_state, pr_urls, error, updated_at
-            FROM pipelines
-            ORDER BY updated_at DESC
-            LIMIT 50
-        """)
+    SELECT thread_id, user_id, requirement, status, phase, sub_stage,
+           current_state, pr_urls, error, updated_at
+    FROM pipelines
+    ORDER BY updated_at DESC
+    LIMIT 50
+""")
         for row in cur.fetchall():
             tid = row[0]
             out[tid] = {
-                "thread_id": tid,
-                "requirement": row[1],
-                "status": row[2] or "",
-                "phase": row[3] or "",
-                "sub_stage": row[4] or "",
-                "current_state": row[5] or {},
-                "pr_urls": row[6] or [],
-                "error": row[7] or "",
-                "updated_at": row[8].isoformat() if row[8] else ""
-            }
+        "thread_id": tid,
+        "user_id": row[1],
+        "requirement": row[2],
+        "status": row[3],
+        "phase": row[4],
+        "sub_stage": row[5],
+        "current_state": row[6] or {},
+        "pr_urls": row[7] or [],
+        "error": row[8] or "",
+        "updated_at": str(row[9]) if row[9] else "",
+    }
         cur.close()
         conn.close()
     except Exception as e:

@@ -165,6 +165,101 @@ let selectedThread = null;
 let pollInterval = null;
 // THE ANTI-FLICKER CACHE (From Shantanu/Optimization)
 const mermaidCache = {};
+// ─── USER IDENTITY ──────────────────────────────────
+function getUserId() {
+  let uid = localStorage.getItem('sdlc_user_id');
+  if (!uid) {
+    // prompt() is blocked in some browsers — use a quick inline modal instead
+    uid = 'anonymous';
+    localStorage.setItem('sdlc_user_id', uid);
+    // Show modal AFTER DOM is ready
+    setTimeout(showUserLoginModal, 100);
+  }
+  return uid;
+}
+
+function showUserLoginModal() {
+  // Don't show if user already set
+  const existing = localStorage.getItem('sdlc_user_id');
+  if (existing && existing !== 'anonymous') return;
+
+  // Build modal
+  let modal = document.getElementById('user-login-modal');
+  if (modal) return;  // already shown
+
+  modal = document.createElement('div');
+  modal.id = 'user-login-modal';
+  modal.style.cssText = `
+    position:fixed; inset:0; background:rgba(0,0,0,0.85);
+    display:flex; align-items:center; justify-content:center;
+    z-index:99999; font-family:'JetBrains Mono', monospace;
+  `;
+  modal.innerHTML = `
+    <div style="background:#161b22; border:1px solid #30363d; border-radius:10px;
+                padding:30px; min-width:340px; box-shadow:0 8px 32px rgba(0,0,0,0.5)">
+      <div style="font-size:14px; color:#00ff88; margin-bottom:8px; font-weight:700">
+        Welcome to SDLC V2 Control Tower
+      </div>
+      <div style="font-size:11px; color:#8b949e; margin-bottom:18px">
+        Enter your name to see only your own pipelines
+      </div>
+      <input id="user-login-input" type="text" placeholder="e.g. akash, tarun"
+             style="width:100%; background:#0d1117; border:1px solid #30363d;
+                    color:#e6edf3; padding:10px; border-radius:6px;
+                    font-family:inherit; font-size:13px; outline:none;
+                    margin-bottom:14px" autofocus>
+      <button id="user-login-btn"
+              style="width:100%; background:#00ff88; color:#0d1117; border:none;
+                     padding:10px; border-radius:6px; font-family:inherit;
+                     font-size:12px; font-weight:700; cursor:pointer">
+        Continue
+      </button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const input = document.getElementById('user-login-input');
+  const btn = document.getElementById('user-login-btn');
+
+  function submit() {
+    const value = input.value.trim().toLowerCase();
+    if (!value) {
+      input.style.borderColor = '#ff4757';
+      input.focus();
+      return;
+    }
+    localStorage.setItem('sdlc_user_id', value);
+    modal.remove();
+    location.reload();  // reload so USER_ID const picks up the new value
+  }
+
+  btn.addEventListener('click', submit);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') submit();
+  });
+  setTimeout(() => input.focus(), 50);
+}
+const USER_ID = getUserId();
+
+// Wrap fetch to inject X-User-Id + X-API-Key automatically
+const _origFetch = window.fetch;
+window.fetch = function(url, options = {}) {
+  options.headers = options.headers || {};
+  if (!options.headers['X-User-Id']) options.headers['X-User-Id'] = USER_ID;
+  if (!options.headers['X-API-Key']) options.headers['X-API-Key'] = API_KEY;
+  return _origFetch(url, options);
+};
+
+// Show user identity in header (optional visual)
+window.addEventListener('DOMContentLoaded', () => {
+  const header = document.querySelector('.header, header');
+  if (header) {
+    const tag = document.createElement('span');
+    tag.style.cssText = 'color:#888;font-size:11px;margin-left:12px';
+    tag.innerHTML = `user: <b style="color:#0f0">${USER_ID}</b>`;
+    header.appendChild(tag);
+  }
+});
 
 const PHASES = [
   { key: 'WAITING_PHASE_1_APPROVAL', label: 'Phase 1 — Discovery', num: 1 },
@@ -357,28 +452,86 @@ async function commitRouting(requirement) {
     closeModal();
     // The dashboard polls /pipeline/status — it'll pick up the new thread automatically
     if (typeof watchPipeline === 'function') {
-      watchPipeline(data.thread_id);
+      watchPipeline(data.thread_id,requirement);
     }
   } catch (e) {
     alert('Network error: ' + e.message);
   }
 }
 
-async function pollAll() {
-  for (const tid of Object.keys(activePipelines)) {
-    try {
-      const r = await fetch(`${API}/pipeline/status/${tid}`);
-      if (r.ok) {
-        const d = await r.json();
-        activePipelines[tid] = { ...activePipelines[tid], ...d };
-      }
-    } catch {}
+// ── SMART POLLING ──────────────────────────────────────────────────────────
+// 1. Active (selected) pipeline: polled every 2s for live updates
+// 2. Other pipelines: only refreshed via /pipeline/list every 10s (just sidebar metadata)
+// 3. Terminal pipelines (DONE, ERROR): never polled
+
+const TERMINAL_STATUSES = new Set([
+  'PIPELINE_COMPLETE', 'PHASE_7_APPROVED', 'PHASE_7_COMPLETE',
+  'ERROR', 'REJECTED', 'PIPELINE_REJECTED'
+]);
+
+const WAITING_STATUSES = new Set([
+  'WAITING_PHASE_1_APPROVAL', 'WAITING_PHASE_2_APPROVAL',
+  'WAITING_PHASE_3_APPROVAL', 'WAITING_PHASE_6_APPROVAL',
+  'WAITING_PHASE_7_APPROVAL'
+]);
+
+async function pollActiveOnly() {
+  // Only deep-poll the SELECTED pipeline
+  if (!selectedThread) return;
+  const p = activePipelines[selectedThread];
+  if (!p) return;
+
+  // Skip polling if pipeline is in a terminal state — nothing will change
+  if (TERMINAL_STATUSES.has(p.status)) {
+    document.getElementById('poll-time').textContent =
+      'Pipeline ' + p.status.toLowerCase() + ' — polling stopped';
+    return;
   }
-  document.getElementById('poll-time').textContent =
-    'Last poll: ' + new Date().toLocaleTimeString();
-  renderSidebar();
-  renderPipelineBar();
-  if (selectedThread) renderContent();
+
+  try {
+    const r = await fetch(`${API}/pipeline/status/${selectedThread}`);
+    if (r.ok) {
+      const d = await r.json();
+      activePipelines[selectedThread] = { ...activePipelines[selectedThread], ...d };
+      document.getElementById('poll-time').textContent =
+        'Last poll: ' + new Date().toLocaleTimeString();
+      renderSidebar();
+      renderPipelineBar();
+      renderContent();
+    }
+  } catch (e) {
+    // Quiet failure — next poll will retry
+  }
+}
+
+async function refreshSidebarList() {
+  // Light call to refresh ALL pipeline metadata for sidebar (no per-pipeline polling)
+  try {
+    const r = await fetch(`${API}/pipeline/list`);
+    if (!r.ok) return;
+    const data = await r.json();
+    const pipelines = data.pipelines || data || [];
+    for (const p of pipelines) {
+      const tid = p.thread_id;
+      if (!tid) continue;
+      // Merge: keep deep state from active poll, update lightweight metadata
+      if (activePipelines[tid]) {
+        activePipelines[tid].status = p.status || activePipelines[tid].status;
+        activePipelines[tid].sub_stage = p.sub_stage || activePipelines[tid].sub_stage;
+        activePipelines[tid].phase = p.phase || activePipelines[tid].phase;
+      } else {
+        activePipelines[tid] = p;
+      }
+    }
+    renderSidebar();
+  } catch (e) {
+    // Quiet
+  }
+}
+
+// Backward-compat alias — anywhere old code calls pollAll(), redirect to pollActiveOnly
+async function pollAll() {
+  await Promise.all([pollActiveOnly(), refreshSidebarList()]);
 }
 
 async function approvePipeline(threadId, approved) {
@@ -1277,13 +1430,17 @@ function selectThread(tid) {
   renderPipelineBar();
   renderContent();
 }
-function watchPipeline(threadId) {
-  // Register the new pipeline so pollAll() picks it up
+function watchPipeline(threadId, requirement) {
   if (!activePipelines[threadId]) {
-    activePipelines[threadId] = { thread_id: threadId, status: 'STARTED' };
+    activePipelines[threadId] = { 
+      thread_id: threadId, 
+      requirement: requirement || '',  // ← USE the requirement we already have
+      status: 'STARTED',
+      phase: 0
+    };
   }
   selectedThread = threadId;
-  pollAll();        // immediate first poll, don't wait 3s
+  pollActiveOnly();
   renderSidebar();
   renderContent();
 }
@@ -1324,11 +1481,14 @@ function showToast(msg, type='info') {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 checkHealth();
-discoverActivePipelines();   // ← NEW: load existing pipelines into UI
-setInterval(checkHealth, 30000);
-setInterval(pollAll, 3000);
+discoverActivePipelines();
 renderContent();
 renderSidebar();
+
+// Smart intervals (replaces single setInterval(pollAll, 3000))
+setInterval(checkHealth, 30000);        // health: every 30s
+setInterval(pollActiveOnly, 2000);      // active pipeline: every 2s
+setInterval(refreshSidebarList, 10000); // sidebar metadata: every 10s
 </script>
 </body>
 </html>

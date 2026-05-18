@@ -191,7 +191,7 @@ def classify_intent(state: DiscoveryState) -> DiscoveryState:
         )
 
         try:
-            from knowledge_layer.repo_summary import build_repo_summary
+            
             repo_summary = build_repo_summary(
                 requirement=state["requirement"],
                 candidate_repo_name=matched_repo_name

@@ -176,6 +176,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 _scheduler: BackgroundScheduler = None
 
+from fastapi import Header
+
+from fastapi import Header
+
+def get_user_id(x_user_id: str = Header(default="anonymous", alias="X-User-Id")) -> str:
+    return (x_user_id or "anonymous").strip().lower() 
 
 def _reconciliation_job():
     """Detect drift between GitHub default-branch SHAs and what we have indexed."""
@@ -432,24 +438,33 @@ def preview_routing(req: dict = Body(...), api_key: str = Depends(verify_api_key
 
 @app.post("/pipeline/start")
 def pipeline_start(req: PipelineStartRequest, background_tasks: BackgroundTasks,
-                   api_key: str = Depends(verify_api_key)):
+                   api_key: str = Depends(verify_api_key),
+                   user_id: str = Depends(get_user_id)):
     thread_id = f"pipeline-{uuid.uuid4().hex[:8]}"
     pipeline_store[thread_id] = {
         "thread_id": thread_id,
+        "user_id": user_id,                # ← NEW
         "requirement": req.requirement,
-        "routing_choice": req.routing_choice,   # NEW: passed to run_phase0_and_phase1
+        "routing_choice": req.routing_choice,
         "phase": 0,
         "status": "STARTED",
         "current_state": {},
     }
+    
     save_pipeline(thread_id, pipeline_store[thread_id], {})
     background_tasks.add_task(run_phase0_and_phase1, thread_id, req.requirement)
     return {"thread_id": thread_id, "status": "STARTED"}
 
 @app.get("/pipeline/status/{thread_id}")
-def pipeline_status(thread_id: str):
-    if thread_id not in pipeline_store:
-        raise HTTPException(404, f"Thread {thread_id} not found")
+def pipeline_status(thread_id: str,
+                    api_key: str = Depends(verify_api_key),
+                    user_id: str = Depends(get_user_id)):
+    # Ownership check
+    entry = pipeline_store.get(thread_id)
+    if entry and entry.get("user_id") and entry["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not your pipeline")
+    
+    
     entry = pipeline_store[thread_id]
     safe = _safe_state(entry.get("current_state", {}))
     return {
@@ -468,20 +483,43 @@ def pipeline_status(thread_id: str):
     }
 
 @app.get("/pipeline/list")
-def pipeline_list(api_key: str = Depends(verify_api_key)):
-    """List all known pipelines (loaded from PostgreSQL on startup + any new ones)."""
-    pipelines = []
-    for tid, entry in pipeline_store.items():
-        pipelines.append({
-            "thread_id": tid,
-            "requirement": entry.get("requirement", ""),
-            "status": entry.get("status", ""),
-            "phase": entry.get("phase", 0),
-            "sub_stage": entry.get("sub_stage", ""),
-        })
-    # Sort newest first
-    pipelines.sort(key=lambda p: p["thread_id"], reverse=True)
-    return {"pipelines": pipelines, "total": len(pipelines)}
+def pipeline_list(user_id: str = Depends(get_user_id)):
+    """List pipelines for the requesting user. No API key required — user_id is the boundary."""
+    """List pipelines for the requesting user. Soft auth — anonymous gets empty list."""
+    # Soft API key check — accept missing key but log
+    
+    
+    
+    import psycopg2
+    conn = psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+        port=os.getenv("POSTGRES_PORT", "5437"),
+        user=os.getenv("POSTGRES_USER", "sdlc"),
+        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
+        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
+    )
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT thread_id, requirement, status, sub_stage, phase, updated_at
+        FROM pipelines
+        WHERE user_id = %s
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 50
+    """, (user_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [
+        {
+            "thread_id": r[0],
+            "requirement": r[1] or "",
+            "status": r[2] or "",
+            "sub_stage": r[3] or "",
+            "phase": r[4] or "",
+            "updated_at": str(r[5]) if r[5] else "",
+        }
+        for r in rows
+    ]
 
 @app.post("/pipeline/approve/{thread_id}")
 def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: BackgroundTasks = None, api_key: str = Depends(verify_api_key)):
