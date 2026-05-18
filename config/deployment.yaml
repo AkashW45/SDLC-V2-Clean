@@ -1,0 +1,204 @@
+# =====================================================================
+# SDLC-V2 — Phase 7 Deployment Config
+# =====================================================================
+# Platform configuration: declares the infrastructure (registries,
+# deploy targets, CLIs) that exists in this environment. It does NOT
+# enumerate every repo — repos carry their own `.deploy.yaml`.
+#
+# When Phase 7 gets a list of affected repos:
+#   1. URL lookup: legacy `repos:` block (below) first, then `repo_resolver`
+#   2. Clone each repo, read its `.deploy.yaml`
+#   3. Merge: defaults  ←  .deploy.yaml  ←  legacy `repos:` entry (if any)
+#
+# `${VAR}` and `${VAR:-default}` are expanded from env at load time.
+# =====================================================================
+
+project_name: leave-mgmt
+workspace_dir: /tmp/sdlc-deploy-workspace
+
+# Set true to log every git/docker/aws/HTTP call without actually running it.
+dry_run: false
+
+# Auto-install missing CLIs (docker, aws, etc.). Off by default — flip on
+# for ephemeral CI runners.
+cli_auto_install: false
+
+# ---------------------------------------------------------------------
+# How to find the git URL for a repo when it's not pre-declared below.
+# This is what makes the system scale: new repos just need a name and a
+# `.deploy.yaml` in their root — no central config change required.
+# ---------------------------------------------------------------------
+repo_resolver:
+  url_template: "https://github.com/{org}/{name}.git"
+  org: ${GITHUB_REPO_OWNER:-AkashW45}
+
+# ---------------------------------------------------------------------
+# Platform defaults applied to every repo (unless overridden by the
+# repo's own .deploy.yaml or a legacy `repos:` entry).
+# ---------------------------------------------------------------------
+defaults:
+  branch: main
+  dockerfile: Dockerfile
+  docker_context: .
+  registry: ecr-prod                      # default registry name
+  deploy_target: ecs-prod                 # default deploy target name
+  image_tag: ${BUILD_TAG:-latest}
+  deploy_contract_path: .deploy.yaml      # where to look in each repo
+
+# ---------------------------------------------------------------------
+# CLIs that must be on PATH. Missing CLIs with an install_command are
+# auto-installed when cli_auto_install: true.
+# ---------------------------------------------------------------------
+required_clis:
+  - name: git
+    version_command: git --version
+    install_hint: "apt-get install -y git  /  brew install git"
+    install_command: "apt-get update && apt-get install -y git"
+
+  - name: docker
+    version_command: docker --version
+    install_hint: "https://docs.docker.com/get-docker/"
+    install_command: "curl -fsSL https://get.docker.com | sh"
+
+  - name: aws
+    version_command: aws --version
+    install_hint: "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+    install_command: "pip install --break-system-packages awscli"
+
+  - name: kubectl
+    version_command: kubectl version --client=true -o json
+    install_hint: "https://kubernetes.io/docs/tasks/tools/"
+    required: false   # only needed if a repo targets kubernetes
+
+# ---------------------------------------------------------------------
+# Container registries available in this environment. Repos reference
+# these by name from their `.deploy.yaml` (or use the default above).
+# ---------------------------------------------------------------------
+registries:
+  - name: ecr-prod
+    kind: ecr
+    region: ${AWS_REGION:-us-east-1}
+    account_id: ${AWS_ACCOUNT_ID}
+    create_repository_if_missing: true
+
+  - name: dockerhub
+    kind: dockerhub
+    username: ${DOCKERHUB_USERNAME}
+    password: ${DOCKERHUB_TOKEN}
+
+  - name: ghcr
+    kind: ghcr
+    username: ${GITHUB_REPO_OWNER}
+    password: ${GITHUB_TOKEN}
+
+# ---------------------------------------------------------------------
+# Deploy targets — the environments code can be deployed to. Repos pick
+# one by name from their `.deploy.yaml` (e.g. `deploy.target: ecs-prod`).
+#
+# AWS credentials come from env vars (or from an IAM instance role on
+# the deploy host, in which case the keys can be empty).
+# ---------------------------------------------------------------------
+deploy_targets:
+  # ---- AWS ECS ------------------------------------------------------
+  - name: ecs-prod
+    kind: ecs
+    config:
+      access_key_id: ${AWS_ACCESS_KEY_ID}
+      secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+      region: ${AWS_REGION:-us-east-1}
+      cluster: leave-mgmt-cluster
+      # service is omitted here — repos provide their own via .deploy.yaml
+      wait_for_stable: true
+
+  - name: ecs-staging
+    kind: ecs
+    config:
+      access_key_id: ${AWS_ACCESS_KEY_ID}
+      secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+      region: ${AWS_REGION:-us-east-1}
+      cluster: leave-mgmt-staging
+      wait_for_stable: true
+
+  # ---- AWS Lambda ---------------------------------------------------
+  - name: lambda-prod
+    kind: lambda
+    config:
+      access_key_id: ${AWS_ACCESS_KEY_ID}
+      secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+      region: ${AWS_REGION:-us-east-1}
+      wait_for_updated: true
+      # function_name comes from each repo's .deploy.yaml
+
+  # ---- Docker Compose ----------------------------------------------
+  - name: compose-prod
+    kind: compose
+    config:
+      compose_file: docker-compose.yml
+
+  # ---- Plain Kubernetes ---------------------------------------------
+  - name: k8s-prod
+    kind: kubernetes
+    config:
+      namespace: production
+
+  # ---- Webhook ------------------------------------------------------
+  - name: webhook-prod
+    kind: webhook
+    config:
+      url: ${N8N_DEPLOY_WEBHOOK_URL}
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer ${N8N_WEBHOOK_TOKEN}"
+      payload:
+        image: "{image}"
+        repo: "{repo}"
+        tag: "{tag}"
+        commit: "{commit}"
+
+  # ---- Dry run ------------------------------------------------------
+  - name: dry-run-only
+    kind: dry-run
+    config: {}
+
+# ---------------------------------------------------------------------
+# LEGACY: pre-declared repos. The new pattern is `.deploy.yaml` in each
+# repo's root, but you can still list repos here as an escape hatch for
+# repos that haven't migrated, or to override their contract centrally.
+#
+# Anything declared here WINS over the repo's own .deploy.yaml.
+# Leave the block empty for a fully-decentralized setup.
+# ---------------------------------------------------------------------
+repos: []
+
+# ---------------------------------------------------------------------
+# Classification rules used when a repo doesn't declare its `type` in
+# `.deploy.yaml`. First substring match wins.
+# ---------------------------------------------------------------------
+classification:
+  library:  [lib, common, shared, sdk]
+  backend:  [backend, api, service, server]
+  frontend: [frontend, ui, web, client]
+  batch:    [batch, job, worker, cron]
+  order:    [library, backend, frontend, batch, service]
+
+# ---------------------------------------------------------------------
+# Post-deploy monitoring. Set metrics_endpoint to your Prometheus /
+# Datadog / health-check URL for real metrics; otherwise uses defaults.
+# ---------------------------------------------------------------------
+monitoring:
+  enabled: true
+  metrics_endpoint: ""
+  max_error_rate: 0.05
+  max_latency_ms: 500
+  check_duration_seconds: 60
+  auto_rollback_on_breach: true
+
+default_feature_flags:
+  - flag_name: new_feature_enabled
+    default: false
+    enable_after_deploy: true
+
+default_rollback_steps:
+  - "Revert to previous deployment image tag"
+  - "Disable any feature flags enabled in this rollout"
+  - "Alert on-call channel"

@@ -45,7 +45,7 @@ def get_embedder():
 def get_postgres():
     return psycopg2.connect(
         host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5437"),
+        port=os.getenv("POSTGRES_PORT", "5432"),
         user=os.getenv("POSTGRES_USER", "sdlc"),
         password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
         dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
