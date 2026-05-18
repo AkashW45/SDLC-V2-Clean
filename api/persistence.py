@@ -27,6 +27,7 @@ def setup_db():
         CREATE TABLE IF NOT EXISTS pipelines (
             thread_id VARCHAR(50) PRIMARY KEY,
             requirement TEXT NOT NULL,
+            user_id VARCHAR(50),
             status VARCHAR(50),
             phase VARCHAR(20),
             sub_stage VARCHAR(150),
@@ -79,7 +80,7 @@ def setup_db():
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_thread ON audit_log(thread_id, created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pipelines_updated ON pipelines(updated_at DESC)")
-
+    cur.execute("ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS user_id VARCHAR(50);")
     conn.commit()
     cur.close()
     conn.close()
