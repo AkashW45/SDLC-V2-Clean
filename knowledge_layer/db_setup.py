@@ -187,7 +187,7 @@ def setup_qdrant():
 def setup_neo4j():
     print("[Neo4j] Connecting...")
     driver = GraphDatabase.driver(
-        os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+        os.getenv("NEO4J_URI", "bolt://sdlc_neo4j:7687"),
         auth=(
             os.getenv("NEO4J_USER", "neo4j"),
             os.getenv("NEO4J_PASSWORD", "password1234")
