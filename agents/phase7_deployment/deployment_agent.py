@@ -29,7 +29,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from core.llm_gateway import gateway
+from openai import OpenAI
+
+# Direct OpenAI client — matches the pattern used by Phases 1–6.
+# Reads DEEPSEEK_API_KEY (the same env var every other phase uses) so this
+# file no longer depends on the half-finished core/llm_gateway abstraction.
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com"
+)
+
 from core.deployment_config import (
     DeploymentConfig,
     RepoConfig,
@@ -58,6 +67,11 @@ class DeploymentState(TypedDict, total=False):
     runbook: dict
     pr_urls: list
     affected_repos: list           # list[str] from upstream phases
+
+    # Per-repo commit SHAs to deploy (set by Phase 6's merge_prs step).
+    # Phase 7's resolve_deploy_sequence pins each repo's `ref` to its
+    # entry here so the build matches exactly what was merged.
+    merged_shas: dict              # {repo_name: sha}
 
     # Resolved at runtime from config + affected_repos
     resolved_repos: list           # list[dict] — serialised RepoConfig
@@ -176,15 +190,20 @@ def _repos_from_state(state: "DeploymentState") -> List[RepoConfig]:
 
 
 def call_llm(prompt: str) -> dict:
-    """Kept for compatibility with the rest of the agent suite."""
-    content = gateway.generate(
-        prompt=prompt,
+    """Kept for compatibility with the rest of the agent suite.
+
+    Uses the same direct-OpenAI pattern as Phases 1–6. Previously routed
+    through core.llm_gateway, but that file looked for LLM_API_KEY while
+    the rest of the project reads DEEPSEEK_API_KEY — mismatch crashed
+    Phase 7 on import.
+    """
+    response = client.chat.completions.create(
         model="deepseek-v4-pro",
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
         stream=False,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}}
-    ).strip()
+    )
+    content = response.choices[0].message.content.strip()
     if content.startswith("```"):
         content = re.sub(r"```(?:json)?", "", content).strip().strip("```").strip()
     try:
@@ -203,6 +222,12 @@ def resolve_deploy_sequence(state: DeploymentState) -> DeploymentState:
     anything not pre-declared. Classification is provisional here (name-based);
     the in-repo `.deploy.yaml` may override `type` later, in which case
     `fetch_repos_node` re-sorts the sequence.
+
+    If `merged_shas` is present in state (populated by Phase 6's merge step),
+    each repo's `ref` is pinned to the SHA Phase 6 just merged. The executor's
+    fetch_repos will then `git checkout <sha>` instead of `git pull` on a
+    branch — meaning the build is guaranteed to match what was reviewed in
+    the PR, even if main has moved on since.
     """
     print("\n[Phase 7] Resolving repo names and git URLs...")
     cfg = _load_cfg(state)
@@ -211,6 +236,14 @@ def resolve_deploy_sequence(state: DeploymentState) -> DeploymentState:
     if not affected:
         print("  ⚠ no affected_repos provided — falling back to legacy `repos:` block")
         affected = list(cfg.repos.keys())
+
+    # SHAs to pin each repo to (from Phase 6's merge step). If empty, Phase 7
+    # falls back to HEAD-of-branch — useful for hot-fix re-deploys where you
+    # just want whatever's on main right now.
+    merged_shas = state.get("merged_shas") or {}
+    if merged_shas:
+        print(f"  📌 Pinning repos to merged SHAs from Phase 6: "
+              f"{', '.join(f'{k}={(v or '?')[:7]}' for k, v in merged_shas.items())}")
 
     resolved: List[RepoConfig] = []
     missing_urls: List[str] = []
@@ -221,6 +254,9 @@ def resolve_deploy_sequence(state: DeploymentState) -> DeploymentState:
             rc.git_url = cfg.resolve_repo_url(name)
             if not rc.git_url:
                 missing_urls.append(name)
+        # Pin to the exact commit Phase 6 just merged (if available)
+        if name in merged_shas and merged_shas[name]:
+            rc.ref = merged_shas[name]
         # Provisional classification — may be overridden by .deploy.yaml later
         rc.repo_type = cfg.classify_repo(rc)
         resolved.append(rc)
@@ -317,6 +353,24 @@ def fetch_repos_node(state: DeploymentState) -> DeploymentState:
                 return len(order)
         repos.sort(key=order_key)
 
+    # Sanity check: after fetch, every repo that's going to be built should have
+    # a Dockerfile. Phase 4 generates one for new services, so missing one here
+    # is unusual and worth flagging — but we don't hard-fail, because the user
+    # may have intentionally skipped the build step for some repos.
+    missing_dockerfiles: list = []
+    for r in repos:
+        if r.skip or not r.push:
+            continue
+        df_path = workspace / r.name / (r.dockerfile or "Dockerfile")
+        if not df_path.exists():
+            missing_dockerfiles.append(f"{r.name} (expected {r.dockerfile or 'Dockerfile'})")
+    if missing_dockerfiles:
+        print(f"  ⚠ Dockerfile missing in {len(missing_dockerfiles)} repo(s):")
+        for m in missing_dockerfiles:
+            print(f"      - {m}")
+        print("    (build_images will likely fail for these — Phase 4 normally "
+              "generates a Dockerfile when none exists)")
+
     sequence = [
         {"step": i, "repo": r.name, "type": r.repo_type,
          "deploy_target": r.deploy_target, "status": "PENDING"}
@@ -328,6 +382,7 @@ def fetch_repos_node(state: DeploymentState) -> DeploymentState:
         "fetch_results": results,
         "resolved_repos": [_repo_to_dict(r) for r in repos],
         "deploy_sequence": sequence,
+        "missing_dockerfiles": missing_dockerfiles,
         "status": "REPOS_FETCHED",
     }
 

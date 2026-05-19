@@ -19,9 +19,11 @@ workspace_dir: /tmp/sdlc-deploy-workspace
 # Set true to log every git/docker/aws/HTTP call without actually running it.
 dry_run: false
 
-# Auto-install missing CLIs (docker, aws, etc.). Off by default — flip on
-# for ephemeral CI runners.
-cli_auto_install: false
+# Auto-install missing CLIs (docker, aws, etc.). ON by default now so
+# Phase 7 just works on fresh runners. The runner must have apt-get
+# (or another supported package manager) reachable for the install_command
+# of each CLI in `required_clis` below.
+cli_auto_install: true
 
 # ---------------------------------------------------------------------
 # How to find the git URL for a repo when it's not pre-declared below.

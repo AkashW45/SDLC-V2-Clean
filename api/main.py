@@ -18,8 +18,12 @@ from fastapi.responses import JSONResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import zipfile
+
+from streamlit import feedback
+from agents.repo_workspace import get_repo_local_path
 import time
 import threading
+from langgraph.types import Command
 import logging
 
 # ADD THESE TWO LINES TO FIX THE CRASH
@@ -104,7 +108,7 @@ class PipelineStartRequest(BaseModel):
     # Examples of routing_choice:
     #   {"mode": "existing", "project_id": "conduit", "repo_names": ["conduit-django-api"]}
     #   {"mode": "new"}    -> creates new project
-    #   {"mode": "manual", "repo_names": ["flask-contacts-api"]} -> use raw repos    
+    #   {"mode": "manual", "repo_names": ["flask-contacts-api"]} -> use raw repos
 
 
 # In run_phase1, near the top, after thread_id is known:
@@ -160,7 +164,7 @@ def _warn_if_stale_index(thread_id: str, matched_repo: str):
         stored_sha = _get_last_indexed_sha(matched_repo)
         if stored_sha and current_sha != stored_sha:
             logger.warning(f"[Phase 0] Stale index for {matched_repo}: "
-                          f"stored={stored_sha[:8]} current={current_sha[:8]}")
+                           f"stored={stored_sha[:8]} current={current_sha[:8]}")
             audit(thread_id, "phase0", "STALE_INDEX_WARNING",
                   {"repo": matched_repo, "stored": stored_sha, "current": current_sha})
     except Exception as e:
@@ -177,7 +181,7 @@ from fastapi import Header
 from fastapi import Header
 
 def get_user_id(x_user_id: str = Header(default="anonymous", alias="X-User-Id")) -> str:
-    return (x_user_id or "anonymous").strip().lower() 
+    return (x_user_id or "anonymous").strip().lower()
 
 def _reconciliation_job():
     """Detect drift between GitHub default-branch SHAs and what we have indexed."""
@@ -446,7 +450,7 @@ def pipeline_start(req: PipelineStartRequest, background_tasks: BackgroundTasks,
         "status": "STARTED",
         "current_state": {},
     }
-    
+
     save_pipeline(thread_id, pipeline_store[thread_id], {})
     background_tasks.add_task(run_phase0_and_phase1, thread_id, req.requirement)
     return {"thread_id": thread_id, "status": "STARTED"}
@@ -459,8 +463,8 @@ def pipeline_status(thread_id: str,
     entry = pipeline_store.get(thread_id)
     if entry and entry.get("user_id") and entry["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Not your pipeline")
-    
-    
+
+
     entry = pipeline_store[thread_id]
     safe = _safe_state(entry.get("current_state", {}))
     return {
@@ -483,9 +487,9 @@ def pipeline_list(user_id: str = Depends(get_user_id)):
     """List pipelines for the requesting user. No API key required — user_id is the boundary."""
     """List pipelines for the requesting user. Soft auth — anonymous gets empty list."""
     # Soft API key check — accept missing key but log
-    
-    
-    
+
+
+
     import psycopg2
     conn = psycopg2.connect(
         host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
@@ -496,12 +500,12 @@ def pipeline_list(user_id: str = Depends(get_user_id)):
     )
     cur = conn.cursor()
     cur.execute("""
-        SELECT thread_id, requirement, status, sub_stage, phase, updated_at
-        FROM pipelines
-        WHERE user_id = %s
-        ORDER BY updated_at DESC NULLS LAST
-        LIMIT 50
-    """, (user_id,))
+                SELECT thread_id, requirement, status, sub_stage, phase, updated_at
+                FROM pipelines
+                WHERE user_id = %s
+                ORDER BY updated_at DESC NULLS LAST
+                    LIMIT 50
+                """, (user_id,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -567,6 +571,55 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
     next_phase = str(int(current_phase) + 1)
     entry["phase"] = int(next_phase)
 
+    # ── Phase 6 → Phase 7 transition: merge the approved PR(s) first ──
+    # Phase 7 then deploys from the exact merged commit SHA, not from
+    # HEAD-of-main (which might have drifted). If any merge fails, we
+    # refuse to start Phase 7 — the user must fix the PR manually first.
+    if next_phase == "7":
+        from agents.phase6_delivery.delivery_agent import merge_prs_for_state
+        cur_state = entry.get("current_state", {})
+        merge_input = {
+            "requirement": entry.get("requirement", ""),
+            "pr_urls": entry.get("pr_urls", []) or cur_state.get("pr_urls", []),
+            "approved": True,
+            "status": cur_state.get("phase6_status") or "APPROVED_FOR_DEPLOYMENT",
+        }
+        try:
+            merge_result = merge_prs_for_state(merge_input)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            entry["status"] = "ERROR"
+            entry["error"] = f"PR merge step crashed: {e}"
+            save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
+            return {"status": "MERGE_CRASHED", "error": str(e)}
+
+        # Persist merged_shas + merge_errors into the pipeline state so
+        # run_phase7 can read them later.
+        cur_state["merged_shas"] = merge_result.get("merged_shas", {})
+        cur_state["merge_errors"] = merge_result.get("merge_errors", [])
+        cur_state["phase6_final_status"] = merge_result.get("status")
+        entry["current_state"] = cur_state
+
+        if merge_result.get("status") == "MERGE_FAILED":
+            entry["status"] = "MERGE_FAILED"
+            entry["sub_stage"] = (
+                "PR merge failed — see merge_errors. Fix the PR on GitHub "
+                "and use /pipeline/{id}/resume?phase=7 to retry."
+            )
+            entry["error"] = "; ".join(merge_result.get("merge_errors", []))[:500]
+            audit(thread_id, "phase6", "MERGE_FAILED", actor,
+                  {"errors": merge_result.get("merge_errors", [])})
+            save_pipeline(thread_id, entry, _safe_state(cur_state))
+            return {
+                "status": "MERGE_FAILED",
+                "next_phase": next_phase,
+                "merge_errors": merge_result.get("merge_errors", []),
+            }
+
+        audit(thread_id, "phase6", "MERGED", actor,
+              {"merged_shas": merge_result.get("merged_shas", {})})
+        save_pipeline(thread_id, entry, _safe_state(cur_state))
+
     if next_phase == "2": background_tasks.add_task(run_phase2, thread_id, "")
     elif next_phase == "3":
         # Main's Fix: Skip Phase 3 for new projects
@@ -584,10 +637,10 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
     return {"status": "APPROVED", "next_phase": next_phase}
 @app.post("/pipeline/{thread_id}/resume")
 def pipeline_resume(
-    thread_id: str,
-    body: dict = Body(default={}),
-    background_tasks: BackgroundTasks = None,
-    api_key: str = Depends(verify_api_key),
+        thread_id: str,
+        body: dict = Body(default={}),
+        background_tasks: BackgroundTasks = None,
+        api_key: str = Depends(verify_api_key),
 ):
     """
     Resume a stuck/errored pipeline from a specific phase, reusing all saved state
@@ -758,7 +811,7 @@ def download_all(thread_id: str):
         content=buf.getvalue(),
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=Pipeline_{thread_id}_FullPackage.zip"},
-    ) 
+    )
 
 # ── Knowledge Layer Endpoints ─────────────────────────────────────────────────
 @app.post("/knowledge/index")
@@ -998,9 +1051,9 @@ class RepoOverrideRequest(BaseModel):
 
 @app.post("/knowledge/repos/{repo_name}/override")
 def set_repo_override(
-    repo_name: str,
-    req: RepoOverrideRequest,
-    api_key: str = Depends(verify_api_key),
+        repo_name: str,
+        req: RepoOverrideRequest,
+        api_key: str = Depends(verify_api_key),
 ):
     """Manually mark a repo as include or exclude. Persists across syncs."""
     if req.action not in ("include", "exclude"):
@@ -1015,23 +1068,23 @@ def set_repo_override(
     )
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS repo_overrides (
-            repo_name VARCHAR(255) PRIMARY KEY,
-            action VARCHAR(20) NOT NULL,
-            reason TEXT,
-            set_by VARCHAR(255),
-            set_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
+                CREATE TABLE IF NOT EXISTS repo_overrides (
+                                                              repo_name VARCHAR(255) PRIMARY KEY,
+                    action VARCHAR(20) NOT NULL,
+                    reason TEXT,
+                    set_by VARCHAR(255),
+                    set_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
     cur.execute("""
-        INSERT INTO repo_overrides (repo_name, action, reason, set_by)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (repo_name) DO UPDATE
-        SET action = EXCLUDED.action,
-            reason = EXCLUDED.reason,
-            set_by = EXCLUDED.set_by,
-            set_at = NOW()
-    """, (repo_name, req.action, req.reason, "api"))
+                INSERT INTO repo_overrides (repo_name, action, reason, set_by)
+                VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (repo_name) DO UPDATE
+                                                   SET action = EXCLUDED.action,
+                                                   reason = EXCLUDED.reason,
+                                                   set_by = EXCLUDED.set_by,
+                                                   set_at = NOW()
+                """, (repo_name, req.action, req.reason, "api"))
     conn.commit()
     cur.close()
     conn.close()
@@ -1071,14 +1124,14 @@ def list_repo_overrides(api_key: str = Depends(verify_api_key)):
     )
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS repo_overrides (
-            repo_name VARCHAR(255) PRIMARY KEY,
-            action VARCHAR(20) NOT NULL,
-            reason TEXT,
-            set_by VARCHAR(255),
-            set_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
+                CREATE TABLE IF NOT EXISTS repo_overrides (
+                                                              repo_name VARCHAR(255) PRIMARY KEY,
+                    action VARCHAR(20) NOT NULL,
+                    reason TEXT,
+                    set_by VARCHAR(255),
+                    set_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
     cur.execute("SELECT repo_name, action, reason, set_by, set_at FROM repo_overrides ORDER BY set_at DESC")
     rows = cur.fetchall()
     cur.close()
@@ -1231,7 +1284,7 @@ def run_phase0_and_phase1(thread_id: str, requirement: str):
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
         save_pipeline(thread_id, pipeline_store[thread_id],
                       _safe_state(pipeline_store[thread_id].get("current_state", {})))
-        
+
 
 def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
     try:
@@ -1251,10 +1304,10 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
 
         # Resolve selected_repos from THREE possible sources, in priority order
         selected_repos = (
-            prev_state.get("selected_repos")                   # Phase 0 stored it on state
-            or entry.get("selected_repos")                     # Phase 0 stored it on entry
-            or _routing_choice_to_repos(routing_choice)        # Direct fallback from user choice
-            or []
+                prev_state.get("selected_repos")                   # Phase 0 stored it on state
+                or entry.get("selected_repos")                     # Phase 0 stored it on entry
+                or _routing_choice_to_repos(routing_choice)        # Direct fallback from user choice
+                or []
         )
 
         # Resolve is_new_project — explicit False if user picked existing/manual, True if 'new'
@@ -1266,7 +1319,7 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
         else:
             is_new_project = prev_state.get("is_new_project",
                                             entry.get("is_new_project",
-                                                    not bool(selected_repos)))
+                                                      not bool(selected_repos)))
 
         print(f"[Phase 1] selected_repos={[r.get('name') if isinstance(r,dict) else r for r in selected_repos]}, is_new={is_new_project}")
 
@@ -1291,8 +1344,8 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
                 current = pipeline_store[thread_id].get("current_state", {})
                 for k, v in node_state.items():
                     if k in ("brd", "prd", "adr", "architecture", "status",
-                     "scope_contract", "classifier_output"): current[k] = v
-                      
+                             "scope_contract", "classifier_output"): current[k] = v
+
                 pipeline_store[thread_id]["current_state"] = current
 
                 if node_name == "generate_brd": pipeline_store[thread_id]["sub_stage"] = "BRD Done — Generating PRD..."
@@ -1400,7 +1453,7 @@ def run_phase3(thread_id: str, feedback: str = ""):
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
         save_pipeline(thread_id, pipeline_store[thread_id],
                       _safe_state(pipeline_store[thread_id].get("current_state", {})))
-        
+
 def run_phase4(thread_id: str):
     try:
         import sys
@@ -1424,7 +1477,7 @@ def run_phase4(thread_id: str):
         impact = state.get("impact_report", {})
         if state.get("is_new_project", False) and not impact.get("affected_files"):
             impact = {"requirement": entry["requirement"], "affected_files": [], "affected_repos": [r["name"] for r in state.get("selected_repos", [])], "architecture": state.get("architecture", {}), "risk_assessment": {"risk_level": "low", "breaking_changes": [], "recommendation": "proceed"}}
-            
+
         result4 = run_codegen(requirement=entry["requirement"], impact_report=impact, workspace_path="/repos", thread_id=f"{thread_id}-p4", adr=state.get("adr", {}), scope_contract=state.get("scope_contract", {}))
 
         # Accept multiple success statuses from codegen
@@ -1464,10 +1517,10 @@ def run_phase4(thread_id: str):
 
         # Route directly to Phase 5
         run_phase5(thread_id)
-        
 
-       
-        
+
+
+
     except Exception as e:
         import traceback
         traceback.print_exc()   # so the real error shows in the uvicorn log
@@ -1484,7 +1537,7 @@ def run_phase5(thread_id: str):
         from agents.phase5_validation.validation_agent import run_validation_phase
         from agents.expansion_engine import decide_single
         from agents.units_model import attach_units
-        
+
         entry = pipeline_store[thread_id]
         state = entry["current_state"]
 
@@ -1492,22 +1545,22 @@ def run_phase5(thread_id: str):
         pipeline_store[thread_id]["sub_stage"] = "Generating pytest test files..."
         pipeline_store[thread_id]["status"] = "PHASE_5_RUNNING"
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
-        
+
         result5 = run_validation_phase(
-            requirement=entry["requirement"], 
-            generated_changes=state.get("generated_changes", []), 
-            scope_contract=state.get("scope_contract", {}), 
+            requirement=entry["requirement"],
+            generated_changes=state.get("generated_changes", []),
+            scope_contract=state.get("scope_contract", {}),
             workspace_path="/repos", # <--- CLAUDE'S BUG FIX RE-ADDED HERE
             thread_id=f"{thread_id}-p5"
         )
 
         merged = {**state, "test_files": result5.get("test_files", [])}
         pipeline_store[thread_id]["current_state"] = merged
-        
+
         # ── EXPANSION DECISION ENGINE GUARD (The Missing Brain!) ──
         pipeline_store[thread_id]["sub_stage"] = "Calculating Work-Unit Budget (Expansion Engine)..."
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
-        
+
         code_artifact = {
             "artifact_id": f"code-{thread_id}",
             "artifact_type": "CODE",
@@ -1515,7 +1568,7 @@ def run_phase5(thread_id: str):
             "content": {"files": state.get("generated_changes", [])},
             "confidence": 95
         }
-        
+
         # Calculate how many "units" this code costs
         attach_units(code_artifact, state.get("scope_contract", {}))
 
@@ -1529,13 +1582,13 @@ def run_phase5(thread_id: str):
 
         if decision["verdict"] == "reject":
             pipeline_store[thread_id].update({
-                "status": "ERROR", 
+                "status": "ERROR",
                 "error": f"Expansion Engine Rejected: {decision.get('reason')}",
                 "sub_stage": "Code Rejected by Engine"
             })
             save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
             return
-            
+
         elif decision["verdict"] == "queue_for_approval":
             pipeline_store[thread_id].update({
                 "status": "WAITING_PHASE_4_APPROVAL",
@@ -1611,7 +1664,7 @@ def run_phase6(thread_id: str, feedback: str = ""):
                 if os.path.isdir(repo_dir):
                     print(f"  [Phase 6] Re-indexing {r_name} in background...")
                     run_indexer(repo_dir, r_name)
-            
+
             for repo in state.get("selected_repos", []):
                 rname = repo.get("name") if isinstance(repo, dict) else repo
                 if rname:
@@ -1634,13 +1687,45 @@ def run_phase7(thread_id: str, feedback: str = ""):
         entry = pipeline_store[thread_id]
         state = entry["current_state"]
 
+        # Refuse to deploy if Phase 6's merge step failed. The PR is still
+        # open on GitHub; the user must resolve conflicts / fix branch
+        # protection there, then re-trigger Phase 7 via /pipeline/{id}/resume.
+        phase6_final = state.get("phase6_final_status")
+        if phase6_final == "MERGE_FAILED":
+            pipeline_store[thread_id].update({
+                "status": "ERROR",
+                "error": (
+                        "Cannot run Phase 7: PR merge failed in Phase 6. "
+                        "Errors: " + "; ".join(state.get("merge_errors", []))[:400]
+                ),
+                "sub_stage": "Phase 7 blocked — PR not merged",
+            })
+            save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
+            return
+
         pipeline_store[thread_id].update({"status": "PHASE_7_RUNNING", "sub_stage": "Resolving deployment sequence...", "phase": 7})
 
         affected_repos = [r["name"] for r in state.get("selected_repos", [])] or state.get("impact_report", {}).get("affected_repos", [])
 
+        # Pull the SHAs Phase 6 merged so Phase 7 deploys exactly that code,
+        # not whatever HEAD-of-main happens to be at clone time.
+        merged_shas = state.get("merged_shas", {}) or {}
+
         graph = build_deployment_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p7"}}
-        initial = DeploymentState(requirement=entry["requirement"], runbook=state.get("runbook", {}), pr_urls=entry.get("pr_urls", []), affected_repos=affected_repos, scope_contract=state.get("scope_contract", {}), deploy_sequence=[], feature_flags=[], deploy_results=[], monitoring_results={}, rollback_triggered=False, human_feedback=feedback, approved=False, status="STARTED")
+        initial = DeploymentState(
+            requirement=entry["requirement"],
+            runbook=state.get("runbook", {}),
+            pr_urls=entry.get("pr_urls", []),
+            affected_repos=affected_repos,
+            scope_contract=state.get("scope_contract", {}),
+            merged_shas=merged_shas,                  # ← NEW: SHA per repo to git-checkout
+            deploy_sequence=[], feature_flags=[],
+            deploy_results=[], monitoring_results={},
+            rollback_triggered=False,
+            human_feedback=feedback, approved=False,
+            status="STARTED",
+        )
 
         result = graph.invoke(initial, config)
         merged = {**state}
@@ -1661,7 +1746,7 @@ def run_phase7(thread_id: str, feedback: str = ""):
 
 
 def _safe_state(state: dict) -> dict:
-    safe_keys = ["selected_project", "selected_repos", "is_new_project", "candidates", "scope_contract", "classifier_output", "brd", "prd", "adr", "architecture", "sprint_plan", "runbook", "jira_tickets", "impact_report", "generated_changes", "test_files", "pr_urls", "target_repo", "deploy_results", "monitoring_results", "deploy_sequence", "feature_flags", "rollback_triggered", "status", "requirement"]
+    safe_keys = ["selected_project", "selected_repos", "is_new_project", "candidates", "scope_contract", "classifier_output", "brd", "prd", "adr", "architecture", "sprint_plan", "runbook", "jira_tickets", "impact_report", "generated_changes", "test_files", "pr_urls", "target_repo", "deploy_results", "monitoring_results", "deploy_sequence", "feature_flags", "rollback_triggered", "status", "requirement", "merged_shas", "merge_errors", "phase6_final_status"]
     result = {}
     for k in safe_keys:
         if k in state:

@@ -10,7 +10,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from core.llm_gateway import gateway
+# (Previously imported `gateway` from core.llm_gateway, but it was never used
+# in this file — LLM work is delegated to services.test_case_generator.
+# The unused import was triggering LLMGateway() construction at module load,
+# which crashed on missing LLM_API_KEY.)
 
 DARK_BLUE = "1F4E78"
 LIGHT_BLUE = "D9E1F2"

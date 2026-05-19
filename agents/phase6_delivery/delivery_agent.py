@@ -27,13 +27,21 @@ GITHUB_OWNER = os.getenv("GITHUB_REPO_OWNER")
 # State
 # -----------------------------------------
 
-class DeliveryState(TypedDict):
+class DeliveryState(TypedDict, total=False):
     requirement: str
     generated_changes: list
     test_files: list
     branch_name: str
     repo_url: str
     pr_urls: list
+
+    # ── PR merge bookkeeping (populated by merge_prs node) ───────────────
+    # After the human approves Phase 6, the merge_prs node merges each PR
+    # and records the resulting commit SHA so Phase 7 can `git checkout <sha>`
+    # for a reproducible build.
+    merged_shas: dict          # {repo_name: sha}  — SHAs to deploy from
+    merge_errors: list         # list of failure messages (empty on success)
+
     human_feedback: str
     approved: bool
     status: str
@@ -51,10 +59,10 @@ def run_git(cmd: list, cwd: str) -> str:
 
 
 def push_files_to_branch(
-    repo_url: str,
-    branch_name: str,
-    files: list,
-    commit_message: str
+        repo_url: str,
+        branch_name: str,
+        files: list,
+        commit_message: str
 ) -> dict:
     """Clone repo, write files, push to branch."""
     temp_dir = tempfile.mkdtemp()
@@ -107,10 +115,10 @@ def push_files_to_branch(
 
 
 def create_github_pr(
-    repo_name: str,
-    branch_name: str,
-    title: str,
-    body: str
+        repo_name: str,
+        branch_name: str,
+        title: str,
+        body: str
 ) -> dict:
     """Create a GitHub PR via API."""
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{repo_name}/pulls"
@@ -287,6 +295,179 @@ def process_approval(state: DeliveryState) -> DeliveryState:
         return {**state, "status": "PR_REJECTED"}
 
 
+# -----------------------------------------
+# PR Merge helpers — used by the merge_prs node
+# -----------------------------------------
+# Why these live in delivery_agent.py and not in pr_manager.py:
+#   pr_manager.py is explicitly designed to never auto-merge (see its
+#   module-level docstring). That's a sensible invariant — PR creation
+#   should be cheap and reversible. Merging, by contrast, only happens
+#   AFTER a human has approved Phase 6 on the dashboard, so it belongs
+#   in the delivery flow.
+
+def _parse_pr_url(pr_url: str) -> tuple:
+    """Parse 'https://github.com/<owner>/<repo>/pull/<n>' → (owner, repo, n).
+
+    Returns (None, None, None) if the URL doesn't look like a PR. The
+    'PR_SKIPPED_NEW_PROJECT' case (where the URL points to the repo root
+    instead of a /pull/<n> path) is detected here and reported as None.
+    """
+    import re as _re
+    m = _re.match(r"https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_url or "")
+    if not m:
+        return None, None, None
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def _merge_one_pr(owner: str, repo: str, pr_number: int,
+                  commit_title: str, commit_message: str) -> dict:
+    """Call GitHub's PUT /repos/{owner}/{repo}/pulls/{n}/merge.
+
+    Returns:
+        {"merged": bool, "sha": str|None, "error": str|None}
+
+    GitHub merge_method = "squash" so each AI-generated PR lands as a single
+    clean commit on main, regardless of how many small commits the feature
+    branch had. Two other options are "merge" (preserves all commits) and
+    "rebase" (replays each commit onto main).
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "merge_method": "squash",
+        "commit_title": commit_title[:240],     # GitHub caps these at 240/4096
+        "commit_message": commit_message[:4000],
+    }
+
+    try:
+        resp = requests.put(url, headers=headers, json=payload, timeout=30)
+    except Exception as e:
+        return {"merged": False, "sha": None,
+                "error": f"network error calling merge API: {e}"}
+
+    if resp.status_code == 200:
+        data = resp.json()
+        return {"merged": True, "sha": data.get("sha"), "error": None}
+
+    # GitHub merge failures we want clean messages for:
+    #   405 — PR not mergeable (conflicts, failing required checks, or branch
+    #         protection that requires reviews the bot doesn't have)
+    #   409 — head SHA changed since the merge was attempted
+    #   422 — validation error (e.g. PR already closed)
+    try:
+        err = resp.json().get("message", resp.text[:200])
+    except Exception:
+        err = resp.text[:200]
+    return {"merged": False, "sha": None,
+            "error": f"HTTP {resp.status_code}: {err}"}
+
+
+def merge_prs_for_state(state: dict) -> dict:
+    """Standalone helper — same logic as the merge_prs graph node, callable
+    directly from anywhere (e.g. api/main.py during the Phase 6→7 transition).
+
+    Takes a state-shaped dict (or anything with .get('approved'), .get('pr_urls'),
+    .get('status'), .get('requirement')) and returns a new state-shaped dict
+    with 'merged_shas', 'merge_errors', and a possibly-updated 'status'.
+
+    Returned status values:
+        'READY_FOR_DEPLOYMENT'   — merges all succeeded (or nothing to merge)
+        'MERGE_FAILED'           — at least one PR failed to merge
+        'PR_REJECTED'            — input had approved=False; nothing done
+    """
+    # Reject path
+    if state.get("status") == "PR_REJECTED" or not state.get("approved", True):
+        # default approved=True so callers that don't pass it (like the API
+        # transition handler, which only runs on approval anyway) still work
+        if state.get("status") != "PR_REJECTED":
+            # Caller passed approved=False explicitly
+            return {**state, "merged_shas": {}, "merge_errors": [],
+                    "status": "PR_REJECTED"}
+        return {**state, "merged_shas": {}, "merge_errors": []}
+
+    # New-project path
+    if state.get("status") == "PR_SKIPPED_NEW_PROJECT":
+        print("\n[merge_prs] New project — code already on default branch, "
+              "no PRs to merge")
+        return {
+            **state, "merged_shas": {}, "merge_errors": [],
+            "status": "READY_FOR_DEPLOYMENT",
+        }
+
+    pr_urls = state.get("pr_urls") or []
+    if not pr_urls:
+        print("\n[merge_prs] ⚠ No PR URLs — nothing to merge")
+        return {
+            **state, "merged_shas": {}, "merge_errors": [],
+            "status": "READY_FOR_DEPLOYMENT",
+        }
+
+    print(f"\n[merge_prs] Merging {len(pr_urls)} approved PR(s)...")
+    merged_shas: dict = {}
+    failures: list = []
+    requirement = (state.get("requirement") or "")[:80]
+
+    for pr_url in pr_urls:
+        owner, repo, pr_number = _parse_pr_url(pr_url)
+        if owner is None:
+            failures.append(f"{pr_url}: not recognizable as a /pull/<n> URL")
+            print(f"  ⚠ Skipped non-PR URL: {pr_url}")
+            continue
+
+        result = _merge_one_pr(
+            owner=owner,
+            repo=repo,
+            pr_number=pr_number,
+            commit_title=f"feat: {requirement}",
+            commit_message=(
+                f"Merged via SDLC-V2 Phase 6.\n\n"
+                f"Requirement: {state.get('requirement', '')}\n"
+                f"PR: {pr_url}"
+            ),
+        )
+
+        if result["merged"]:
+            merged_shas[repo] = result["sha"]
+            short = (result["sha"] or "?")[:7]
+            print(f"  ✅ Merged {owner}/{repo} PR #{pr_number} → {short}")
+        else:
+            failures.append(f"{owner}/{repo} PR #{pr_number}: {result['error']}")
+            print(f"  ❌ Merge failed for {owner}/{repo} PR #{pr_number}: "
+                  f"{result['error']}")
+
+    if failures:
+        print(f"\n[merge_prs] ⚠ {len(failures)} merge failure(s) — Phase 7 must NOT run")
+        return {
+            **state, "merged_shas": merged_shas, "merge_errors": failures,
+            "status": "MERGE_FAILED",
+        }
+
+    print(f"\n[merge_prs] ✅ All PRs merged. SHAs to deploy:")
+    for repo, sha in merged_shas.items():
+        print(f"    {repo} → {(sha or '?')[:7]}")
+
+    return {
+        **state, "merged_shas": merged_shas, "merge_errors": [],
+        "status": "READY_FOR_DEPLOYMENT",
+    }
+
+
+# -----------------------------------------
+# merge_prs — the graph node (thin wrapper over the standalone helper)
+# -----------------------------------------
+
+def merge_prs(state: DeliveryState) -> DeliveryState:
+    """Graph node that merges approved PRs. Delegates to merge_prs_for_state
+    so the same logic is reachable both via the graph and directly from
+    api/main.py during the Phase 6 → Phase 7 transition.
+    """
+    return merge_prs_for_state(dict(state))  # type: ignore[return-value]
+
+
 def route_after_approval(state: DeliveryState) -> str:
     if state["status"] == "APPROVED_FOR_DEPLOYMENT":
         return "approved"
@@ -304,20 +485,26 @@ def build_delivery_graph():
     builder.add_node("create_pr", create_pr)
     builder.add_node("human_approval_gate", human_approval_gate)
     builder.add_node("process_approval", process_approval)
+    builder.add_node("merge_prs", merge_prs)                  # ← NEW
 
     builder.set_entry_point("push_code")
     builder.add_edge("push_code", "create_pr")
     builder.add_edge("create_pr", "human_approval_gate")
     builder.add_edge("human_approval_gate", "process_approval")
 
+    # Approved → run the merge step. Rejected → end immediately (no merge).
     builder.add_conditional_edges(
         "process_approval",
         route_after_approval,
         {
-            "approved": END,
+            "approved": "merge_prs",                          # ← was END
             "rejected": END
         }
     )
+
+    # After merge (success OR failure), Phase 6 is done. Phase 7 reads
+    # state.status to decide whether to proceed.
+    builder.add_edge("merge_prs", END)                        # ← NEW
 
     memory = MemorySaver()
     return builder.compile(
@@ -331,12 +518,12 @@ def build_delivery_graph():
 # -----------------------------------------
 
 def run_delivery(
-    requirement: str,
-    generated_changes: list,
-    test_files: list,
-    repo_url: str,
-    branch_name: str,
-    thread_id: str = "thread-delivery"
+        requirement: str,
+        generated_changes: list,
+        test_files: list,
+        repo_url: str,
+        branch_name: str,
+        thread_id: str = "thread-delivery"
 ) -> dict:
     graph = build_delivery_graph()
     config = {"configurable": {"thread_id": thread_id}}

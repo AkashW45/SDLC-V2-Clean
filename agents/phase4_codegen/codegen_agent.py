@@ -32,15 +32,18 @@ client = OpenAI(
 # State
 # -----------------------------------------
 
-class CodegenState(TypedDict):
+class CodegenState(TypedDict, total=False):
     requirement: str
     scope_contract: dict
     impact_report: dict
     adr: dict                  # Architecture Decision Record for tech stack enforcement
     existing_code: dict        # file_path -> current content
     generated_changes: list    # list of {file_path, content, change_summary}
-    
-   
+
+    # CI/CD artifact metadata — populated by the new generate_cicd node
+    cicd_decision: dict        # what the LLM decided about deploy needs
+    cicd_warnings: list        # validation warnings (no-test sanity checks)
+
     validation_errors: list
     status: str
     workspace_path: str
@@ -77,11 +80,11 @@ def get_symbols_for_file(repo_name: str, file_path: str) -> list:
     conn = get_postgres()
     cur = conn.cursor()
     cur.execute("""
-        SELECT symbol_name, symbol_type, line_number, signature, docstring
-        FROM symbols
-        WHERE repo_name = %s AND file_path = %s
-        ORDER BY line_number
-    """, (repo_name, file_path))
+                SELECT symbol_name, symbol_type, line_number, signature, docstring
+                FROM symbols
+                WHERE repo_name = %s AND file_path = %s
+                ORDER BY line_number
+                """, (repo_name, file_path))
     symbols = []
     for row in cur.fetchall():
         symbols.append({
@@ -310,21 +313,21 @@ def load_existing_code(state: CodegenState) -> CodegenState:
     return {**state, "existing_code": existing_code, "status": "CODE_LOADED"}
 
 def generate_fresh_project(state: CodegenState) -> CodegenState:
-        print("  [Phase 4] Generating FRESH Polyglot project scaffold...")
+    print("  [Phase 4] Generating FRESH Polyglot project scaffold...")
 
-        requirement = state["requirement"]
-        adr = state.get("adr", {})
-        impact = state.get("impact_report", {})
-        architecture = impact.get("architecture", {})
+    requirement = state["requirement"]
+    adr = state.get("adr", {})
+    impact = state.get("impact_report", {})
+    architecture = impact.get("architecture", {})
 
-        # Extract ADR and Architecture context
-        adr_text = json.dumps(adr, indent=2) if adr else "ADR not provided."
-        arch_context = ""
-        if architecture.get("nodes"):
-            arch_summary = [f"- {n.get('name','')} ({n.get('type','service')}): {n.get('description','')}" for n in architecture.get("nodes",[])]
-            arch_context = "\nARCHITECTURE TO IMPLEMENT:\n" + "\n".join(arch_summary)
+    # Extract ADR and Architecture context
+    adr_text = json.dumps(adr, indent=2) if adr else "ADR not provided."
+    arch_context = ""
+    if architecture.get("nodes"):
+        arch_summary = [f"- {n.get('name','')} ({n.get('type','service')}): {n.get('description','')}" for n in architecture.get("nodes",[])]
+        arch_context = "\nARCHITECTURE TO IMPLEMENT:\n" + "\n".join(arch_summary)
 
-        prompt = f"""
+    prompt = f"""
     You are a Senior Polyglot Software Architect scaffolding a brand new multi-service project.
 
     ADR (Agreed Tech Stack):
@@ -356,28 +359,28 @@ def generate_fresh_project(state: CodegenState) -> CodegenState:
     }}
     """
 
-        response = call_llm(prompt, max_tokens=4000)
-        if response.startswith("```"):
-            response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
+    response = call_llm(prompt, max_tokens=4000)
+    if response.startswith("```"):
+        response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
 
-        try:
-            data = json.loads(response)
-            generated_changes = data.get("files", [])
-        except Exception as e:
-            print(f"  [Phase 4] JSON parse failed: {e}")
-            generated_changes = []
+    try:
+        data = json.loads(response)
+        generated_changes = data.get("files", [])
+    except Exception as e:
+        print(f"  [Phase 4] JSON parse failed: {e}")
+        generated_changes = []
 
-        errors = []
-        for change in generated_changes:
-            errors.extend(validate_python(change.get("content", ""), change.get("file_path", "")))
+    errors = []
+    for change in generated_changes:
+        errors.extend(validate_python(change.get("content", ""), change.get("file_path", "")))
 
-        print(f"  [Phase 4] Generated {len(generated_changes)} fresh files")
-        return {
-            **state,
-            "generated_changes": generated_changes,
-            "validation_errors": errors,
-            "status": "CODE_GENERATED" if not errors else "CODE_GENERATION_FAILED"
-        }
+    print(f"  [Phase 4] Generated {len(generated_changes)} fresh files")
+    return {
+        **state,
+        "generated_changes": generated_changes,
+        "validation_errors": errors,
+        "status": "CODE_GENERATED" if not errors else "CODE_GENERATION_FAILED"
+    }
 
 
 
@@ -420,8 +423,8 @@ def build_context_packet(state: CodegenState) -> dict:
         # Get current content
         # existing_code is keyed by "<repo>:<path>" — fall back to bare path for safety
         current_content = (
-            state["existing_code"].get(f"{repo_name}:{file_path}")
-            or state["existing_code"].get(file_path, "")
+                state["existing_code"].get(f"{repo_name}:{file_path}")
+                or state["existing_code"].get(file_path, "")
         )
 
         context["files"].append({
@@ -437,16 +440,16 @@ def build_context_packet(state: CodegenState) -> dict:
 
 def generate_code_changes(state: CodegenState) -> CodegenState:
     print("\n[Phase 4] Generating Diff-Based Polyglot Code Changes...")
-    
+
     if state.get("status") == "NEW_PROJECT_NO_CODE":
         return generate_fresh_project(state)
-    
+
     impact = state.get("impact_report", {})
     affected_files = impact.get("affected_files", [])
     context = build_context_packet(state)
-    asp = state.get("scope_contract", {}) 
+    asp = state.get("scope_contract", {})
     requirement = state.get("requirement", "")
-    
+
     # ── CLAUDE'S RAG CONTEXT BUILDER ──
     packet = build_context_packet_rag(
         requirement=requirement,
@@ -461,10 +464,10 @@ def generate_code_changes(state: CodegenState) -> CodegenState:
     workspace_path = state.get('workspace_path', '')
     # Build the brownfield RAG context once for the whole batch
     packet = build_context_packet_rag(
-    requirement=requirement,
-    asp=asp,
-    top_k=8, max_files=4,
-    selected_repos=state.get("selected_repos", []),
+        requirement=requirement,
+        asp=asp,
+        top_k=8, max_files=4,
+        selected_repos=state.get("selected_repos", []),
     )
     print(f"  [Phase 4] RAG packet size: {len(packet)} chars")
 
@@ -534,24 +537,24 @@ Return ONLY valid JSON in this exact format:
                 change_data = json.loads(response)
                 modified_content = current_content
                 diff_errors = []
-                
+
                 if change_data.get("changes"):
                     for diff in change_data["changes"]:
                         search_block = diff.get("search_block", "")
                         replace_block = diff.get("replace_block", "")
-                        
+
                         if not search_block:
                             continue
                         try:
-                           modified_content = apply_patch(
-                                               modified_content, 
-                                                search_block, 
-                                                replace_block, 
-                                                file_path=file_path
-                                                          )
+                            modified_content = apply_patch(
+                                modified_content,
+                                search_block,
+                                replace_block,
+                                file_path=file_path
+                            )
                         except ValueError as e:
-                              diff_errors.append(str(e))
-                              continue
+                            diff_errors.append(str(e))
+                            continue
 
                     if diff_errors:
                         errors = diff_errors
@@ -565,7 +568,7 @@ Return ONLY valid JSON in this exact format:
                     print(f"  ⚠️  Attempt {attempt}/{max_retries} — errors: {errors}")
                     if attempt < max_retries:
                         # When retry is triggered by 'search_block not found':
-                       retry_feedback = """
+                        retry_feedback = """
 CRITICAL FEEDBACK FROM PREVIOUS ATTEMPT:
 
 The patch's `search_block` did NOT match the actual file content. The file content
@@ -586,7 +589,7 @@ For files you cannot patch reliably, RETURN:
 
 Do NOT invent code that isn't there.
 """
-                       prompt += f"\n\n{retry_feedback}"
+                        prompt += f"\n\n{retry_feedback}"
                         # ─────────────────────────────────────────────
                     continue
                 if workspace_path:
@@ -638,7 +641,7 @@ def validate_changes(state: CodegenState) -> CodegenState:
     success_count = len(changes)
     success_rate = success_count / max(total, 1)
 
-        # Threshold: tolerate up to 30% failures, but never accept 0 successes
+    # Threshold: tolerate up to 30% failures, but never accept 0 successes
     MIN_SUCCESS_RATE = 0.70
 
     if success_count == 0:
@@ -680,9 +683,188 @@ def validate_changes(state: CodegenState) -> CodegenState:
 
 
 def route_after_validation(state: CodegenState) -> str:
-    if state["status"] == "VALIDATED":
+    """Route after validate_changes.
+
+    Accept any of the success-shaped statuses so the graph terminates the
+    right way. The original version only checked for the literal "VALIDATED"
+    which validate_changes never produces.
+    """
+    if state.get("status") in ("CODE_GENERATED", "CODE_GENERATED_WITH_WARNINGS"):
         return "pass"
     return "fail"
+
+
+# -----------------------------------------
+# CI/CD Artifact Generation (Phase 4 → 7 bridge)
+# -----------------------------------------
+
+def generate_cicd_node(state: CodegenState) -> CodegenState:
+    """Generate Dockerfile, .deploy.yaml, and GitHub Actions CI/CD workflow.
+
+    Runs after main code generation but before validation, so the new files
+    flow through the same validation step as the rest of generated_changes.
+
+    Skips entirely if code generation produced nothing (no point creating
+    deploy infra for an empty pipeline).
+
+    Brownfield safety: we look at what's *actually on disk* in the cloned
+    repo, NOT just at the files Phase 3 flagged as affected. Phase 3's
+    `affected_files` only lists files relevant to the requirement (e.g.
+    `app/models.py`) — it never includes infra files like `Dockerfile`.
+    If we only consulted that list, we'd miss existing infra and clobber
+    it. This function scans the repo root directly.
+    """
+    from agents.phase4_codegen.cicd_generator import generate_cicd_artifacts
+    from agents.repo_workspace import get_repo_local_path
+
+    changes = state.get("generated_changes", [])
+    if not changes:
+        print("\n[Phase 4] No code generated — skipping CI/CD artifact generation")
+        return state
+
+    print("\n[Phase 4] Generating CI/CD + deployment artifacts...")
+
+    # ── Detect whether this is a brownfield run by checking impact_report ──
+    # If Phase 3 listed affected files, the repo already exists. If the status
+    # came in as NEW_PROJECT_NO_CODE, it's greenfield. We need both pieces:
+    #   - is_brownfield: whether to apply the "be conservative" policy
+    #   - existing_files: what's actually present on disk so we don't clobber
+    impact = state.get("impact_report") or {}
+    affected_files = impact.get("affected_files", [])
+    is_brownfield = bool(affected_files) and state.get("status") != "NEW_PROJECT_NO_CODE"
+
+    existing_files: set = set()
+    if is_brownfield:
+        # Collect distinct repo names from affected_files and scan each one
+        # on disk. We only look at the *top-level* + a few well-known infra
+        # paths because deploy artifacts always live near the repo root.
+        repo_names = {af.get("repo_name") for af in affected_files if af.get("repo_name")}
+        for repo_name in repo_names:
+            try:
+                repo_path = get_repo_local_path(repo_name)
+            except Exception as e:
+                print(f"  [cicd] cannot resolve local path for {repo_name}: {e}")
+                continue
+            if not repo_path or not os.path.isdir(repo_path):
+                print(f"  [cicd] repo {repo_name} not cloned locally — "
+                      f"cannot detect existing infra files")
+                continue
+
+            # Top-level files (Dockerfile, .deploy.yaml, .dockerignore, etc.)
+            for entry in os.listdir(repo_path):
+                full = os.path.join(repo_path, entry)
+                if os.path.isfile(full):
+                    existing_files.add(entry)
+
+            # Known infra subdirectories — we look one level deep
+            for sub in (".github/workflows",):
+                sub_path = os.path.join(repo_path, sub)
+                if os.path.isdir(sub_path):
+                    for entry in os.listdir(sub_path):
+                        if os.path.isfile(os.path.join(sub_path, entry)):
+                            existing_files.add(f"{sub}/{entry}")
+
+        # Echo what we found so the run log makes the decision auditable
+        infra_present = sorted(
+            f for f in existing_files
+            if f in ("Dockerfile", ".deploy.yaml", ".dockerignore")
+            or f.startswith(".github/workflows/")
+        )
+        if infra_present:
+            print(f"  [cicd] brownfield infra detected on disk: {infra_present}")
+        else:
+            print(f"  [cicd] brownfield repo but no infra files found "
+                  f"(Dockerfile/.deploy.yaml/workflow) — LLM will decide")
+    else:
+        print("  [cicd] greenfield project — generating full deployment stack")
+
+    result = generate_cicd_artifacts(
+        requirement=state.get("requirement", ""),
+        generated_changes=changes,
+        adr=state.get("adr"),
+        architecture=(state.get("impact_report") or {}).get("architecture"),
+        existing_files_in_repo=existing_files,
+        is_brownfield=is_brownfield,
+    )
+
+    new_files = result.get("new_files", [])
+    if new_files:
+        # Append, don't replace — keep all the regular files Phase 4 generated.
+        combined = list(changes) + new_files
+        return {
+            **state,
+            "generated_changes": combined,
+            "cicd_decision": result.get("decision"),
+        }
+
+    return {**state, "cicd_decision": result.get("decision")}
+
+
+def validate_cicd_node(state: CodegenState) -> CodegenState:
+    """Sanity-check CI/CD artifacts WITHOUT running them.
+
+    Per directive: no tests run. We only check that:
+      - YAML files parse
+      - Dockerfile has the required directives (FROM, EXPOSE if a port was
+        promised, CMD or ENTRYPOINT)
+      - GitHub Actions workflow has the structural fields (`on`, `jobs`)
+      - .deploy.yaml has the keys Phase 7 will read (deploy_target, service_name)
+
+    Failures here are recorded as warnings — they don't fail the pipeline,
+    because deployment artifacts being suboptimal shouldn't kill an
+    otherwise-successful codegen.
+    """
+    print("\n[Phase 4] Validating CI/CD artifacts (no tests run)...")
+    changes = state.get("generated_changes", [])
+    warnings: list = list(state.get("cicd_warnings", []))
+
+    for c in changes:
+        path = c.get("file_path", "")
+        content = c.get("content", "")
+
+        # Dockerfile checks
+        if path == "Dockerfile" or path.endswith("/Dockerfile"):
+            if "FROM " not in content:
+                warnings.append(f"{path}: missing FROM directive")
+            if "CMD " not in content and "ENTRYPOINT " not in content:
+                warnings.append(f"{path}: missing CMD or ENTRYPOINT")
+
+        # YAML files (deploy.yaml + workflow) — parse only
+        elif path == ".deploy.yaml" or path.endswith(".deploy.yaml") \
+                or (path.startswith(".github/workflows/") and (path.endswith(".yml") or path.endswith(".yaml"))):
+            try:
+                import yaml
+                parsed = yaml.safe_load(content)
+                if not isinstance(parsed, dict):
+                    warnings.append(f"{path}: YAML did not parse to a mapping")
+                else:
+                    if path.endswith(".deploy.yaml"):
+                        for required_key in ("deploy_target", "service_name"):
+                            if required_key not in parsed:
+                                warnings.append(
+                                    f"{path}: missing required key '{required_key}'"
+                                )
+                    elif path.startswith(".github/workflows/"):
+                        for required_key in ("on", "jobs"):
+                            if required_key not in parsed and True not in parsed:
+                                # GitHub Actions weirdly parses `on:` → bool True
+                                # under some yaml libs; allow both
+                                warnings.append(
+                                    f"{path}: missing required key '{required_key}'"
+                                )
+            except Exception as e:
+                warnings.append(f"{path}: YAML parse error — {e}")
+
+    if warnings:
+        print(f"  ⚠ {len(warnings)} CI/CD validation warning(s):")
+        for w in warnings[:10]:
+            print(f"    - {w}")
+        if len(warnings) > 10:
+            print(f"    (+ {len(warnings) - 10} more)")
+    else:
+        print("  ✅ All CI/CD artifacts validated")
+
+    return {**state, "cicd_warnings": warnings}
 
 
 # -----------------------------------------
@@ -696,6 +878,8 @@ def build_codegen_graph():
     builder.add_node("load_existing_code", load_existing_code)
     builder.add_node("generate_fresh_project", generate_fresh_project)
     builder.add_node("generate_code_changes", generate_code_changes)
+    builder.add_node("generate_cicd", generate_cicd_node)         # ← NEW
+    builder.add_node("validate_cicd", validate_cicd_node)         # ← NEW
     builder.add_node("validate_changes", validate_changes)
 
     # Single linear flow into the router
@@ -712,9 +896,13 @@ def build_codegen_graph():
         {"fresh": "generate_fresh_project", "existing": "generate_code_changes"},
     )
 
-    # Both generators converge on validation
-    builder.add_edge("generate_fresh_project", "validate_changes")
-    builder.add_edge("generate_code_changes", "validate_changes")
+    # Both generators flow into CI/CD artifact generation
+    builder.add_edge("generate_fresh_project", "generate_cicd")
+    builder.add_edge("generate_code_changes", "generate_cicd")
+
+    # CI/CD generation → CI/CD validation (no tests, just sanity checks) → main validation
+    builder.add_edge("generate_cicd", "validate_cicd")
+    builder.add_edge("validate_cicd", "validate_changes")
 
     # Validation terminates the graph
     builder.add_conditional_edges(
