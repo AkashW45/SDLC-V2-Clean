@@ -104,6 +104,13 @@ def push_files_to_branch(
         run_git(["git", "commit", "-m", commit_message], cwd=temp_dir)
         run_git(["git", "push", "origin", branch_name, "--force"], cwd=temp_dir)
 
+        safe_repo_url = "https://github.com/AkashW45/leave-mgmt-backend.git"
+
+        run_git(
+            ["git", "remote", "set-url", "origin", safe_repo_url],
+            cwd=temp_dir
+        )
+
         return {
             "status": "PUSH_SUCCESS",
             "branch": branch_name,
@@ -208,7 +215,7 @@ def create_pr(state: DeliveryState) -> DeliveryState:
     repo_url = state["repo_url"]
 
     # Extract repo name from URL
-    repo_name = repo_url.rstrip(".git").split("/")[-1]
+    repo_name = repo_url.split("/")[-1].replace(".git", "")
 
     # New project: code was pushed directly to default branch — no PR needed.
     # GitHub can't open a PR from main → main, so we record the repo URL instead.
@@ -620,11 +627,21 @@ def test_employee_default_balance():
 
     requirement = "Add leave balance tracker. Each employee gets 20 days per year."
 
+    github_token = os.getenv("GITHUB_TOKEN")
+
+    if not github_token:
+        raise Exception("GITHUB_TOKEN is missing")
+
+    repo_url = (
+        f"https://x-access-token:{github_token}@github.com/"
+        "AkashW45/leave-mgmt-backend.git"
+    )
+
     graph6, config6, result6 = run_delivery(
         requirement=requirement,
         generated_changes=mock_changes,
         test_files=mock_test_files,
-        repo_url="https://github.com/AkashW45/leave-mgmt-backend.git",
+        repo_url=repo_url,
         branch_name="feature/leave-balance-test",
         thread_id="test-delivery-1"
     )
