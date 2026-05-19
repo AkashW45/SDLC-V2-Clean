@@ -104,7 +104,8 @@ def push_files_to_branch(
         run_git(["git", "commit", "-m", commit_message], cwd=temp_dir)
         run_git(["git", "push", "origin", branch_name, "--force"], cwd=temp_dir)
 
-        safe_repo_url = "https://github.com/AkashW45/leave-mgmt-backend.git"
+        safe_repo_url = repo_url.split("@github.com/")[-1]
+        safe_repo_url = f"https://github.com/{safe_repo_url}"
 
         run_git(
             ["git", "remote", "set-url", "origin", safe_repo_url],
@@ -168,6 +169,18 @@ def push_code(state: DeliveryState) -> DeliveryState:
 
     branch_name = state["branch_name"]
     repo_url = state["repo_url"]
+
+    github_token = os.getenv("GITHUB_TOKEN")
+
+    if not github_token:
+        raise Exception("GITHUB_TOKEN is missing")
+
+    # Inject auth into GitHub HTTPS URL
+    if repo_url.startswith("https://github.com/"):
+        repo_url = repo_url.replace(
+            "https://github.com/",
+            f"https://x-access-token:{github_token}@github.com/"
+        )
 
     # Prepare all files to push
     all_files = []
