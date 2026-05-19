@@ -696,7 +696,10 @@ def run_validation(state: ValidationState) -> ValidationState:
 
     if pytest_result["status"] != "PASS":
         print("\n[Phase 5] Pytest output:")
-        print(pytest_result["output"])
+        if "output" in pytest_result:
+            print(pytest_result["output"])
+        else:
+            print(pytest_result.get("reason", "No pytest output available"))
         # Determine what languages we have
     generated_changes = state.get("generated_changes", []) or []
     languages_present = set()
