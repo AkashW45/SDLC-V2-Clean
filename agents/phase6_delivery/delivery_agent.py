@@ -5,11 +5,10 @@ Human approval gate — engineers must review PR before merge.
 """
 
 import os
-import json
+import time
 import subprocess
 import tempfile
 import shutil
-import datetime
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -56,6 +55,43 @@ def run_git(cmd: list, cwd: str) -> str:
     if result.returncode != 0:
         raise Exception(f"Git error: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def create_github_repo(
+        repo_name: str,
+        private: bool = True
+) -> dict:
+    """
+    Create a new GitHub repository for greenfield projects.
+    """
+
+    url = "https://api.github.com/user/repos"
+
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    payload = {
+        "name": repo_name,
+        "private": private,
+        "auto_init": True
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+
+    # Repo created successfully
+    if response.status_code == 201:
+        return response.json()
+
+    # Repo already exists
+    if response.status_code == 422 and "name already exists" in response.text:
+        return {"status": "ALREADY_EXISTS"}
+
+    raise Exception(
+        f"GitHub repo creation failed: "
+        f"{response.status_code} - {response.text}"
+    )
 
 
 def push_files_to_branch(
@@ -181,6 +217,29 @@ def push_code(state: DeliveryState) -> DeliveryState:
             "https://github.com/",
             f"https://x-access-token:{github_token}@github.com/"
         )
+
+    # -----------------------------------------
+    # Greenfield repo creation
+    # -----------------------------------------
+
+    # Extract repo name
+    repo_name = repo_url.split("/")[-1].replace(".git", "")
+
+    # Check if repo exists
+    repo_check_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{repo_name}"
+
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    repo_check = requests.get(repo_check_url, headers=headers)
+    time.sleep(3)
+    # Repo does not exist → create it
+    if repo_check.status_code == 404:
+        print(f"  ℹ️  Repo '{repo_name}' does not exist. Creating...")
+        create_github_repo(repo_name=repo_name)
+        print(f"  ✅ Repository created: {repo_name}")
 
     # Prepare all files to push
     all_files = []
