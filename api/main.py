@@ -1705,7 +1705,13 @@ def run_phase7(thread_id: str, feedback: str = ""):
 
         pipeline_store[thread_id].update({"status": "PHASE_7_RUNNING", "sub_stage": "Resolving deployment sequence...", "phase": 7})
 
-        affected_repos = [r["name"] for r in state.get("selected_repos", [])] or state.get("impact_report", {}).get("affected_repos", [])
+        # affected_repos in impact_report is now a list of enriched dicts
+        # (name, url, type, …) produced by Phase 3 using Phase 0's metadata.
+        # No need to separately read selected_repos for git URL resolution.
+        affected_repos = state.get("impact_report", {}).get("affected_repos", [])
+        if not affected_repos:
+            # Fallback: use selected_repos names if impact report is empty
+            affected_repos = [r["name"] for r in state.get("selected_repos", [])]
 
         # Pull the SHAs Phase 6 merged so Phase 7 deploys exactly that code,
         # not whatever HEAD-of-main happens to be at clone time.
@@ -1719,7 +1725,7 @@ def run_phase7(thread_id: str, feedback: str = ""):
             pr_urls=entry.get("pr_urls", []),
             affected_repos=affected_repos,
             scope_contract=state.get("scope_contract", {}),
-            merged_shas=merged_shas,                  # ← NEW: SHA per repo to git-checkout
+            merged_shas=merged_shas,                  # ← SHA per repo to git-checkout
             deploy_sequence=[], feature_flags=[],
             deploy_results=[], monitoring_results={},
             rollback_triggered=False,

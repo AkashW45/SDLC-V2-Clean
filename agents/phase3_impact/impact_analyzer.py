@@ -223,12 +223,12 @@ def _fetch_contracts_parallel(repo_names: list) -> list:
 # -----------------------------------------
 
 def assess_risk(
-    requirement: str,
-    affected_files: list,
-    affected_symbols: list,
-    contracts: list,
-    functional_requirements: list = None,
-    adr: dict = None
+        requirement: str,
+        affected_files: list,
+        affected_symbols: list,
+        contracts: list,
+        functional_requirements: list = None,
+        adr: dict = None
 ) -> dict:
     """Use DeepSeek to assess risk level, injecting PRD/ADR for strict Context Precision."""
 
@@ -321,10 +321,10 @@ def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None,
     print("\n[Step 1] Semantic search across indexed repos...")
     # Scope semantic search to the selected repos so we don't bleed into other projects
     selected_repo_names = [
-    r if isinstance(r, str) else r.get("name")
-    for r in (selected_repos or [])
-    if (r if isinstance(r, str) else r.get("name"))
-]
+        r if isinstance(r, str) else r.get("name")
+        for r in (selected_repos or [])
+        if (r if isinstance(r, str) else r.get("name"))
+    ]
     hits = semantic_search(requirement, top_k=8, repo_names=selected_repo_names or None)
     print(f"  Scoped to repos: {selected_repo_names or 'ALL'}")
     print(f"  Found {len(hits)} relevant symbols")
@@ -359,7 +359,26 @@ def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None,
 
     affected_files_list = list(affected_files.values())
     file_paths = [f["file_path"] for f in affected_files_list]
-    affected_repos = list({f["repo_name"] for f in affected_files_list})
+    affected_repo_names = list({f["repo_name"] for f in affected_files_list})
+
+    # Build a name→metadata lookup from Phase 0's selected_repos so we can
+    # enrich affected_repos with git URLs, type, language, etc. in one place.
+    # Downstream phases (Phase 7) can then use impact_report["affected_repos"]
+    # directly without needing a separate selected_repos lookup.
+    selected_repos_by_name = {}
+    for r in (selected_repos or []):
+        if isinstance(r, dict) and r.get("name"):
+            selected_repos_by_name[r["name"]] = r
+
+    affected_repos = []
+    for name in affected_repo_names:
+        meta = selected_repos_by_name.get(name)
+        if meta:
+            # Merge Phase 0 metadata (name, url, type, language, etc.) and mark impacted
+            affected_repos.append({**meta, "impacted": True})
+        else:
+            # No Phase 0 metadata — store name only for backward compatibility
+            affected_repos.append({"name": name, "impacted": True})
 
     print(f"  Affected files: {file_paths}")
 
@@ -370,7 +389,7 @@ def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None,
     with ThreadPoolExecutor(max_workers=4) as executor:
         fut_symbols    = executor.submit(get_affected_symbols_batch, file_paths)
         fut_dependents = executor.submit(get_dependents_batch, file_paths)
-        fut_contracts  = executor.submit(_fetch_contracts_parallel, affected_repos)
+        fut_contracts  = executor.submit(_fetch_contracts_parallel, affected_repo_names)
 
         symbols_by_file: dict = fut_symbols.result()
         dependents_map: dict  = fut_dependents.result()
@@ -408,7 +427,7 @@ def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None,
 
     print(f"\n{'='*50}")
     print("✅ Impact Analysis Complete")
-    print(f"   Repos affected: {affected_repos}")
+    print(f"   Repos affected: {[r['name'] for r in affected_repos]}")
     print(f"   Files affected: {len(affected_files_list)}")
     print(f"   Symbols affected: {len(all_affected_symbols)}")
     print(f"   Risk: {risk.get('risk_level')}")
