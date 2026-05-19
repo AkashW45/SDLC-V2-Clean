@@ -66,14 +66,10 @@ class DeploymentState(TypedDict, total=False):
     scope_contract: dict
     runbook: dict
     pr_urls: list
-    affected_repos: list           # list[str] from upstream phases
-
-    # Rich repo metadata from Phase 0 (selector_agent).  Each entry is a dict
-    # with at minimum {"name": str, "url": str}.  When present,
-    # resolve_deploy_sequence uses these git URLs directly instead of
-    # re-deriving them from the deployment config's repo_resolver template —
-    # avoiding a second round-trip through config lookup logic.
-    selected_repos: list           # list[dict] from Phase 0 — {name, url, type, …}
+    # Enriched by Phase 3 with full metadata from Phase 0 — each entry is a dict
+    # {name, url, type, language, …}. resolve_deploy_sequence reads git URLs
+    # directly from here; no separate selected_repos lookup needed.
+    affected_repos: list           # list[dict] from Phase 3 — {name, url, type, …}
 
     # Per-repo commit SHAs to deploy (set by Phase 6's merge_prs step).
     # Phase 7's resolve_deploy_sequence pins each repo's `ref` to its
@@ -239,10 +235,17 @@ def resolve_deploy_sequence(state: DeploymentState) -> DeploymentState:
     print("\n[Phase 7] Resolving repo names and git URLs...")
     cfg = _load_cfg(state)
 
-    affected = list(state.get("affected_repos") or [])
-    if not affected:
+    affected_raw = list(state.get("affected_repos") or [])
+    if not affected_raw:
         print("  ⚠ no affected_repos provided — falling back to legacy `repos:` block")
         affected = list(cfg.repos.keys())
+    else:
+        # affected_repos may be enriched dicts {name, url, …} (new format from Phase 3)
+        # or plain strings (old format / fallback). Normalise to plain names here.
+        affected = [
+            r["name"] if isinstance(r, dict) else r
+            for r in affected_raw
+        ]
 
     # SHAs to pin each repo to (from Phase 6's merge step). If empty, Phase 7
     # falls back to HEAD-of-branch — useful for hot-fix re-deploys where you
@@ -839,7 +842,6 @@ def run_deployment(
         pr_urls: list,
         affected_repos: list,
         scope_contract: Optional[dict] = None,
-        selected_repos: Optional[list] = None,
         thread_id: str = "thread-deployment",
         config_path: Optional[str] = None,
         dry_run: Optional[bool] = None,
@@ -851,12 +853,10 @@ def run_deployment(
         requirement: original requirement text (for audit trail)
         runbook: from Phase 2 — may contain feature_flags & rollback_steps
         pr_urls: merged PR URLs from Phase 6
-        affected_repos: list[str] from Phase 3
+        affected_repos: list[dict] from Phase 3 — enriched with git URL, type,
+            language, etc. from Phase 0. resolve_deploy_sequence reads git URLs
+            directly from these dicts; no separate selected_repos needed.
         scope_contract: optional scope contract from upstream phases
-        selected_repos: rich repo metadata from Phase 0 — list of dicts with at
-            minimum {"name": str, "url": str}.  When supplied,
-            resolve_deploy_sequence uses these git URLs directly instead of
-            re-deriving them via the deployment config's repo_resolver template.
         thread_id: LangGraph checkpoint thread id
         config_path: explicit path to deployment.yaml (else autodetect)
         dry_run: override config.dry_run (None = honor config)
@@ -870,7 +870,6 @@ def run_deployment(
         "runbook": runbook or {},
         "pr_urls": pr_urls or [],
         "affected_repos": affected_repos or [],
-        "selected_repos": selected_repos or [],
         "resolved_repos": [],
         "deploy_sequence": [],
         "feature_flags": [],
@@ -942,16 +941,16 @@ if __name__ == "__main__":
         requirement="Add leave balance tracker",
         runbook=mock_runbook,
         pr_urls=["https://github.com/AkashW45/leave-mgmt-backend/pull/11"],
-        affected_repos=["leave-mgmt-backend"],
-        # Simulate the rich repo metadata Phase 0 would have produced —
-        # resolve_deploy_sequence will use this URL directly.
-        selected_repos=[
-            {
-                "name": "leave-mgmt-backend",
-                "url": "https://github.com/AkashW45/leave-mgmt-backend.git",
-                "type": "backend",
-            }
-        ],
+        # affected_repos now carries full metadata (as Phase 3 would produce
+        # after enrichment from Phase 0) — url is used directly by
+        # resolve_deploy_sequence, no separate selected_repos needed.
+        affected_repos=[{
+            "name": "leave-mgmt-backend",
+            "url":  "https://github.com/AkashW45/leave-mgmt-backend.git",
+            "type": "backend",
+            "language": "python",
+            "impacted": True,
+        }],
         thread_id="test-deployment-1",
         dry_run=True,  # always dry-run for the self-test
     )
