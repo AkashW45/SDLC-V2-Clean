@@ -535,7 +535,14 @@ def run_pytest_sandbox(generated_changes: list, test_files: list, timeout: int =
             os.makedirs(os.path.dirname(full) or sandbox, exist_ok=True)
             with open(full, "w", encoding="utf-8") as f:
                 f.write(content)
+            current_dir = os.path.dirname(full)
+            while current_dir and current_dir != sandbox:
+                init_file = os.path.join(current_dir, "__init__.py")
 
+                if not os.path.exists(init_file):
+                    with open(init_file, "w") as f:
+                        f.write("")
+                current_dir = os.path.dirname(current_dir)
         # 2. Write test files
         for test in py_tests:
             tpath = test.get("test_file_path", "")
@@ -546,6 +553,16 @@ def run_pytest_sandbox(generated_changes: list, test_files: list, timeout: int =
             os.makedirs(os.path.dirname(full) or sandbox, exist_ok=True)
             with open(full, "w", encoding="utf-8") as f:
                 f.write(tcontent)
+            current_dir = os.path.dirname(full)
+
+            while current_dir and current_dir != sandbox:
+                init_file = os.path.join(current_dir, "__init__.py")
+
+                if not os.path.exists(init_file):
+                    with open(init_file, "w") as f:
+                        f.write("")
+
+                current_dir = os.path.dirname(current_dir)
 
         # 3. Run pytest. Sandbox is on PYTHONPATH so tests can import generated code.
         env = os.environ.copy()
@@ -677,6 +694,9 @@ def run_validation(state: ValidationState) -> ValidationState:
           f"{pytest_result['passed']} passed, {pytest_result['failed']} failed, "
           f"{pytest_result.get('errors', 0)} errors")
 
+    if pytest_result["status"] != "PASS":
+        print("\n[Phase 5] Pytest output:")
+        print(pytest_result["output"])
         # Determine what languages we have
     generated_changes = state.get("generated_changes", []) or []
     languages_present = set()
