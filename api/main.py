@@ -5,13 +5,14 @@ Unified Version: Blends Surgical Replays & API Security with Phase 0 Smart Routi
 import io
 import os
 import re
+import hashlib
 from time import time
 import uuid
 import json
 import asyncio
 import requests
 from typing import Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Body, Depends, Security, logger
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Body, Depends, Security, Response, Request, logger
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse, HTMLResponse, Response
@@ -474,13 +475,15 @@ def pipeline_status(thread_id: str,
     }
 
 @app.get("/pipeline/list")
-def pipeline_list(user_id: str = Depends(get_user_id)):
-    """List pipelines for the requesting user. No API key required — user_id is the boundary."""
-    """List pipelines for the requesting user. Soft auth — anonymous gets empty list."""
-    # Soft API key check — accept missing key but log
+def pipeline_list(request: Request, response: Response, user_id: str = Depends(get_user_id)):
+    """
+    List pipelines for the requesting user. user_id is the boundary.
 
-
-
+    Supports HTTP ETag: the browser sends back the previous ETag in the
+    If-None-Match header, and if the data hasn't changed we return 304 with
+    an empty body. Saves bandwidth when the dashboard polls and nothing has
+    moved since last time.
+    """
     from core.db_clients import pg_conn
     with pg_conn() as conn:
         cur = conn.cursor()
@@ -493,7 +496,8 @@ def pipeline_list(user_id: str = Depends(get_user_id)):
                     """, (user_id,))
         rows = cur.fetchall()
         cur.close()
-    return [
+
+    payload = [
         {
             "thread_id": r[0],
             "requirement": r[1] or "",
@@ -504,6 +508,25 @@ def pipeline_list(user_id: str = Depends(get_user_id)):
         }
         for r in rows
     ]
+
+    # ── ETag handling ────────────────────────────────────────────────────
+    # Hash the rows (each row already contains updated_at, which changes when
+    # anything about a pipeline changes). The hash is deterministic across
+    # processes — two uvicorn workers compute the same ETag for identical data.
+    body = json.dumps(payload, sort_keys=True, default=str)
+    etag = '"' + hashlib.md5(body.encode("utf-8")).hexdigest() + '"'
+
+    # If the browser sends If-None-Match matching our current ETag, the data
+    # hasn't changed — return 304 with zero body. Browser reuses its cache.
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+
+    response.headers["ETag"] = etag
+    # no-cache (not no-store) tells the browser: revalidate every time, but
+    # you may keep a cached copy to use after a 304.
+    response.headers["Cache-Control"] = "no-cache"
+    return payload
 
 @app.post("/pipeline/approve/{thread_id}")
 def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: BackgroundTasks = None, api_key: str = Depends(verify_api_key)):
