@@ -449,6 +449,8 @@ def pipeline_start(req: PipelineStartRequest, background_tasks: BackgroundTasks,
 
 @app.get("/pipeline/status/{thread_id}")
 def pipeline_status(thread_id: str,
+                    request: Request,
+                    response: Response,
                     api_key: str = Depends(verify_api_key),
                     user_id: str = Depends(get_user_id)):
     # Ownership check
@@ -459,7 +461,7 @@ def pipeline_status(thread_id: str,
 
     entry = pipeline_store[thread_id]
     safe = _safe_state(entry.get("current_state", {}))
-    return {
+    payload = {
         "thread_id": thread_id,
         "phase": entry.get("phase", ""),
         "status": entry.get("status", ""),
@@ -473,6 +475,24 @@ def pipeline_status(thread_id: str,
         "target_repo": safe.get("target_repo", ""),
         "current_state": safe
     }
+
+    # ── ETag handling ────────────────────────────────────────────────────
+    # This is the hottest polling endpoint — fires every few seconds per
+    # open dashboard. Returning 304 when state hasn't changed cuts payload
+    # bytes to ~0 and avoids the JSON.parse on the browser side.
+    #
+    # The hash is computed from the full payload (sort_keys for determinism
+    # across uvicorn workers / Python dict ordering). Any field changing
+    # invalidates the ETag, so the browser sees a fresh 200 with new data.
+    body = json.dumps(payload, sort_keys=True, default=str)
+    etag = '"' + hashlib.md5(body.encode("utf-8")).hexdigest() + '"'
+
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-cache"
+    return payload
 
 @app.get("/pipeline/list")
 def pipeline_list(request: Request, response: Response, user_id: str = Depends(get_user_id)):

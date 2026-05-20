@@ -496,8 +496,10 @@
     'WAITING_PHASE_7_APPROVAL'
   ]);
 
-  // Backoff config — base interval 2s, doubles when unchanged, caps at 30s.
-  const POLL_BASE_MS = 2000;
+  // Backoff config — base interval 3s (was 2s; 1s difference is imperceptible
+  // on a multi-minute pipeline but ~33% fewer requests). Doubles when
+  // unchanged, caps at 30s.
+  const POLL_BASE_MS = 3000;
   const POLL_MAX_MS = 30000;
   const UNCHANGED_THRESHOLD = 3;  // double the interval after 3 unchanged polls
   const SIDEBAR_BASE_MS = 10000;
@@ -513,6 +515,7 @@
   let sidebarUnchangedCount = 0;
   let lastPipelineListETag = null;    // sent back as If-None-Match
   let lastPipelineListPayload = null; // remembered across 304 responses
+  let lastPipelineStatusETag = null;  // ETag for /pipeline/status (per-thread reset on switch)
 
   // Timer handles so we can cancel cleanly on visibility change.
   let activePollTimer = null;
@@ -542,10 +545,18 @@
   });
 
   // Compute a small fingerprint of pipeline state so we can detect changes.
-  // Anything that affects what the user sees should be in here.
+  //
+  // Deliberately excludes `sub_stage`. sub_stage ticks frequently (e.g.
+  // "loading_context", "calling_llm", "parsing_response") during a single
+  // phase, which would prevent backoff from ever engaging — defeating the
+  // purpose. The user-visible UI still updates sub_stage live whenever a
+  // poll returns 200 (server only changes ETag when ANY field changes,
+  // including sub_stage), so the trade-off is: sub_stage chatter no
+  // longer keeps polling fast. The phase/status transitions — what users
+  // actually care about — still snap polling back to base interval.
   function pipelineSignature(p) {
     if (!p) return null;
-    return [p.status, p.phase, p.sub_stage, p.updated_at].join('|');
+    return [p.status, p.phase, p.updated_at].join('|');
   }
 
   async function pollActiveOnly() {
@@ -571,12 +582,38 @@
     }
 
     try {
-      const r = await fetch(`${API}/pipeline/status/${selectedThread}`);
+      // Send last ETag so server can short-circuit with 304 when unchanged.
+      const headers = {};
+      if (lastPipelineStatusETag) {
+        headers['If-None-Match'] = lastPipelineStatusETag;
+      }
+      const r = await fetch(`${API}/pipeline/status/${selectedThread}`, { headers });
+
+      if (r.status === 304) {
+        // Server confirmed nothing changed — count as unchanged for backoff.
+        // No JSON parse, no DOM re-render, no bandwidth used.
+        pollUnchangedCount++;
+        if (pollUnchangedCount >= UNCHANGED_THRESHOLD) {
+          pollIntervalMs = Math.min(pollIntervalMs * 2, POLL_MAX_MS);
+          pollUnchangedCount = 0;
+        }
+        document.getElementById('poll-time').textContent =
+                'Last poll: ' + new Date().toLocaleTimeString() + ' (304 — no change)' +
+                (pollIntervalMs > POLL_BASE_MS ? ', slowed to ' + (pollIntervalMs/1000) + 's' : '');
+        return;
+      }
+
       if (r.ok) {
+        // Remember new ETag for next request.
+        const newEtag = r.headers.get('ETag');
+        if (newEtag) lastPipelineStatusETag = newEtag;
+
         const d = await r.json();
         activePipelines[selectedThread] = { ...activePipelines[selectedThread], ...d };
 
-        // FIX 3 — Backoff: did anything actually change?
+        // FIX 3 — Backoff: did anything user-visible change?
+        // (sub_stage chatter is intentionally NOT in the signature; see
+        // pipelineSignature() above.)
         const sig = pipelineSignature(activePipelines[selectedThread]);
         if (sig === lastPipelineSignature) {
           pollUnchangedCount++;
@@ -704,11 +741,15 @@
       const d = await r.json();
       showToast(approved ? '✓ Approved — pipeline continuing' : '✗ Rejected', approved ? 'success' : 'error');
       // The pipeline just unblocked — snap polling back to fast cadence so the
-      // user sees the next phase transition immediately.
+      // user sees the next phase transition immediately. Also clear stale
+      // ETags so the next poll definitely fetches fresh state (we KNOW the
+      // server-side state just changed; trusting the cache would be wrong).
       pollIntervalMs = POLL_BASE_MS;
       pollUnchangedCount = 0;
       sidebarIntervalMs = SIDEBAR_BASE_MS;
       sidebarUnchangedCount = 0;
+      lastPipelineStatusETag = null;
+      lastPipelineListETag = null;
       setTimeout(() => {
         pollAll();
         scheduleActivePoll(pollIntervalMs);
@@ -1591,6 +1632,11 @@
 
   function selectThread(tid) {
     selectedThread = tid;
+    // Sidebar click — different pipeline, so clear cross-pipeline state.
+    pollIntervalMs = POLL_BASE_MS;
+    pollUnchangedCount = 0;
+    lastPipelineSignature = null;
+    lastPipelineStatusETag = null;
     renderSidebar();
     renderPipelineBar();
     renderContent();
@@ -1605,10 +1651,14 @@
       };
     }
     selectedThread = threadId;
-    // User actively switched pipelines — reset backoff so they see updates fast.
+    // User actively switched pipelines — reset backoff AND clear ETag.
+    // The ETag belongs to the previous thread's payload; sending it to a
+    // different thread's endpoint would either always-200 (wasteful) or
+    // worst-case match by coincidence and return a misleading 304.
     pollIntervalMs = POLL_BASE_MS;
     pollUnchangedCount = 0;
     lastPipelineSignature = null;
+    lastPipelineStatusETag = null;
     pollActiveOnly();
     scheduleActivePoll(pollIntervalMs);
     renderSidebar();
