@@ -16,17 +16,16 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
+from core.db_clients import PooledConn
+
 load_dotenv()
 
 
 def _conn():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-    )
+    # Returns a pooled connection that supports the same .cursor() / .commit()
+    # / .close() API as a raw psycopg2 connection. .close() returns it to
+    # the pool instead of dropping the socket.
+    return PooledConn()
 
 
 def _now():
@@ -44,12 +43,12 @@ def save_asp(asp: dict, thread_id: str, created_by: str = "classifier") -> str:
     cur.execute(
         """INSERT INTO asp (asp_id, thread_id, payload, allow_unbounded, policy_mode, depth_level, created_by, created_at, version)
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT (asp_id) DO UPDATE SET
-             payload = EXCLUDED.payload,
-             allow_unbounded = EXCLUDED.allow_unbounded,
-             policy_mode = EXCLUDED.policy_mode,
-             depth_level = EXCLUDED.depth_level,
-             version = asp.version + 1""",
+               ON CONFLICT (asp_id) DO UPDATE SET
+            payload = EXCLUDED.payload,
+                                           allow_unbounded = EXCLUDED.allow_unbounded,
+                                           policy_mode = EXCLUDED.policy_mode,
+                                           depth_level = EXCLUDED.depth_level,
+                                           version = asp.version + 1""",
         (
             asp_id, thread_id, json.dumps(asp),
             asp.get("allow_unbounded", False),
@@ -100,11 +99,11 @@ def save_artifact(artifact: dict, asp_id: str, thread_id: str,
     cur.execute(
         """INSERT INTO artifacts (artifact_id, asp_id, thread_id, type, category, payload, units_estimate, confidence, status, created_by, created_at)
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT (artifact_id) DO UPDATE SET
-             payload = EXCLUDED.payload,
-             units_estimate = EXCLUDED.units_estimate,
-             confidence = EXCLUDED.confidence,
-             status = EXCLUDED.status""",
+               ON CONFLICT (artifact_id) DO UPDATE SET
+            payload = EXCLUDED.payload,
+                                                units_estimate = EXCLUDED.units_estimate,
+                                                confidence = EXCLUDED.confidence,
+                                                status = EXCLUDED.status""",
         (
             artifact_id, asp_id, thread_id,
             artifact.get("type") or artifact.get("artifact_type", "DOC"),
@@ -251,9 +250,9 @@ def load_unit_weights() -> dict:
         cur = conn.cursor()
         # Detect whether the table has the depth_level column
         cur.execute("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name = 'units_weights'
-        """)
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'units_weights'
+                    """)
         cols = {r[0] for r in cur.fetchall()}
 
         if "depth_level" in cols:
@@ -295,7 +294,7 @@ def set_unit_weight(name: str, depth_level: int, weight: float):
     cur = conn.cursor()
     cur.execute(
         """INSERT INTO units_weights (name, depth_level, weight) VALUES (%s, %s, %s)
-           ON CONFLICT (name, depth_level) DO UPDATE SET weight = EXCLUDED.weight""",
+            ON CONFLICT (name, depth_level) DO UPDATE SET weight = EXCLUDED.weight""",
         (name.upper(), depth_level, weight),
     )
     conn.commit()
@@ -342,7 +341,7 @@ def save_pr(unique_request_id: str, artifact_id: str, thread_id: str,
     cur.execute(
         """INSERT INTO pr_registry (unique_request_id, artifact_id, thread_id, repo, branch, pr_url, pr_number, status, created_at)
            VALUES (%s, %s, %s, %s, %s, %s, %s, 'open', %s)
-           ON CONFLICT (unique_request_id) DO NOTHING""",
+               ON CONFLICT (unique_request_id) DO NOTHING""",
         (unique_request_id, artifact_id, thread_id, repo, branch, pr_url, pr_number, _now()),
     )
     conn.commit()

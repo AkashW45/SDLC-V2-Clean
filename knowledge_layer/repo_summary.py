@@ -31,21 +31,14 @@ def _get_embedder():
 
 
 def _get_qdrant():
-    global _qdrant
-    if _qdrant is None:
-        from qdrant_client import QdrantClient
-        _qdrant = QdrantClient(url="http://127.0.0.1:6333", timeout=10)
-    return _qdrant
+    # Use the process-wide Qdrant client.
+    from core.db_clients import qdrant_client
+    return qdrant_client
 
 
 def _pg_conn():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-    )
+    from core.db_clients import PooledConn
+    return PooledConn()
 
 
 def _empty_summary() -> dict:
@@ -176,7 +169,7 @@ def _get_top_symbols(repo_name: str):
             """SELECT symbol_name FROM symbols
                WHERE repo_name = %s
                ORDER BY symbol_name
-               LIMIT 50""",
+                   LIMIT 50""",
             (repo_name,),
         )
         rows = cur.fetchall()
@@ -217,7 +210,7 @@ def _detect_tests(repo_name: str) -> bool:
         cur.execute(
             """SELECT COUNT(*) FROM symbols
                WHERE repo_name = %s
-               AND (file_path ILIKE %s OR file_path ILIKE %s OR symbol_name ILIKE %s)""",
+                 AND (file_path ILIKE %s OR file_path ILIKE %s OR symbol_name ILIKE %s)""",
             (repo_name, "%test%", "%spec%", "test_%"),
         )
         count = cur.fetchone()[0]

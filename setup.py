@@ -151,13 +151,9 @@ print("Loading AI Embedder...")
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 def get_postgres():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge")
-    )
+    # Pooled connection — .close() returns it to the pool.
+    from core.db_clients import PooledConn
+    return PooledConn()
 
 def create_github_repo(repo_name: str) -> str:
     url = f"https://api.github.com/user/repos"
@@ -176,7 +172,7 @@ def run_cmd(cmd, cwd=None):
 def run_setup():
     base_dir = Path(os.getcwd()) / "repos"
     base_dir.mkdir(exist_ok=True)
-    
+
     print("\n" + "="*70)
     print("🚀 PROVISIONING 12-PROJECT ENTERPRISE PORTFOLIO")
     print("="*70)
@@ -184,14 +180,14 @@ def run_setup():
     for proj in PORTFOLIO:
         print(f"\n[Project] {proj['project_name']} | Domain: {proj['domain']}")
         registered_repos =[]
-        
+
         for repo in proj["repos"]:
             repo_name = repo["name"]
             source_url = repo["source"]
             local_path = base_dir / repo_name
-            
+
             my_github_url = create_github_repo(repo_name)
-            
+
             if not local_path.exists():
                 print(f"  📥 Cloning {repo_name}...")
                 run_cmd(["git", "clone", source_url, str(local_path)])
@@ -218,20 +214,20 @@ def run_setup():
         conn = get_postgres()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO projects (project_id, project_name, description, domain, tech_stack, repos, owner_team)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (project_id) DO UPDATE
-            SET project_name = EXCLUDED.project_name, description = EXCLUDED.description, 
-                domain = EXCLUDED.domain, tech_stack = EXCLUDED.tech_stack, repos = EXCLUDED.repos
-        """, (
-            proj["project_id"], proj["project_name"], proj["description"], 
-            proj["domain"], json.dumps(proj["tech_stack"]), json.dumps(registered_repos), proj["owner_team"]
-        ))
+                    INSERT INTO projects (project_id, project_name, description, domain, tech_stack, repos, owner_team)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (project_id) DO UPDATE
+                                                        SET project_name = EXCLUDED.project_name, description = EXCLUDED.description,
+                                                        domain = EXCLUDED.domain, tech_stack = EXCLUDED.tech_stack, repos = EXCLUDED.repos
+                    """, (
+                        proj["project_id"], proj["project_name"], proj["description"],
+                        proj["domain"], json.dumps(proj["tech_stack"]), json.dumps(registered_repos), proj["owner_team"]
+                    ))
         conn.commit()
         conn.close()
 
         text_for_embedding = f"{proj['project_name']}. {proj['description']}. Domain: {proj['domain']}."
-        qdrant = QdrantClient(url="http://127.0.0.1:6333", timeout=60)
+        from core.db_clients import qdrant_client as qdrant
         qdrant.upsert(collection_name="project_embeddings", points=[PointStruct(
             id=hash(proj["project_id"]) % (2**63),
             vector=embedder.encode(text_for_embedding).tolist(),

@@ -67,13 +67,9 @@ def call_llm(prompt: str, max_tokens: int = 8192) -> str:
 
 
 def get_postgres():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge")
-    )
+    # Pooled connection — .close() returns it instead of dropping the socket.
+    from core.db_clients import PooledConn
+    return PooledConn()
 
 
 def get_symbols_for_file(repo_name: str, file_path: str) -> list:

@@ -347,37 +347,28 @@ def health():
     """Check all service connections."""
     services = {}
     try:
-        from qdrant_client import QdrantClient
-        q = QdrantClient(url="http://127.0.0.1:6333", timeout=5)
-        collections = q.get_collections()
+        from core.db_clients import qdrant_client
+        collections = qdrant_client.get_collections()
         services["qdrant"] = {"status": "ok", "collections": len(collections.collections)}
     except Exception as e:
         services["qdrant"] = {"status": "error", "error": str(e)}
 
     try:
-        from neo4j import GraphDatabase
-        driver = GraphDatabase.driver(
-            os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-            auth=(os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "password1234"))
-        )
-        with driver.session() as s:
+        from core.db_clients import neo4j_driver
+        with neo4j_driver.session() as s:
             s.run("RETURN 1")
-        driver.close()
         services["neo4j"] = {"status": "ok"}
     except Exception as e:
         services["neo4j"] = {"status": "error", "error": str(e)}
 
     try:
-        import psycopg2
-        conn = psycopg2.connect(
-            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-            port=os.getenv("POSTGRES_PORT", "5433"),
-            user=os.getenv("POSTGRES_USER", "sdlc"),
-            password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-            dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge")
-        )
-        conn.close()
-        services["postgres"] = {"status": "ok"}
+        from core.db_clients import pg_conn, pg_pool_stats
+        with pg_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.close()
+        services["postgres"] = {"status": "ok", "pool": pg_pool_stats()}
     except Exception as e:
         services["postgres"] = {"status": "error", "error": str(e)}
 
@@ -490,25 +481,18 @@ def pipeline_list(user_id: str = Depends(get_user_id)):
 
 
 
-    import psycopg2
-    conn = psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5437"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-    )
-    cur = conn.cursor()
-    cur.execute("""
-                SELECT thread_id, requirement, status, sub_stage, phase, updated_at
-                FROM pipelines
-                WHERE user_id = %s
-                ORDER BY updated_at DESC NULLS LAST
-                    LIMIT 50
-                """, (user_id,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    from core.db_clients import pg_conn
+    with pg_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+                    SELECT thread_id, requirement, status, sub_stage, phase, updated_at
+                    FROM pipelines
+                    WHERE user_id = %s
+                    ORDER BY updated_at DESC NULLS LAST
+                        LIMIT 50
+                    """, (user_id,))
+        rows = cur.fetchall()
+        cur.close()
     return [
         {
             "thread_id": r[0],
@@ -831,19 +815,12 @@ def knowledge_search(req: SearchRequest):
 
 @app.get("/knowledge/repos")
 def knowledge_repos():
-    import psycopg2
-    conn = psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge")
-    )
-    cur = conn.cursor()
-    cur.execute("SELECT repo_name, language, file_count, last_indexed FROM repo_maps ORDER BY last_indexed DESC")
-    repos = [{"repo_name": r[0], "language": r[1], "file_count": r[2], "last_indexed": str(r[3])} for r in cur.fetchall()]
-    cur.close()
-    conn.close()
+    from core.db_clients import pg_conn
+    with pg_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT repo_name, language, file_count, last_indexed FROM repo_maps ORDER BY last_indexed DESC")
+        repos = [{"repo_name": r[0], "language": r[1], "file_count": r[2], "last_indexed": str(r[3])} for r in cur.fetchall()]
+        cur.close()
     return {"repos": repos, "total": len(repos)}
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1058,84 +1035,61 @@ def set_repo_override(
     """Manually mark a repo as include or exclude. Persists across syncs."""
     if req.action not in ("include", "exclude"):
         raise HTTPException(400, "action must be 'include' or 'exclude'")
-    import psycopg2
-    conn = psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5437"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-    )
-    cur = conn.cursor()
-    cur.execute("""
-                CREATE TABLE IF NOT EXISTS repo_overrides (
-                                                              repo_name VARCHAR(255) PRIMARY KEY,
-                    action VARCHAR(20) NOT NULL,
-                    reason TEXT,
-                    set_by VARCHAR(255),
-                    set_at TIMESTAMP DEFAULT NOW()
-                    )
-                """)
-    cur.execute("""
-                INSERT INTO repo_overrides (repo_name, action, reason, set_by)
-                VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (repo_name) DO UPDATE
-                                                   SET action = EXCLUDED.action,
-                                                   reason = EXCLUDED.reason,
-                                                   set_by = EXCLUDED.set_by,
-                                                   set_at = NOW()
-                """, (repo_name, req.action, req.reason, "api"))
-    conn.commit()
-    cur.close()
-    conn.close()
+    from core.db_clients import pg_conn
+    with pg_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS repo_overrides (
+                                                                  repo_name VARCHAR(255) PRIMARY KEY,
+                        action VARCHAR(20) NOT NULL,
+                        reason TEXT,
+                        set_by VARCHAR(255),
+                        set_at TIMESTAMP DEFAULT NOW()
+                        )
+                    """)
+        cur.execute("""
+                    INSERT INTO repo_overrides (repo_name, action, reason, set_by)
+                    VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (repo_name) DO UPDATE
+                                                       SET action = EXCLUDED.action,
+                                                       reason = EXCLUDED.reason,
+                                                       set_by = EXCLUDED.set_by,
+                                                       set_at = NOW()
+                    """, (repo_name, req.action, req.reason, "api"))
+        cur.close()
     return {"repo_name": repo_name, "action": req.action, "reason": req.reason}
 
 
 @app.delete("/knowledge/repos/{repo_name}/override")
 def clear_repo_override(repo_name: str, api_key: str = Depends(verify_api_key)):
     """Remove the manual override so default heuristics apply again."""
-    import psycopg2
-    conn = psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5437"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-    )
-    cur = conn.cursor()
-    cur.execute("DELETE FROM repo_overrides WHERE repo_name = %s", (repo_name,))
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
+    from core.db_clients import pg_conn
+    with pg_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM repo_overrides WHERE repo_name = %s", (repo_name,))
+        deleted = cur.rowcount
+        cur.close()
     return {"repo_name": repo_name, "cleared": deleted > 0}
 
 
 @app.get("/knowledge/repos/overrides")
 def list_repo_overrides(api_key: str = Depends(verify_api_key)):
     """List every manual override currently active."""
-    import psycopg2
-    conn = psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-    )
-    cur = conn.cursor()
-    cur.execute("""
-                CREATE TABLE IF NOT EXISTS repo_overrides (
-                                                              repo_name VARCHAR(255) PRIMARY KEY,
-                    action VARCHAR(20) NOT NULL,
-                    reason TEXT,
-                    set_by VARCHAR(255),
-                    set_at TIMESTAMP DEFAULT NOW()
-                    )
-                """)
-    cur.execute("SELECT repo_name, action, reason, set_by, set_at FROM repo_overrides ORDER BY set_at DESC")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    from core.db_clients import pg_conn
+    with pg_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+                    CREATE TABLE IF NOT EXISTS repo_overrides (
+                                                                  repo_name VARCHAR(255) PRIMARY KEY,
+                        action VARCHAR(20) NOT NULL,
+                        reason TEXT,
+                        set_by VARCHAR(255),
+                        set_at TIMESTAMP DEFAULT NOW()
+                        )
+                    """)
+        cur.execute("SELECT repo_name, action, reason, set_by, set_at FROM repo_overrides ORDER BY set_at DESC")
+        rows = cur.fetchall()
+        cur.close()
     return {
         "overrides": [
             {"repo_name": r[0], "action": r[1], "reason": r[2],

@@ -12,17 +12,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from qdrant_client import QdrantClient
-from neo4j import GraphDatabase
-import psycopg2
-from psycopg2 import pool as pg_pool
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
+
+from core.db_clients import (
+    pg_conn as _borrow_pg,
+    neo4j_driver as _neo4j_driver,
+    qdrant_client,
+)
 
 load_dotenv()
 
 # -----------------------------------------
-# Module-level Singletons & Pools
+# Module-level Singletons
 # -----------------------------------------
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -32,40 +34,11 @@ client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
-qdrant_host = os.getenv("QDRANT_HOST", "127.0.0.1")
-qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
-qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=60)
-
-_neo4j_driver = GraphDatabase.driver(
-    os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687"),
-    auth=(
-        os.getenv("NEO4J_USER", "neo4j"),
-        os.getenv("NEO4J_PASSWORD", "password1234"),
-    ),
-)
-
-# Detect if running in Docker network
-db_host = os.getenv("POSTGRES_HOST", "127.0.0.1")
-db_port = "5432" if db_host == "sdlc_postgres" else os.getenv("POSTGRES_PORT", "5433")
-
-_pg_pool = pg_pool.ThreadedConnectionPool(
-    minconn=1,
-    maxconn=10,
-    host=db_host,
-    port=db_port,
-    user=os.getenv("POSTGRES_USER", "sdlc"),
-    password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-    dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-)
-
-@contextmanager
-def _borrow_pg():
-    """Borrow a Postgres connection from the pool and return it on exit."""
-    conn = _pg_pool.getconn()
-    try:
-        yield conn
-    finally:
-        _pg_pool.putconn(conn)
+# qdrant_client, _neo4j_driver, and _borrow_pg are imported above from
+# core.db_clients — a single project-wide pool/driver/client shared across
+# all agents. Phase 3 previously kept its own private pools; removing them
+# here cuts ~10 redundant Postgres connections and one extra Neo4j driver
+# per process.
 
 
 # -----------------------------------------

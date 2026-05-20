@@ -16,80 +16,80 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DDL = """
--- ── Adaptive Scope Profile ─────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS asp (
-    asp_id           UUID PRIMARY KEY,
-    thread_id        TEXT,
-    payload          JSONB NOT NULL,
-    allow_unbounded  BOOLEAN NOT NULL DEFAULT FALSE,
-    policy_mode      TEXT NOT NULL DEFAULT 'managed',
-    depth_level      INT,
-    created_by       TEXT,
-    created_at       TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    version          INT DEFAULT 1
-);
-CREATE INDEX IF NOT EXISTS idx_asp_thread ON asp(thread_id);
+      -- ── Adaptive Scope Profile ─────────────────────────────────────────
+      CREATE TABLE IF NOT EXISTS asp (
+                                         asp_id           UUID PRIMARY KEY,
+                                         thread_id        TEXT,
+                                         payload          JSONB NOT NULL,
+                                         allow_unbounded  BOOLEAN NOT NULL DEFAULT FALSE,
+                                         policy_mode      TEXT NOT NULL DEFAULT 'managed',
+                                         depth_level      INT,
+                                         created_by       TEXT,
+                                         created_at       TIMESTAMP WITH TIME ZONE DEFAULT now(),
+          version          INT DEFAULT 1
+          );
+      CREATE INDEX IF NOT EXISTS idx_asp_thread ON asp(thread_id);
 
 -- ── Artifacts ──────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS artifacts (
-    artifact_id    UUID PRIMARY KEY,
-    asp_id         UUID REFERENCES asp(asp_id),
-    thread_id      TEXT,
-    type           TEXT NOT NULL,
-    category       TEXT NOT NULL DEFAULT 'mvp',
-    payload        JSONB NOT NULL,
-    units_estimate INT DEFAULT 0,
-    confidence     INT DEFAULT 0,
-    status         TEXT NOT NULL DEFAULT 'candidate',
-    created_by     TEXT,
-    created_at     TIMESTAMP WITH TIME ZONE DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_artifacts_asp ON artifacts(asp_id);
-CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id);
-CREATE INDEX IF NOT EXISTS idx_artifacts_status ON artifacts(status);
+      CREATE TABLE IF NOT EXISTS artifacts (
+                                               artifact_id    UUID PRIMARY KEY,
+                                               asp_id         UUID REFERENCES asp(asp_id),
+          thread_id      TEXT,
+          type           TEXT NOT NULL,
+          category       TEXT NOT NULL DEFAULT 'mvp',
+          payload        JSONB NOT NULL,
+          units_estimate INT DEFAULT 0,
+          confidence     INT DEFAULT 0,
+          status         TEXT NOT NULL DEFAULT 'candidate',
+          created_by     TEXT,
+          created_at     TIMESTAMP WITH TIME ZONE DEFAULT now()
+          );
+      CREATE INDEX IF NOT EXISTS idx_artifacts_asp ON artifacts(asp_id);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_status ON artifacts(status);
 
 -- ── Artifact decisions ─────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS artifact_decisions (
-    decision_id   UUID PRIMARY KEY,
-    artifact_id   UUID REFERENCES artifacts(artifact_id),
-    thread_id     TEXT,
-    decision      JSONB NOT NULL,
-    decided_by    TEXT,
-    decided_at    TIMESTAMP WITH TIME ZONE DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_decisions_artifact ON artifact_decisions(artifact_id);
+      CREATE TABLE IF NOT EXISTS artifact_decisions (
+                                                        decision_id   UUID PRIMARY KEY,
+                                                        artifact_id   UUID REFERENCES artifacts(artifact_id),
+          thread_id     TEXT,
+          decision      JSONB NOT NULL,
+          decided_by    TEXT,
+          decided_at    TIMESTAMP WITH TIME ZONE DEFAULT now()
+          );
+      CREATE INDEX IF NOT EXISTS idx_decisions_artifact ON artifact_decisions(artifact_id);
 
 -- ── Unit weights — DEPTH-AWARE (name, depth_level, weight) ─────────
-CREATE TABLE IF NOT EXISTS units_weights (
-    name         TEXT NOT NULL,
-    depth_level  INT  NOT NULL,
-    weight       FLOAT NOT NULL,
-    PRIMARY KEY (name, depth_level)
-);
+      CREATE TABLE IF NOT EXISTS units_weights (
+                                                   name         TEXT NOT NULL,
+                                                   depth_level  INT  NOT NULL,
+                                                   weight       FLOAT NOT NULL,
+                                                   PRIMARY KEY (name, depth_level)
+          );
 
 -- ── Audit log ──────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS audit_log (
-    id          UUID PRIMARY KEY,
-    thread_id   TEXT,
-    actor       TEXT,
-    action      TEXT,
-    data        JSONB,
-    created_at  TIMESTAMP WITH TIME ZONE DEFAULT now()
-);
+      CREATE TABLE IF NOT EXISTS audit_log (
+                                               id          UUID PRIMARY KEY,
+                                               thread_id   TEXT,
+                                               actor       TEXT,
+                                               action      TEXT,
+                                               data        JSONB,
+                                               created_at  TIMESTAMP WITH TIME ZONE DEFAULT now()
+          );
 
 -- ── PR registry — idempotent PR creation ───────────────────────────
-CREATE TABLE IF NOT EXISTS pr_registry (
-    unique_request_id  TEXT PRIMARY KEY,
-    artifact_id        UUID,
-    thread_id          TEXT,
-    repo               TEXT,
-    branch             TEXT,
-    pr_url             TEXT,
-    pr_number          INT,
-    status             TEXT DEFAULT 'open',
-    created_at         TIMESTAMP WITH TIME ZONE DEFAULT now()
-);
-"""
+      CREATE TABLE IF NOT EXISTS pr_registry (
+                                                 unique_request_id  TEXT PRIMARY KEY,
+                                                 artifact_id        UUID,
+                                                 thread_id          TEXT,
+                                                 repo               TEXT,
+                                                 branch             TEXT,
+                                                 pr_url             TEXT,
+                                                 pr_number          INT,
+                                                 status             TEXT DEFAULT 'open',
+                                                 created_at         TIMESTAMP WITH TIME ZONE DEFAULT now()
+          ); \
+      """
 
 # Depth-aware default weights — (name, depth_level): weight
 # At LOW depth each unit is heavier (fewer, simpler things expected).
@@ -113,13 +113,9 @@ DEFAULT_WEIGHTS = {
 
 
 def _conn():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-    )
+    # Pooled connection — .close() returns it to the pool.
+    from core.db_clients import PooledConn
+    return PooledConn()
 
 
 def migrate():
@@ -134,7 +130,7 @@ def migrate():
             cur.execute(
                 """INSERT INTO units_weights (name, depth_level, weight)
                    VALUES (%s, %s, %s)
-                   ON CONFLICT (name, depth_level) DO NOTHING""",
+                       ON CONFLICT (name, depth_level) DO NOTHING""",
                 (name, depth_level, weight),
             )
 

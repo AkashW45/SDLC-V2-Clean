@@ -43,20 +43,16 @@ if not logger.handlers:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Clients
+# Clients (delegate to project-wide pool)
 # ─────────────────────────────────────────────────────────────────────
 def _qdrant() -> QdrantClient:
-    return QdrantClient(url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"))
+    from core.db_clients import qdrant_client
+    return qdrant_client
 
 
 def _pg():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5433"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-    )
+    from core.db_clients import PooledConn
+    return PooledConn()
 
 
 def _openai_for_embeddings() -> OpenAI:
@@ -150,7 +146,7 @@ def _enrich_with_symbols(chunks: List[Dict[str, Any]], repo_name: str) -> List[D
                        FROM symbols
                        WHERE repo ILIKE %s
                          AND (name = %s OR file_path = %s)
-                       LIMIT 1""",
+                           LIMIT 1""",
                     (f"%{repo_name}%", symbol, fp),
                 )
                 row = cur.fetchone()
@@ -197,9 +193,9 @@ def _fetch_full_files(chunks: List[Dict[str, Any]], repo_name: str,
         cur = conn.cursor(cursor_factory=RealDictCursor)
         # Check whether the table exists
         cur.execute("""
-            SELECT 1 FROM information_schema.tables
-            WHERE table_name = 'indexed_files' LIMIT 1
-        """)
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'indexed_files' LIMIT 1
+                    """)
         if cur.fetchone():
             for fp in seen_paths:
                 try:
@@ -363,11 +359,11 @@ def build_context_packet(requirement: str, asp: Dict[str, Any],
     # ── Resolve repo name with fallbacks ─────────────────────────────
     repo_summary = asp.get("repo_summary", {}) or {}
     repo_name = (
-        repo_summary.get("matched_repo")
-        or repo_summary.get("name")
-        or repo_summary.get("repo_name")
-        or (selected_repos[0] if selected_repos else "")
-        or ""
+            repo_summary.get("matched_repo")
+            or repo_summary.get("name")
+            or repo_summary.get("repo_name")
+            or (selected_repos[0] if selected_repos else "")
+            or ""
     )
 
     # Normalize repo_name (handle dict vs string)

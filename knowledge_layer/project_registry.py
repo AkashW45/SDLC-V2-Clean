@@ -43,33 +43,28 @@ def get_embedder():
 
 
 def get_postgres():
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=os.getenv("POSTGRES_PORT", "5432"),
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-    )
+    # Pooled connection — .close() returns it to the pool.
+    from core.db_clients import PooledConn
+    return PooledConn()
 
 
 def get_qdrant():
-    return QdrantClient(
-        url=f"http://{os.getenv('QDRANT_HOST', '127.0.0.1')}:{os.getenv('QDRANT_PORT', '6333')}",
-        timeout=60,
-    )
+    # Process-wide Qdrant client singleton.
+    from core.db_clients import qdrant_client
+    return qdrant_client
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Core CRUD
 # ─────────────────────────────────────────────────────────────────────
 def register_project(
-    project_id: str,
-    project_name: str,
-    description: str,
-    domain: str = "",
-    tech_stack: list = None,
-    repos: list = None,
-    owner_team: str = "",
+        project_id: str,
+        project_name: str,
+        description: str,
+        domain: str = "",
+        tech_stack: list = None,
+        repos: list = None,
+        owner_team: str = "",
 ) -> dict:
     """
     Idempotent register/update of a project in both PostgreSQL and Qdrant.
@@ -88,13 +83,13 @@ def register_project(
         """
         INSERT INTO projects (project_id, project_name, description, domain, tech_stack, repos, owner_team)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (project_id) DO UPDATE
-        SET project_name = EXCLUDED.project_name,
-            description  = EXCLUDED.description,
-            domain       = EXCLUDED.domain,
-            tech_stack   = EXCLUDED.tech_stack,
-            repos        = EXCLUDED.repos,
-            owner_team   = EXCLUDED.owner_team
+            ON CONFLICT (project_id) DO UPDATE
+                                            SET project_name = EXCLUDED.project_name,
+                                            description  = EXCLUDED.description,
+                                            domain       = EXCLUDED.domain,
+                                            tech_stack   = EXCLUDED.tech_stack,
+                                            repos        = EXCLUDED.repos,
+                                            owner_team   = EXCLUDED.owner_team
         """,
         (project_id, project_name, description, domain,
          json.dumps(tech_stack), json.dumps(repos), owner_team),

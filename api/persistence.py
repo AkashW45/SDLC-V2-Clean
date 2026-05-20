@@ -1,82 +1,73 @@
 import psycopg2
-from psycopg_pool import ConnectionPool
 import json
 from datetime import datetime
 import os
 
+from core.db_clients import PooledConn
+
 def _conn():
-    # Get the host (Docker compose sets this to "sdlc_postgres" for the API container)
-    db_host = os.getenv("POSTGRES_HOST", "127.0.0.1")
-    
-    # If we are inside Docker, use the internal port 5432. Otherwise, use 5437.
-    db_port = "5432" if db_host == "sdlc_postgres" else os.getenv("POSTGRES_PORT", "5437")
-    
-    return psycopg2.connect(
-        host=db_host,
-        port=db_port,
-        user=os.getenv("POSTGRES_USER", "sdlc"),
-        password=os.getenv("POSTGRES_PASSWORD", "postgres_password"),
-        dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge")
-    )
+    # Pooled connection — supports the same .cursor() / .commit() / .close() API
+    # as a raw psycopg2 connection, but .close() returns it to the shared pool.
+    return PooledConn()
 
 def setup_db():
     conn = _conn()
     cur = conn.cursor()
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS pipelines (
-            thread_id VARCHAR(50) PRIMARY KEY,
-            requirement TEXT NOT NULL,
-            user_id VARCHAR(50),
-            status VARCHAR(50),
-            phase VARCHAR(20),
-            sub_stage VARCHAR(150),
-            current_state JSONB,
-            pr_urls JSONB,
-            error TEXT,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
+                CREATE TABLE IF NOT EXISTS pipelines (
+                                                         thread_id VARCHAR(50) PRIMARY KEY,
+                    requirement TEXT NOT NULL,
+                    user_id VARCHAR(50),
+                    status VARCHAR(50),
+                    phase VARCHAR(20),
+                    sub_stage VARCHAR(150),
+                    current_state JSONB,
+                    pr_urls JSONB,
+                    error TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id SERIAL PRIMARY KEY,
-            thread_id VARCHAR(50),
-            phase VARCHAR(20),
-            event VARCHAR(100),
-            actor VARCHAR(100),
-            details JSONB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+                CREATE TABLE IF NOT EXISTS audit_log (
+                                                         id SERIAL PRIMARY KEY,
+                                                         thread_id VARCHAR(50),
+                    phase VARCHAR(20),
+                    event VARCHAR(100),
+                    actor VARCHAR(100),
+                    details JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
 
     cur.execute("REVOKE UPDATE, DELETE ON audit_log FROM PUBLIC;")
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS artifact_registry (
-            artifact_id SERIAL PRIMARY KEY,
-            thread_id VARCHAR(255),
-            "key" VARCHAR(255),
-            version INT,
-            status VARCHAR(50),
-            producing_phase VARCHAR(50),
-            content TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(thread_id, "key", version)
-        )
-    """)
+                CREATE TABLE IF NOT EXISTS artifact_registry (
+                                                                 artifact_id SERIAL PRIMARY KEY,
+                                                                 thread_id VARCHAR(255),
+                    "key" VARCHAR(255),
+                    version INT,
+                    status VARCHAR(50),
+                    producing_phase VARCHAR(50),
+                    content TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(thread_id, "key", version)
+                    )
+                """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS replay_jobs (
-            job_id SERIAL PRIMARY KEY,
-            thread_id VARCHAR(255),
-            target_artifact VARCHAR(255),
-            status VARCHAR(50),
-            diff_summary TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+                CREATE TABLE IF NOT EXISTS replay_jobs (
+                                                           job_id SERIAL PRIMARY KEY,
+                                                           thread_id VARCHAR(255),
+                    target_artifact VARCHAR(255),
+                    status VARCHAR(50),
+                    diff_summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_thread ON audit_log(thread_id, created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pipelines_updated ON pipelines(updated_at DESC)")
@@ -99,8 +90,8 @@ def enforce_audit_retention() -> int:
     conn = _conn()
     cur = conn.cursor()
     cur.execute("""
-        DELETE FROM audit_log WHERE created_at < NOW() - INTERVAL '90 days';
-    """)
+                DELETE FROM audit_log WHERE created_at < NOW() - INTERVAL '90 days';
+                """)
     deleted_count = cur.rowcount
     conn.commit()
     cur.close()
@@ -113,28 +104,28 @@ def save_pipeline(thread_id: str, entry: dict, safe_state: dict):
         conn = _conn()
         cur = conn.cursor()
         cur.execute("""
-    INSERT INTO pipelines
-      (thread_id, user_id, requirement, status, phase, sub_stage, current_state, pr_urls, error, updated_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-    ON CONFLICT (thread_id) DO UPDATE SET
-      status = EXCLUDED.status,
-      phase = EXCLUDED.phase,
-      sub_stage = EXCLUDED.sub_stage,
-      current_state = EXCLUDED.current_state,
-      pr_urls = EXCLUDED.pr_urls,
-      error = EXCLUDED.error,
-      updated_at = NOW()
-""", (
-    thread_id,
-    entry.get("user_id", "anonymous"),
-    entry.get("requirement", ""),
-    entry.get("status", ""),
-    entry.get("phase", ""),
-    entry.get("sub_stage", ""),
-    json.dumps(safe_state),
-    json.dumps(entry.get("pr_urls", [])),
-    entry.get("error") or ""
-))
+                    INSERT INTO pipelines
+                    (thread_id, user_id, requirement, status, phase, sub_stage, current_state, pr_urls, error, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (thread_id) DO UPDATE SET
+                        status = EXCLUDED.status,
+                                                       phase = EXCLUDED.phase,
+                                                       sub_stage = EXCLUDED.sub_stage,
+                                                       current_state = EXCLUDED.current_state,
+                                                       pr_urls = EXCLUDED.pr_urls,
+                                                       error = EXCLUDED.error,
+                                                       updated_at = NOW()
+                    """, (
+                        thread_id,
+                        entry.get("user_id", "anonymous"),
+                        entry.get("requirement", ""),
+                        entry.get("status", ""),
+                        entry.get("phase", ""),
+                        entry.get("sub_stage", ""),
+                        json.dumps(safe_state),
+                        json.dumps(entry.get("pr_urls", [])),
+                        entry.get("error") or ""
+                    ))
         conn.commit()
         cur.close()
         conn.close()
@@ -148,26 +139,26 @@ def load_all_pipelines() -> dict:
         conn = _conn()
         cur = conn.cursor()
         cur.execute("""
-    SELECT thread_id, user_id, requirement, status, phase, sub_stage,
-           current_state, pr_urls, error, updated_at
-    FROM pipelines
-    ORDER BY updated_at DESC
-    LIMIT 50
-""")
+                    SELECT thread_id, user_id, requirement, status, phase, sub_stage,
+                           current_state, pr_urls, error, updated_at
+                    FROM pipelines
+                    ORDER BY updated_at DESC
+                        LIMIT 50
+                    """)
         for row in cur.fetchall():
             tid = row[0]
             out[tid] = {
-        "thread_id": tid,
-        "user_id": row[1],
-        "requirement": row[2],
-        "status": row[3],
-        "phase": row[4],
-        "sub_stage": row[5],
-        "current_state": row[6] or {},
-        "pr_urls": row[7] or [],
-        "error": row[8] or "",
-        "updated_at": str(row[9]) if row[9] else "",
-    }
+                "thread_id": tid,
+                "user_id": row[1],
+                "requirement": row[2],
+                "status": row[3],
+                "phase": row[4],
+                "sub_stage": row[5],
+                "current_state": row[6] or {},
+                "pr_urls": row[7] or [],
+                "error": row[8] or "",
+                "updated_at": str(row[9]) if row[9] else "",
+            }
         cur.close()
         conn.close()
     except Exception as e:
@@ -180,9 +171,9 @@ def audit(thread_id: str, phase: str, event: str, actor: str = "system", details
         conn = _conn()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO audit_log (thread_id, phase, event, actor, details)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (thread_id, phase, event, actor, json.dumps(details or {})))
+                    INSERT INTO audit_log (thread_id, phase, event, actor, details)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """, (thread_id, phase, event, actor, json.dumps(details or {})))
         conn.commit()
         cur.close()
         conn.close()
@@ -196,11 +187,11 @@ def get_audit_log(thread_id: str) -> list:
         conn = _conn()
         cur = conn.cursor()
         cur.execute("""
-            SELECT phase, event, actor, details, created_at
-            FROM audit_log
-            WHERE thread_id = %s
-            ORDER BY created_at ASC
-        """, (thread_id,))
+                    SELECT phase, event, actor, details, created_at
+                    FROM audit_log
+                    WHERE thread_id = %s
+                    ORDER BY created_at ASC
+                    """, (thread_id,))
         for row in cur.fetchall():
             out.append({
                 "phase": row[0],

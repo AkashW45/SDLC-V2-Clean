@@ -33,19 +33,19 @@ class ContextOptimizationEngine:
             # Returns: {"brd": {"title": "Project X"}}
         """
         result = {}
-        
+
         for key_path in required_keys:
             parts = key_path.split(".")
             current = state
-            
+
             # Navigate through nested structure
             try:
                 for part in parts[:-1]:
                     current = current[part]
-                
+
                 # Get the final value
                 final_value = current[parts[-1]]
-                
+
                 # Build nested result structure
                 if len(parts) == 1:
                     # Top-level key
@@ -61,7 +61,7 @@ class ContextOptimizationEngine:
             except (KeyError, TypeError):
                 # Key path not found in state — skip gracefully
                 continue
-        
+
         return result
 
     @staticmethod
@@ -143,7 +143,7 @@ class ContextOptimizationEngine:
         except SyntaxError:
             # If parsing fails, return original source
             return source_code
-        
+
         # Search for matching ClassDef or FunctionDef
         for node in ast.walk(tree):
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -156,7 +156,7 @@ class ContextOptimizationEngine:
                     except (AttributeError, TypeError):
                         # Fallback if get_source_segment unavailable
                         pass
-        
+
         # Node not found — return original source
         return source_code
 
@@ -174,16 +174,12 @@ class ContextOptimizationEngine:
             List of top matches with repo, file path, symbol info, and relevance score
         """
         try:
-            from qdrant_client import QdrantClient
             from sentence_transformers import SentenceTransformer
+            from core.db_clients import qdrant_client as qdrant
         except ImportError:
             return []
-        
+
         try:
-            qdrant_host = os.getenv("QDRANT_HOST", "127.0.0.1")
-            qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
-            qdrant = QdrantClient(host=qdrant_host, port=qdrant_port, timeout=60)
-            
             embedder = SentenceTransformer("all-MiniLM-L6-v2")
             query_vector = embedder.encode(query).tolist()
 

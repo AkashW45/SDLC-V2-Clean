@@ -24,15 +24,15 @@ class SelectorState(TypedDict):
 
 
 def get_qdrant():
-    return QdrantClient(url="http://127.0.0.1:6333", timeout=60)
+    # Process-wide singleton Qdrant client.
+    from core.db_clients import qdrant_client
+    return qdrant_client
 
 
 def get_postgres():
-    return psycopg2.connect(
-        host="127.0.0.1", port=5433,
-        user="sdlc", password="sdlc1234",
-        dbname="sdlc_knowledge"
-    )
+    # Pooled connection — .close() returns it to the pool.
+    from core.db_clients import PooledConn
+    return PooledConn()
 
 
 _embedder = None

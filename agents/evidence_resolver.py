@@ -39,11 +39,9 @@ def _get_embedder():
 
 
 def _get_qdrant():
-    global _qdrant
-    if _qdrant is None:
-        from qdrant_client import QdrantClient
-        _qdrant = QdrantClient(url="http://127.0.0.1:6333", timeout=10)
-    return _qdrant
+    # Use the process-wide Qdrant client.
+    from core.db_clients import qdrant_client
+    return qdrant_client
 
 
 def _cosine(a, b) -> float:
@@ -191,22 +189,15 @@ def _resolve_symbol(link: dict, asp: dict) -> dict:
         return link
 
     try:
-        import psycopg2
-        conn = psycopg2.connect(
-            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-            port=os.getenv("POSTGRES_PORT", "5433"),
-            user=os.getenv("POSTGRES_USER", "sdlc"),
-            password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-            dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-        )
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT symbol_name, file_path FROM symbols WHERE symbol_name ILIKE %s LIMIT 1",
-            (f"%{symbol}%",),
-        )
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        from core.db_clients import pg_conn
+        with pg_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT symbol_name, file_path FROM symbols WHERE symbol_name ILIKE %s LIMIT 1",
+                (f"%{symbol}%",),
+            )
+            row = cur.fetchone()
+            cur.close()
         if row:
             link["resolved"] = True
             link["evidence_score"] = 1.0
@@ -265,7 +256,7 @@ def resolve_evidence(artifact: dict, asp: dict) -> dict:
     # Artifact is resolved if MAJORITY of links resolve and avg score clears threshold
     resolved_count = sum(1 for l in resolved_links if l.get("resolved"))
     artifact["evidence_resolved"] = (
-        resolved_count >= len(resolved_links) / 2 and avg_score >= EVIDENCE_THRESHOLD
+            resolved_count >= len(resolved_links) / 2 and avg_score >= EVIDENCE_THRESHOLD
     )
     artifact["evidence_score"] = round(avg_score, 2)
     artifact["evidence_note"] = f"{resolved_count}/{len(resolved_links)} links resolved"

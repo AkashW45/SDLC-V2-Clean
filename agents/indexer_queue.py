@@ -60,7 +60,7 @@ class IndexJob:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration_sec": (self.finished_at - self.started_at)
-                            if self.started_at and self.finished_at else None,
+            if self.started_at and self.finished_at else None,
         }
 
 
@@ -75,32 +75,27 @@ class IndexerQueue:
 
     # ── persistence ─────────────────────────────────────────────────
     def _conn(self):
-        return psycopg2.connect(
-            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-            port=os.getenv("POSTGRES_PORT", "5437"),
-            user=os.getenv("POSTGRES_USER", "sdlc"),
-            password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-            dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-        )
+        from core.db_clients import PooledConn
+        return PooledConn()
 
     def _ensure_table(self):
         try:
             conn = self._conn()
             cur = conn.cursor()
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS indexer_jobs (
-                    job_id VARCHAR(64) PRIMARY KEY,
-                    repo_name VARCHAR(255) NOT NULL,
-                    repo_url TEXT,
-                    branch VARCHAR(100),
-                    status VARCHAR(20),
-                    attempts INTEGER DEFAULT 0,
-                    last_error TEXT,
-                    created_at DOUBLE PRECISION,
-                    started_at DOUBLE PRECISION,
-                    finished_at DOUBLE PRECISION
-                );
-            """)
+                        CREATE TABLE IF NOT EXISTS indexer_jobs (
+                                                                    job_id VARCHAR(64) PRIMARY KEY,
+                            repo_name VARCHAR(255) NOT NULL,
+                            repo_url TEXT,
+                            branch VARCHAR(100),
+                            status VARCHAR(20),
+                            attempts INTEGER DEFAULT 0,
+                            last_error TEXT,
+                            created_at DOUBLE PRECISION,
+                            started_at DOUBLE PRECISION,
+                            finished_at DOUBLE PRECISION
+                            );
+                        """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_indexer_jobs_status ON indexer_jobs(status);")
             conn.commit()
             cur.close()
@@ -113,18 +108,18 @@ class IndexerQueue:
             conn = self._conn()
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO indexer_jobs (job_id, repo_name, repo_url, branch, status,
-                                          attempts, last_error, created_at, started_at, finished_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (job_id) DO UPDATE
-                SET status = EXCLUDED.status,
-                    attempts = EXCLUDED.attempts,
-                    last_error = EXCLUDED.last_error,
-                    started_at = EXCLUDED.started_at,
-                    finished_at = EXCLUDED.finished_at
-            """, (job.job_id, job.repo_name, job.repo_url, job.branch, job.status,
-                  job.attempts, job.last_error[:2000], job.created_at,
-                  job.started_at, job.finished_at))
+                        INSERT INTO indexer_jobs (job_id, repo_name, repo_url, branch, status,
+                                                  attempts, last_error, created_at, started_at, finished_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (job_id) DO UPDATE
+                                                        SET status = EXCLUDED.status,
+                                                        attempts = EXCLUDED.attempts,
+                                                        last_error = EXCLUDED.last_error,
+                                                        started_at = EXCLUDED.started_at,
+                                                        finished_at = EXCLUDED.finished_at
+                        """, (job.job_id, job.repo_name, job.repo_url, job.branch, job.status,
+                              job.attempts, job.last_error[:2000], job.created_at,
+                              job.started_at, job.finished_at))
             conn.commit()
             cur.close()
             conn.close()
@@ -136,19 +131,19 @@ class IndexerQueue:
             conn = self._conn()
             cur = conn.cursor()
             cur.execute("""
-                SELECT job_id, repo_name, repo_url, branch, status, attempts, last_error,
-                       created_at, started_at, finished_at
-                FROM indexer_jobs
-                WHERE status IN ('QUEUED', 'RUNNING', 'RETRYING')
-            """)
+                        SELECT job_id, repo_name, repo_url, branch, status, attempts, last_error,
+                               created_at, started_at, finished_at
+                        FROM indexer_jobs
+                        WHERE status IN ('QUEUED', 'RUNNING', 'RETRYING')
+                        """)
             rows = cur.fetchall()
             cur.close()
             conn.close()
             for r in rows:
                 job = IndexJob(job_id=r[0], repo_name=r[1], repo_url=r[2] or "",
-                              branch=r[3] or "main", status="QUEUED",
-                              attempts=r[5] or 0, last_error=r[6] or "",
-                              created_at=r[7] or time.time())
+                               branch=r[3] or "main", status="QUEUED",
+                               attempts=r[5] or 0, last_error=r[6] or "",
+                               created_at=r[7] or time.time())
                 self._jobs[job.job_id] = job
                 self._executor.submit(self._run, job)
             if rows:
@@ -211,16 +206,16 @@ class IndexerQueue:
                 result = index_repo(local, job.repo_name, force=job.force)
 
                 job.status = "SUCCESS"
-                 # Surface skip info in last_error field for visibility
+                # Surface skip info in last_error field for visibility
                 if result and result.get("status") == "SKIPPED_NO_CHANGES":
-                  job.last_error = f"SKIPPED — no changes since last index (sha={result['sha'][:8]})"
+                    job.last_error = f"SKIPPED — no changes since last index (sha={result['sha'][:8]})"
                 else:
-                  job.last_error = ""
+                    job.last_error = ""
                 job.finished_at = time.time()
                 job.last_error = ""
                 self._persist(job)
                 logger.info(f"[IndexerQueue] {job.job_id} SUCCESS in "
-                           f"{job.finished_at - job.started_at:.1f}s")
+                            f"{job.finished_at - job.started_at:.1f}s")
                 return
             except Exception as e:
                 tb = traceback.format_exc()

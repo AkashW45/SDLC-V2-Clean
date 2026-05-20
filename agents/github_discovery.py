@@ -84,30 +84,22 @@ def _load_db_overrides() -> dict:
     Fails open — if DB unavailable, returns empty dict.
     """
     try:
-        import psycopg2
-        conn = psycopg2.connect(
-            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-            port=os.getenv("POSTGRES_PORT", "5437"),
-            user=os.getenv("POSTGRES_USER", "sdlc"),
-            password=os.getenv("POSTGRES_PASSWORD", "sdlc1234"),
-            dbname=os.getenv("POSTGRES_DB", "sdlc_knowledge"),
-        )
-        cur = conn.cursor()
-        # Idempotent — creates table on first call so this just works
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS repo_overrides (
-                repo_name VARCHAR(255) PRIMARY KEY,
-                action VARCHAR(20) NOT NULL,  -- 'include' or 'exclude'
-                reason TEXT,
-                set_by VARCHAR(255),
-                set_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        conn.commit()
-        cur.execute("SELECT repo_name, action FROM repo_overrides")
-        overrides = {row[0]: row[1] for row in cur.fetchall()}
-        cur.close()
-        conn.close()
+        from core.db_clients import pg_conn
+        with pg_conn() as conn:
+            cur = conn.cursor()
+            # Idempotent — creates table on first call so this just works
+            cur.execute("""
+                        CREATE TABLE IF NOT EXISTS repo_overrides (
+                                                                      repo_name VARCHAR(255) PRIMARY KEY,
+                            action VARCHAR(20) NOT NULL,  -- 'include' or 'exclude'
+                            reason TEXT,
+                            set_by VARCHAR(255),
+                            set_at TIMESTAMP DEFAULT NOW()
+                            )
+                        """)
+            cur.execute("SELECT repo_name, action FROM repo_overrides")
+            overrides = {row[0]: row[1] for row in cur.fetchall()}
+            cur.close()
         return overrides
     except Exception as e:
         logger.warning(f"[GitHubDiscovery] repo_overrides lookup failed: {e}")
@@ -131,49 +123,49 @@ def _should_include_repo(repo: dict, overrides: dict) -> tuple[bool, str]:
     if overrides.get(repo["name"]) == "exclude":
         return False, "db_override:exclude"
     return True, "included"
-# def _should_include_repo(repo: dict, overrides: dict) -> tuple[bool, str]:
-#     """
-#     Decide whether to include a repo. Returns (include?, reason).
-#     Order of precedence:
-#       1. Database override (manual decision wins)
-#       2. GitHub topic 'sdlc-include' or 'sdlc-exclude'
-#       3. Platform self-repos (always excluded)
-#       4. Heuristics (size, name patterns, description)
-#     """
-#     name = repo["name"]
-#     topics = repo.get("topics", []) or []
+    # def _should_include_repo(repo: dict, overrides: dict) -> tuple[bool, str]:
+    #     """
+    #     Decide whether to include a repo. Returns (include?, reason).
+    #     Order of precedence:
+    #       1. Database override (manual decision wins)
+    #       2. GitHub topic 'sdlc-include' or 'sdlc-exclude'
+    #       3. Platform self-repos (always excluded)
+    #       4. Heuristics (size, name patterns, description)
+    #     """
+    #     name = repo["name"]
+    #     topics = repo.get("topics", []) or []
 
-#     # 1. Manual DB override — highest priority
-#     if name in overrides:
-#         action = overrides[name]
-#         return (action == "include"), f"db_override:{action}"
+    #     # 1. Manual DB override — highest priority
+    #     if name in overrides:
+    #         action = overrides[name]
+    #         return (action == "include"), f"db_override:{action}"
 
-#     # 2. GitHub topic opt-in/opt-out — declarative, lives in GitHub itself
-#     if TOPIC_EXCLUDE in topics:
-#         return False, f"topic:{TOPIC_EXCLUDE}"
-#     if TOPIC_INCLUDE in topics:
-#         return True, f"topic:{TOPIC_INCLUDE}"
+    #     # 2. GitHub topic opt-in/opt-out — declarative, lives in GitHub itself
+    #     if TOPIC_EXCLUDE in topics:
+    #         return False, f"topic:{TOPIC_EXCLUDE}"
+    #     if TOPIC_INCLUDE in topics:
+    #         return True, f"topic:{TOPIC_INCLUDE}"
 
-#     # 3. Platform self-repos
-#     if name in PLATFORM_SELF_REPOS:
-#         return False, "platform_self_repo"
+    #     # 3. Platform self-repos
+    #     if name in PLATFORM_SELF_REPOS:
+    #         return False, "platform_self_repo"
 
-#     # 4. Fork / archived policy
-#     if repo.get("fork") and not INCLUDE_FORKS:
-#         return False, "fork_excluded_by_policy"
-#     if repo.get("archived") and not INCLUDE_ARCHIVED:
-#         return False, "archived_excluded_by_policy"
+    #     # 4. Fork / archived policy
+    #     if repo.get("fork") and not INCLUDE_FORKS:
+    #         return False, "fork_excluded_by_policy"
+    #     if repo.get("archived") and not INCLUDE_ARCHIVED:
+    #         return False, "archived_excluded_by_policy"
 
-#     # 5. Junk name patterns
-#     pattern_match = _matches_junk_pattern(name)
-#     if pattern_match:
-#         return False, f"junk_pattern:{pattern_match}"
+    #     # 5. Junk name patterns
+    #     pattern_match = _matches_junk_pattern(name)
+    #     if pattern_match:
+    #         return False, f"junk_pattern:{pattern_match}"
 
-#     # 6. Empty / abandoned heuristic — small size AND no description
-#     size_kb = repo.get("size_kb", 0)
-#     desc = (repo.get("description") or "").strip()
-#     if size_kb < MIN_REPO_SIZE_KB and not desc:
-#         return False, f"empty_repo:size={size_kb}KB_no_desc"
+    #     # 6. Empty / abandoned heuristic — small size AND no description
+    #     size_kb = repo.get("size_kb", 0)
+    #     desc = (repo.get("description") or "").strip()
+    #     if size_kb < MIN_REPO_SIZE_KB and not desc:
+    #         return False, f"empty_repo:size={size_kb}KB_no_desc"
 
     return True, "included"
 # ─────────────────────────────────────────────────────────────────────
