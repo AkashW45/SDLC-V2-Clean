@@ -1634,11 +1634,38 @@ def run_phase6(thread_id: str, feedback: str = ""):
 
         github_token = os.getenv("GITHUB_TOKEN")
         github_owner = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
+        gh_headers = {"Authorization": f"Bearer {github_token}", "Accept": "application/vnd.github+json"}
 
         if is_new_project or not target_repo.get("exists", True):
-            check_resp = req_lib.get(f"https://api.github.com/repos/{github_owner}/{target_repo_name}", headers={"Authorization": f"Bearer {github_token}", "Accept": "application/vnd.github+json"})
+            check_resp = req_lib.get(f"https://api.github.com/repos/{github_owner}/{target_repo_name}", headers=gh_headers)
             if check_resp.status_code == 404:
-                req_lib.post("https://api.github.com/user/repos", headers={"Authorization": f"Bearer {github_token}", "Accept": "application/vnd.github+json"}, json={"name": target_repo_name, "private": False, "auto_init": True})
+                create_resp = req_lib.post(
+                    "https://api.github.com/user/repos",
+                    headers=gh_headers,
+                    json={"name": target_repo_name, "private": False, "auto_init": True},
+                )
+                # Do NOT ignore the result — a 401/403/422 here is the #1 reason
+                # a greenfield repo never appears. Surface it as a hard error.
+                if create_resp.status_code not in (201, 422):
+                    err = f"GitHub repo creation failed: HTTP {create_resp.status_code} - {create_resp.text[:300]}"
+                    print(f"  ❌ {err}")
+                    pipeline_store[thread_id].update({"status": "ERROR", "error": err})
+                    save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
+                    return
+                # auto_init's initial commit is async; wait for it so the
+                # delivery agent's clone doesn't race an empty repo.
+                commits_url = f"https://api.github.com/repos/{github_owner}/{target_repo_name}/commits"
+                for _ in range(10):
+                    c = req_lib.get(commits_url, headers=gh_headers)
+                    if c.status_code == 200 and c.json():
+                        break
+                    time.sleep(1)
+            elif check_resp.status_code not in (200, 301):
+                err = f"Cannot access repo {github_owner}/{target_repo_name}: HTTP {check_resp.status_code} - {check_resp.text[:200]}"
+                print(f"  ❌ {err}")
+                pipeline_store[thread_id].update({"status": "ERROR", "error": err})
+                save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
+                return
 
         branch_name = "main" if is_new_project else f"feature/{thread_id}"
 
@@ -1647,7 +1674,18 @@ def run_phase6(thread_id: str, feedback: str = ""):
         initial = DeliveryState(requirement=entry["requirement"], generated_changes=state.get("generated_changes", []), test_files=state.get("test_files", []), branch_name=branch_name, repo_url=target_repo_url, pr_urls=[], human_feedback=feedback, approved=False, status="STARTED")
 
         result = graph.invoke(initial, config)
+        delivery_status = result.get("status", "")
         pr_urls = result.get("pr_urls", [])
+
+        # If the push/PR step failed, do NOT report "Awaiting PR approval" — that
+        # false-success was masking empty/missing repos. Stop and report the error.
+        if delivery_status in ("PUSH_FAILED", "PR_SKIPPED", "PR_FAILED"):
+            err = result.get("error") or f"Phase 6 delivery failed with status {delivery_status}"
+            print(f"  ❌ Phase 6 push/PR failed: {err}")
+            merged = {**state, "pr_urls": pr_urls, "target_repo": target_repo_name}
+            pipeline_store[thread_id].update({"current_state": merged, "status": "ERROR", "error": err, "sub_stage": f"Delivery failed: {delivery_status}"})
+            save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+            return
 
         merged = {**state, "pr_urls": pr_urls, "target_repo": target_repo_name}
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "pr_urls": pr_urls, "status": "WAITING_PHASE_6_APPROVAL", "sub_stage": f"Pushed to {target_repo_name} — Awaiting PR approval"})

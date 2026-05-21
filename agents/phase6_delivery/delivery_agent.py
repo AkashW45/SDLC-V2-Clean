@@ -82,7 +82,13 @@ def create_github_repo(
 
     # Repo created successfully
     if response.status_code == 201:
-        return response.json()
+        repo = response.json()
+        # auto_init creates the initial README commit ASYNCHRONOUSLY. The 201
+        # response can return before that commit exists, so a clone fired
+        # immediately afterwards may hit an empty repo (no default branch ref).
+        # Block until the initial commit is visible before returning.
+        _wait_for_initial_commit(repo.get("full_name", ""), headers)
+        return repo
 
     # Repo already exists
     if response.status_code == 422 and "name already exists" in response.text:
@@ -92,6 +98,34 @@ def create_github_repo(
         f"GitHub repo creation failed: "
         f"{response.status_code} - {response.text}"
     )
+
+
+def _wait_for_initial_commit(
+        full_name: str,
+        headers: dict,
+        attempts: int = 10,
+        delay: float = 1.0
+) -> bool:
+    """Poll GitHub until the repo has at least one commit.
+
+    Returns True once a commit is visible, False if it never appeared within
+    the budget. Called after auto_init repo creation to defeat the clone race.
+    """
+    if not full_name:
+        return False
+
+    commits_url = f"https://api.github.com/repos/{full_name}/commits"
+    for _ in range(attempts):
+        resp = requests.get(commits_url, headers=headers)
+        # 200 with a non-empty list → initial commit exists.
+        # 409 ("Git Repository is empty") → auto_init hasn't landed yet.
+        if resp.status_code == 200 and resp.json():
+            return True
+        time.sleep(delay)
+
+    print(f"  ⚠️  Initial commit for '{full_name}' not visible after "
+          f"{attempts}s — proceeding anyway (clone may still race).")
+    return False
 
 
 def push_files_to_branch(
@@ -104,21 +138,37 @@ def push_files_to_branch(
     temp_dir = tempfile.mkdtemp()
 
     try:
-        # Clone
+        # Clone. On a freshly auto_init'd repo this normally works, but if the
+        # initial commit still hasn't landed git prints a warning about cloning
+        # an empty repository and leaves HEAD on an unborn branch — handled below.
         run_git(["git", "clone", repo_url, "."], cwd=temp_dir)
-        run_git(["git", "fetch", "--all"], cwd=temp_dir)
 
-        # Create or checkout branch
-        remote_branches = run_git(["git", "branch", "-r"], cwd=temp_dir)
-        if f"origin/{branch_name}" in remote_branches:
-            run_git(["git", "checkout", branch_name], cwd=temp_dir)
-            run_git(["git", "pull", "origin", branch_name], cwd=temp_dir)
-        else:
-            run_git(["git", "checkout", "-b", branch_name], cwd=temp_dir)
-
-        # Configure git identity
+        # Configure git identity early so commits work even on an unborn branch.
         run_git(["git", "config", "user.email", "ai-sdlc@bot.com"], cwd=temp_dir)
         run_git(["git", "config", "user.name", "AI SDLC Bot"], cwd=temp_dir)
+
+        # Detect whether the clone actually has any commits. A just-created repo
+        # whose auto_init commit hasn't propagated yet clones as "empty": HEAD
+        # points at an unborn branch and `git branch -r` lists nothing.
+        rev_check = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=temp_dir, capture_output=True, text=True
+        )
+        repo_has_commits = rev_check.returncode == 0
+
+        if repo_has_commits:
+            run_git(["git", "fetch", "--all"], cwd=temp_dir)
+            remote_branches = run_git(["git", "branch", "-r"], cwd=temp_dir)
+            if f"origin/{branch_name}" in remote_branches:
+                run_git(["git", "checkout", branch_name], cwd=temp_dir)
+                run_git(["git", "pull", "origin", branch_name], cwd=temp_dir)
+            else:
+                run_git(["git", "checkout", "-b", branch_name], cwd=temp_dir)
+        else:
+            # Empty repo → put HEAD on the target branch directly. The first
+            # commit will create it. Use -B so it works whether or not the
+            # unborn branch already happens to be named branch_name.
+            run_git(["git", "checkout", "-B", branch_name], cwd=temp_dir)
 
         # Write files
         files_written = 0
@@ -134,17 +184,13 @@ def push_files_to_branch(
         # Commit and push
         status = run_git(["git", "status", "--porcelain"], cwd=temp_dir)
         if not status:
-            return {"status": "NO_CHANGES", "branch": branch_name}
+            return {"status": "NO_CHANGES", "branch": branch_name,
+                    "files_pushed": 0}
 
         run_git(["git", "add", "."], cwd=temp_dir)
         run_git(["git", "commit", "-m", commit_message], cwd=temp_dir)
-        run_git(["git", "push", "origin", branch_name, "--force"], cwd=temp_dir)
-
-        safe_repo_url = repo_url.split("@github.com/")[-1]
-        safe_repo_url = f"https://github.com/{safe_repo_url}"
-
         run_git(
-            ["git", "remote", "set-url", "origin", safe_repo_url],
+            ["git", "push", "--set-upstream", "origin", branch_name, "--force"],
             cwd=temp_dir
         )
 
@@ -153,6 +199,12 @@ def push_files_to_branch(
             "branch": branch_name,
             "files_pushed": files_written
         }
+
+    except Exception as e:
+        # Surface the real git error instead of letting it disappear. The
+        # caller (push_code) inspects status and must treat this as a failure.
+        return {"status": "PUSH_FAILED", "branch": branch_name,
+                "files_pushed": 0, "error": str(e)}
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -234,18 +286,28 @@ def push_code(state: DeliveryState) -> DeliveryState:
     }
 
     repo_check = requests.get(repo_check_url, headers=headers)
-    time.sleep(3)
-    # Repo does not exist → create it
+    # Repo does not exist → create it (and wait for auto_init commit inside).
     if repo_check.status_code == 404:
         print(f"  ℹ️  Repo '{repo_name}' does not exist. Creating...")
-        create_github_repo(repo_name=repo_name)
-        print(f"  ✅ Repository created: {repo_name}")
+        try:
+            create_github_repo(repo_name=repo_name)
+            print(f"  ✅ Repository created: {repo_name}")
+        except Exception as e:
+            print(f"  ❌ Repo creation failed: {e}")
+            return {**state, "status": "PUSH_FAILED", "error": str(e)}
+    elif repo_check.status_code not in (200, 301):
+        # 401/403 here almost always means the token lacks repo scope. Fail
+        # loudly instead of silently sailing into a push that can't work.
+        msg = (f"Cannot access repo '{GITHUB_OWNER}/{repo_name}': "
+               f"HTTP {repo_check.status_code} - {repo_check.text[:200]}")
+        print(f"  ❌ {msg}")
+        return {**state, "status": "PUSH_FAILED", "error": msg}
 
     # Prepare all files to push
     all_files = []
 
     # Generated code changes
-    for change in state["generated_changes"]:
+    for change in state.get("generated_changes", []):
         all_files.append({
             "file_path": change["file_path"],
             "content": change["content"]
@@ -259,21 +321,32 @@ def push_code(state: DeliveryState) -> DeliveryState:
                 "content": test_file["content"]
             })
 
+    # Nothing to push is itself a failure for a greenfield project — an empty
+    # repo is exactly the symptom we're trying to eliminate.
+    if not all_files:
+        msg = "No files to push (generated_changes and test_files are empty)"
+        print(f"  ❌ {msg}")
+        return {**state, "status": "PUSH_FAILED", "error": msg}
+
     print(f"  Pushing {len(all_files)} files to branch: {branch_name}")
 
-    try:
-        push_result = push_files_to_branch(
-            repo_url=repo_url,
-            branch_name=branch_name,
-            files=all_files,
-            commit_message=f"feat: AI-generated changes — {state['requirement'][:60]}"
-        )
-        print(f"  ✅ Push result: {push_result['status']}")
+    push_result = push_files_to_branch(
+        repo_url=repo_url,
+        branch_name=branch_name,
+        files=all_files,
+        commit_message=f"feat: AI-generated changes — {state['requirement'][:60]}"
+    )
+    print(f"  Push result: {push_result['status']}")
+
+    # Only PUSH_SUCCESS counts. NO_CHANGES and PUSH_FAILED must NOT advance the
+    # pipeline as if code landed — that was the bug that hid empty repos.
+    if push_result["status"] == "PUSH_SUCCESS":
+        print(f"  ✅ Pushed {push_result.get('files_pushed', 0)} files")
         return {**state, "status": "CODE_PUSHED"}
 
-    except Exception as e:
-        print(f"  ❌ Push failed: {e}")
-        return {**state, "status": "PUSH_FAILED"}
+    err = push_result.get("error") or push_result["status"]
+    print(f"  ❌ Push did not succeed: {err}")
+    return {**state, "status": "PUSH_FAILED", "error": err}
 
 
 def create_pr(state: DeliveryState) -> DeliveryState:
@@ -291,9 +364,28 @@ def create_pr(state: DeliveryState) -> DeliveryState:
 
     # New project: code was pushed directly to default branch — no PR needed.
     # GitHub can't open a PR from main → main, so we record the repo URL instead.
+    # But only AFTER confirming the branch really has our commit — otherwise we'd
+    # hand back a link to an empty/nonexistent repo (the original bug).
     if branch_name in ("main", "master"):
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        }
+        verify_url = (
+            f"https://api.github.com/repos/{GITHUB_OWNER}/{repo_name}/"
+            f"branches/{branch_name}"
+        )
+        verify = requests.get(verify_url, headers=headers)
+        if verify.status_code != 200:
+            msg = (f"Push verification failed — branch '{branch_name}' not found "
+                   f"on {GITHUB_OWNER}/{repo_name} (HTTP {verify.status_code}). "
+                   f"Code did not land.")
+            print(f"  ❌ {msg}")
+            return {**state, "status": "PUSH_FAILED", "error": msg}
+
         push_url = f"https://github.com/{GITHUB_OWNER}/{repo_name}"
-        print(f"  ℹ️  New project — code pushed to {branch_name}, no PR needed.")
+        sha = (verify.json().get("commit", {}).get("sha") or "")[:7]
+        print(f"  ℹ️  New project — code pushed to {branch_name} ({sha}), no PR needed.")
         print(f"  Repo: {push_url}")
         return {**state, "pr_urls": [push_url], "status": "PR_SKIPPED_NEW_PROJECT"}
 
