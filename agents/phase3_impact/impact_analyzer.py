@@ -12,7 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
+# SentenceTransformer now comes from the shared singleton (core/embeddings.py),
+# so the model is no longer built at import time of this module.
 from openai import OpenAI
 
 from core.db_clients import (
@@ -27,7 +28,7 @@ load_dotenv()
 # Module-level Singletons
 # -----------------------------------------
 
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# embedder is provided by the shared singleton (core/embeddings.py); see _encode().
 
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
@@ -48,7 +49,8 @@ client = OpenAI(
 @lru_cache(maxsize=256)
 def _encode(query: str) -> tuple:
     """Encode query text to an embedding vector with LRU Cache."""
-    return tuple(embedder.encode(query).tolist())
+    from core.embeddings import get_embedder
+    return tuple(get_embedder().encode(query).tolist())
 
 
 def semantic_search(query: str, top_k: int = 3, repo_names: list = None) -> list:

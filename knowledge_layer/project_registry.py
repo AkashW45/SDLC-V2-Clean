@@ -25,7 +25,7 @@ import psycopg2
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
-from sentence_transformers import SentenceTransformer
+# SentenceTransformer now comes from the shared singleton (core/embeddings.py).
 
 load_dotenv()
 
@@ -36,10 +36,9 @@ _embedder = None
 
 
 def get_embedder():
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embedder
+    # Shared process-wide singleton (see core/embeddings.py).
+    from core.embeddings import get_embedder as _shared
+    return _shared()
 
 
 def get_postgres():

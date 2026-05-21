@@ -217,6 +217,25 @@ def _reconciliation_job():
 
 
 @app.on_event("startup")
+def warmup_embedder():
+    # Pay the one-time model load (download + init) at server boot rather than
+    # on the first user request. Without this, the first /pipeline/preview-routing
+    # call appears to "hang" for seconds while the model loads. Runs in a daemon
+    # thread so it never blocks the server from accepting connections.
+    import threading
+
+    def _warm():
+        try:
+            from core.embeddings import warmup
+            warmup()
+            logger.info("[startup] embedding model warmed up")
+        except Exception as e:
+            logger.warning(f"[startup] embedder warmup skipped: {e}")
+
+    threading.Thread(target=_warm, name="embedder-warmup", daemon=True).start()
+
+
+@app.on_event("startup")
 def start_reconciliation():
     global _scheduler
     interval_min = int(os.getenv("RECONCILIATION_INTERVAL_MIN", "60"))

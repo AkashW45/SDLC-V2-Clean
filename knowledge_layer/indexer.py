@@ -19,7 +19,7 @@ import psycopg2
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 from neo4j import GraphDatabase
-from sentence_transformers import SentenceTransformer
+# SentenceTransformer now comes from the shared singleton (core/embeddings.py).
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -67,10 +67,17 @@ def get_neo4j():
     from core.db_clients import neo4j_driver
     return neo4j_driver
 
-# Load embedding model once
-print("[Indexer] Loading embedding model...")
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-print("[Indexer] Embedding model ready")
+# Embedding model is provided by the shared singleton (core/embeddings.py).
+# `embedder` below is a thin lazy proxy so existing `embedder.encode(...)` call
+# sites keep working unchanged, while the model is built once, process-wide,
+# only on first real use (and warmed at server startup).
+class _LazyEmbedderProxy:
+    def __getattr__(self, name):
+        from core.embeddings import get_embedder
+        return getattr(get_embedder(), name)
+
+
+embedder = _LazyEmbedderProxy()
 
 
 # -----------------------------------------

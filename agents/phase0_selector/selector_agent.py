@@ -8,7 +8,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from typing import TypedDict, List, Dict, Any
 from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer
+# NOTE: SentenceTransformer is no longer imported here. The model is provided
+# by the shared singleton in core/embeddings.py (lazy + warmed at startup).
 import psycopg2
 import json
 
@@ -35,12 +36,11 @@ def get_postgres():
     return PooledConn()
 
 
-_embedder = None
 def get_embedder():
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embedder
+    # Shared process-wide singleton (see core/embeddings.py). Loaded once,
+    # warmed at server startup, so this call is effectively free.
+    from core.embeddings import get_embedder as _shared
+    return _shared()
 
 
 def search_projects(requirement: str, top_k: int = 3):

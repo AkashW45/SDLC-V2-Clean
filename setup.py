@@ -6,7 +6,7 @@ import psycopg2
 from pathlib import Path
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
-from sentence_transformers import SentenceTransformer
+# SentenceTransformer is provided via the shared singleton (core/embeddings.py).
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -148,7 +148,8 @@ PORTFOLIO =[
 # Execution Engine
 # ---------------------------------------------------------
 print("Loading AI Embedder...")
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+from core.embeddings import get_embedder
+embedder = get_embedder()
 
 def get_postgres():
     # Pooled connection — .close() returns it to the pool.

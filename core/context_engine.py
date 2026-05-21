@@ -174,13 +174,13 @@ class ContextOptimizationEngine:
             List of top matches with repo, file path, symbol info, and relevance score
         """
         try:
-            from sentence_transformers import SentenceTransformer
             from core.db_clients import qdrant_client as qdrant
         except ImportError:
             return []
 
         try:
-            embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            from core.embeddings import get_embedder
+            embedder = get_embedder()
             query_vector = embedder.encode(query).tolist()
 
             results = qdrant.query_points(
