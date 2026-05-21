@@ -450,6 +450,15 @@
       }
       const data = await resp.json();
       closeModal();
+      // Ask once for notification permission so we can alert the user about
+      // approvals even when this tab isn't focused. Requested here (on an
+      // explicit user action) rather than on page load, which browsers block
+      // and users find intrusive. Best-effort; ignored if unsupported/denied.
+      try {
+        if (window.Notification && Notification.permission === 'default') {
+          Notification.requestPermission();
+        }
+      } catch (e) { /* ignore */ }
       // The dashboard polls /pipeline/status — it'll pick up the new thread automatically
       if (typeof watchPipeline === 'function') {
         watchPipeline(data.thread_id,requirement);
@@ -506,6 +515,18 @@
   const SIDEBAR_MAX_MS = 60000;
   const HEALTH_INTERVAL_MS = 30000;
 
+  // Approval watcher — a SEPARATE, never-paused, never-backed-off loop whose
+  // ONLY job is to detect when the active pipeline needs human approval and
+  // fire the notification. This is deliberately decoupled from the optimized
+  // UI polling above: pause-on-hidden, exponential backoff, ETag/304
+  // short-circuits, and the waiting-state early-return all exist to save
+  // bandwidth on RENDERING, but none of them must ever be able to suppress an
+  // approval notification. This loop runs at a steady cadence regardless of
+  // tab visibility so "if approval is needed, the user is told" holds
+  // unconditionally. It is intentionally lightweight (a single status GET, no
+  // rendering) so running it while hidden is cheap.
+  const APPROVAL_WATCH_MS = 5000;
+
   // Polling state — tracks "is anyone watching", current interval, change counts.
   let pollingPaused = false;          // set true when tab hidden
   let pollIntervalMs = POLL_BASE_MS;  // current interval for active pipeline
@@ -517,10 +538,16 @@
   let lastPipelineListPayload = null; // remembered across 304 responses
   let lastPipelineStatusETag = null;  // ETag for /pipeline/status (per-thread reset on switch)
 
+  // Tracks which (thread, waiting-status) pairs we've already notified about,
+  // so the approval popup fires exactly once per transition into a waiting
+  // state — not repeatedly on every poll that observes the same waiting state.
+  const notifiedApprovals = new Set();
+
   // Timer handles so we can cancel cleanly on visibility change.
   let activePollTimer = null;
   let sidebarTimer = null;
   let healthTimer = null;
+  let approvalWatchTimer = null;  // dedicated approval watcher — never paused
 
   // ─── Tab visibility (Fix 1) ────────────────────────────────────────────────
   // Pause every polling loop when the tab is hidden. When it becomes visible
@@ -538,6 +565,12 @@
       pollUnchangedCount = 0;
       sidebarIntervalMs = SIDEBAR_BASE_MS;
       sidebarUnchangedCount = 0;
+      // Drop cached ETags so the resume poll returns a FULL 200 (with body),
+      // not a 304. While the tab was hidden the pipeline may have entered a
+      // waiting state that the local UI never rendered; a 304 here would skip
+      // rendering and the approval popup would be missed.
+      lastPipelineStatusETag = null;
+      lastPipelineListETag = null;
       scheduleActivePoll(0);
       scheduleSidebarPoll(0);
       scheduleHealthCheck(0);
@@ -575,9 +608,22 @@
     // FIX 2b — Waiting on human approval. The pipeline cannot move forward
     // until someone clicks approve/reject IN THIS TAB. The click handler
     // (approvePipeline) already schedules a refresh — no timer needed.
+    //
+    // IMPORTANT: we must still RENDER before returning. The transition INTO a
+    // waiting state can happen while the tab is hidden (polling is paused), so
+    // the normal change-detection branch below never ran for it. When the user
+    // returns, the resume poll lands here with status already == WAITING_* — if
+    // we returned without rendering, the approval zone (and its popup) would
+    // never appear. Rendering here makes the approval UI show on any poll that
+    // observes a waiting state, not only the one that caught the live change.
     if (WAITING_STATUSES.has(p.status)) {
       document.getElementById('poll-time').textContent =
               'Awaiting approval — polling paused';
+      lastPipelineSignature = pipelineSignature(p);  // keep change-detect in sync
+      renderSidebar();
+      renderPipelineBar();
+      renderContent();
+      maybeNotifyApproval(p);  // fire the popup/notification if not already shown
       return;
     }
 
@@ -634,6 +680,20 @@
         renderSidebar();
         renderPipelineBar();
         renderContent();
+
+        // Notify on a live transition INTO a waiting state (tab was visible and
+        // this poll caught the change). If the pipeline is NOT waiting, clear any
+        // prior notification flags for this thread so the next time it enters a
+        // waiting state — even the same phase after a reject/regenerate — it
+        // notifies again.
+        const cur = activePipelines[selectedThread];
+        if (cur && WAITING_STATUSES.has(cur.status)) {
+          maybeNotifyApproval(cur);
+        } else if (cur) {
+          for (const k of [...notifiedApprovals]) {
+            if (k.startsWith(selectedThread + ':')) notifiedApprovals.delete(k);
+          }
+        }
       }
     } catch (e) {
       // Quiet failure — next poll will retry
@@ -718,6 +778,52 @@
     healthTimer = setTimeout(async () => {
       await checkHealth();
       scheduleHealthCheck(HEALTH_INTERVAL_MS);
+    }, delayMs);
+  }
+
+  // ─── Approval watcher (never paused, never backed off) ──────────────────────
+  // The guarantee: if a pipeline needs approval, the user is notified — period,
+  // regardless of tab visibility, backoff state, or ETag caching. This loop is
+  // intentionally NOT gated on pollingPaused and NEVER cancelled by the
+  // visibilitychange handler, so it keeps running while the tab is hidden.
+  //
+  // It does a minimal status GET for the active thread, deliberately WITHOUT
+  // sending If-None-Match, so the server can't 304 it into silence. It does no
+  // rendering — maybeNotifyApproval() owns the popup (browser notification +
+  // in-page cue) and self-dedupes via notifiedApprovals, so this firing every
+  // few seconds is safe and produces exactly one popup per waiting transition.
+  async function watchForApproval() {
+    if (!selectedThread) return;
+    try {
+      const r = await fetch(`${API}/pipeline/status/${selectedThread}`);
+      if (!r.ok) return;
+      const d = await r.json();
+      // Keep local state fresh enough that a later render shows the right thing,
+      // but do NOT touch ETag/backoff/signature state owned by the UI poller.
+      if (activePipelines[selectedThread]) {
+        activePipelines[selectedThread].status = d.status || activePipelines[selectedThread].status;
+        activePipelines[selectedThread].phase = (d.phase != null) ? d.phase : activePipelines[selectedThread].phase;
+      }
+      if (d && WAITING_STATUSES.has(d.status)) {
+        maybeNotifyApproval({ thread_id: selectedThread, status: d.status, phase: d.phase });
+      } else if (d) {
+        // Left the waiting state — clear this thread's flags so a future
+        // waiting phase (even the same one after reject/regenerate) re-notifies.
+        for (const k of [...notifiedApprovals]) {
+          if (k.startsWith(selectedThread + ':')) notifiedApprovals.delete(k);
+        }
+      }
+    } catch (e) {
+      // Quiet — next tick retries. Never throws into the timer loop.
+    }
+  }
+
+  function scheduleApprovalWatch(delayMs) {
+    // NOTE: intentionally NOT guarded by pollingPaused — this is the whole point.
+    if (approvalWatchTimer) clearTimeout(approvalWatchTimer);
+    approvalWatchTimer = setTimeout(async () => {
+      await watchForApproval();
+      scheduleApprovalWatch(APPROVAL_WATCH_MS);
     }, delayMs);
   }
 
@@ -1615,6 +1721,43 @@
   </div>`;
   }
 
+  // Fire an approval notification exactly once per transition into a waiting
+  // state. Because the transition can occur while the tab is hidden (polling
+  // paused), this is also called from the resume poll — the notifiedApprovals
+  // guard ensures the user still gets exactly one popup when they return,
+  // rather than zero (the old bug) or one-per-poll (spam).
+  function maybeNotifyApproval(p) {
+    if (!p || !WAITING_STATUSES.has(p.status)) return;
+    const key = p.thread_id + ':' + p.status;
+    if (notifiedApprovals.has(key)) return;   // already notified for this transition
+    notifiedApprovals.add(key);
+
+    const phaseLabel = (p.phase != null) ? ('Phase ' + p.phase) : 'A phase';
+    const msg = phaseLabel + ' is awaiting your approval.';
+
+    // Browser notification (works even when this tab isn't focused) IF the user
+    // previously granted permission. We never auto-request it on load; see the
+    // one-time opt-in wired from the approval UI. Guarded so it never throws.
+    try {
+      if (window.Notification && Notification.permission === 'granted') {
+        new Notification('SDLC-V2 — approval needed', { body: msg });
+      }
+    } catch (e) { /* notifications unavailable; fall through to in-page cue */ }
+
+    // Reliable in-page fallback — always runs, no permission needed. Brings the
+    // approval zone into view and briefly highlights it so a returning user
+    // can't miss it.
+    try {
+      const zone = document.getElementById('feedback-' + p.thread_id);
+      const card = zone ? zone.closest('div') : null;
+      if (card && card.scrollIntoView) {
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      const banner = document.getElementById('poll-time');
+      if (banner) banner.textContent = '⚠ ' + msg + ' — review below';
+    } catch (e) { /* DOM not ready; the rendered approval zone still shows */ }
+  }
+
   function approvalZone(threadId) {
     return `<div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
     <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px">Human Review Required</div>
@@ -1717,6 +1860,10 @@
   scheduleActivePoll(POLL_BASE_MS);
   scheduleSidebarPoll(SIDEBAR_BASE_MS);
   scheduleHealthCheck(HEALTH_INTERVAL_MS);
+  // The approval watcher runs independently of the three loops above — it is
+  // NOT paused on tab-hide, so an approval that becomes due while the user is
+  // on another window still fires a notification.
+  scheduleApprovalWatch(APPROVAL_WATCH_MS);
 </script>
 </body>
 </html>
