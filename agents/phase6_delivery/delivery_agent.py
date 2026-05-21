@@ -20,6 +20,15 @@ load_dotenv()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_OWNER = os.getenv("GITHUB_REPO_OWNER")
+# If set, new repos are created INSIDE this organization via POST /orgs/{org}/repos.
+# If empty/unset, repos are created under the token owner's personal account via
+# POST /user/repos. This is the difference between a repo showing up in your org
+# vs. silently landing in your personal account.
+GITHUB_ORG = os.getenv("GITHUB_ORG", "").strip()
+# The account that actually owns the repos: the org when creating in an org,
+# otherwise the personal owner. All repo existence checks, clone URLs, and PR
+# URLs must use THIS, so they point at wherever the repo was actually created.
+EFFECTIVE_OWNER = GITHUB_ORG or GITHUB_OWNER
 
 
 # -----------------------------------------
@@ -63,9 +72,20 @@ def create_github_repo(
 ) -> dict:
     """
     Create a new GitHub repository for greenfield projects.
+
+    Creates inside GITHUB_ORG (POST /orgs/{org}/repos) when that env var is set,
+    otherwise under the token owner's personal account (POST /user/repos).
+    NOTE: POST /user/repos ALWAYS creates under the account that owns the token —
+    it cannot create org repos. Org creation requires the /orgs/{org}/repos
+    endpoint and a token with the 'repo' scope (classic) or repository-creation
+    permission on that org (fine-grained), plus org membership/permission to
+    create repos.
     """
 
-    url = "https://api.github.com/user/repos"
+    if GITHUB_ORG:
+        url = f"https://api.github.com/orgs/{GITHUB_ORG}/repos"
+    else:
+        url = "https://api.github.com/user/repos"
 
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -83,6 +103,8 @@ def create_github_repo(
     # Repo created successfully
     if response.status_code == 201:
         repo = response.json()
+        target = repo.get("full_name", f"{GITHUB_ORG or '?'}/{repo_name}")
+        print(f"  ✅ Created repo at {url} → {target}")
         # auto_init creates the initial README commit ASYNCHRONOUSLY. The 201
         # response can return before that commit exists, so a clone fired
         # immediately afterwards may hit an empty repo (no default branch ref).
@@ -217,7 +239,7 @@ def create_github_pr(
         body: str
 ) -> dict:
     """Create a GitHub PR via API."""
-    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{repo_name}/pulls"
+    url = f"https://api.github.com/repos/{EFFECTIVE_OWNER}/{repo_name}/pulls"
 
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -238,7 +260,7 @@ def create_github_pr(
 
     # PR already exists
     if response.status_code == 422 and "already exists" in response.text:
-        pr_list_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{repo_name}/pulls?head={GITHUB_OWNER}:{branch_name}&state=open"
+        pr_list_url = f"https://api.github.com/repos/{EFFECTIVE_OWNER}/{repo_name}/pulls?head={EFFECTIVE_OWNER}:{branch_name}&state=open"
         pr_resp = requests.get(pr_list_url, headers=headers)
         prs = pr_resp.json()
         if prs:
@@ -278,7 +300,7 @@ def push_code(state: DeliveryState) -> DeliveryState:
     repo_name = repo_url.split("/")[-1].replace(".git", "")
 
     # Check if repo exists
-    repo_check_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{repo_name}"
+    repo_check_url = f"https://api.github.com/repos/{EFFECTIVE_OWNER}/{repo_name}"
 
     headers = {
         "Authorization": f"Bearer {github_token}",
@@ -298,7 +320,7 @@ def push_code(state: DeliveryState) -> DeliveryState:
     elif repo_check.status_code not in (200, 301):
         # 401/403 here almost always means the token lacks repo scope. Fail
         # loudly instead of silently sailing into a push that can't work.
-        msg = (f"Cannot access repo '{GITHUB_OWNER}/{repo_name}': "
+        msg = (f"Cannot access repo '{EFFECTIVE_OWNER}/{repo_name}': "
                f"HTTP {repo_check.status_code} - {repo_check.text[:200]}")
         print(f"  ❌ {msg}")
         return {**state, "status": "PUSH_FAILED", "error": msg}
@@ -372,18 +394,18 @@ def create_pr(state: DeliveryState) -> DeliveryState:
             "Accept": "application/vnd.github+json",
         }
         verify_url = (
-            f"https://api.github.com/repos/{GITHUB_OWNER}/{repo_name}/"
+            f"https://api.github.com/repos/{EFFECTIVE_OWNER}/{repo_name}/"
             f"branches/{branch_name}"
         )
         verify = requests.get(verify_url, headers=headers)
         if verify.status_code != 200:
             msg = (f"Push verification failed — branch '{branch_name}' not found "
-                   f"on {GITHUB_OWNER}/{repo_name} (HTTP {verify.status_code}). "
+                   f"on {EFFECTIVE_OWNER}/{repo_name} (HTTP {verify.status_code}). "
                    f"Code did not land.")
             print(f"  ❌ {msg}")
             return {**state, "status": "PUSH_FAILED", "error": msg}
 
-        push_url = f"https://github.com/{GITHUB_OWNER}/{repo_name}"
+        push_url = f"https://github.com/{EFFECTIVE_OWNER}/{repo_name}"
         sha = (verify.json().get("commit", {}).get("sha") or "")[:7]
         print(f"  ℹ️  New project — code pushed to {branch_name} ({sha}), no PR needed.")
         print(f"  Repo: {push_url}")

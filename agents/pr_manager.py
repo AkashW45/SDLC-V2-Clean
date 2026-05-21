@@ -25,7 +25,10 @@ from agents.stage2_store import get_pr_by_request_id, save_pr, audit
 load_dotenv()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_OWNER = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
+GITHUB_ORG = os.getenv("GITHUB_ORG", "").strip()
+# Effective owner: the org when set (repos created via /orgs/{org}/repos),
+# else the token owner's personal account (/user/repos).
+GITHUB_OWNER = GITHUB_ORG or os.getenv("GITHUB_REPO_OWNER", "AkashW45")
 AGENT_VERSION = os.getenv("AGENT_VERSION", "v2.0")
 
 from agents.github_auth import get_github_headers
@@ -45,8 +48,10 @@ def _repo_exists(repo_name: str) -> bool:
 
 
 def _create_repo(repo_name: str, description: str) -> bool:
+    create_url = (f"{GH_API}/orgs/{GITHUB_ORG}/repos"
+                  if GITHUB_ORG else f"{GH_API}/user/repos")
     r = requests.post(
-        f"{GH_API}/user/repos",
+        create_url,
         headers=get_github_headers(),
         json={
             "name": repo_name,
@@ -56,6 +61,9 @@ def _create_repo(repo_name: str, description: str) -> bool:
         },
         timeout=15,
     )
+    if r.status_code != 201:
+        print(f"[pr_manager] repo create failed at {create_url}: "
+              f"HTTP {r.status_code} - {r.text[:200]}")
     return r.status_code == 201
 
 

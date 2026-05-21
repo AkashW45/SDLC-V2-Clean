@@ -1649,24 +1649,35 @@ def run_phase6(thread_id: str, feedback: str = ""):
 
         target_repo = next((r for r in selected_repos if r.get("type") == "backend"), selected_repos[0])
         target_repo_name = target_repo["name"]
-        target_repo_url = target_repo.get("url", f"https://github.com/{os.getenv('GITHUB_REPO_OWNER','AkashW45')}/{target_repo_name}.git")
 
         github_token = os.getenv("GITHUB_TOKEN")
-        github_owner = os.getenv("GITHUB_REPO_OWNER", "AkashW45")
+        github_org = os.getenv("GITHUB_ORG", "").strip()
+        # When GITHUB_ORG is set, repos live in the org: create via
+        # POST /orgs/{org}/repos and resolve all repo URLs under the org.
+        # Otherwise fall back to the token owner's personal account.
+        github_owner = github_org or os.getenv("GITHUB_REPO_OWNER", "AkashW45")
         gh_headers = {"Authorization": f"Bearer {github_token}", "Accept": "application/vnd.github+json"}
+        create_url = (f"https://api.github.com/orgs/{github_org}/repos"
+                      if github_org else "https://api.github.com/user/repos")
+
+        # Build the clone/push URL from the EFFECTIVE owner so it points wherever
+        # the repo actually lives. A url stored during phase-0 routing may carry a
+        # stale/personal owner, so we always normalise it here to github_owner.
+        target_repo_url = f"https://github.com/{github_owner}/{target_repo_name}.git"
 
         if is_new_project or not target_repo.get("exists", True):
             check_resp = req_lib.get(f"https://api.github.com/repos/{github_owner}/{target_repo_name}", headers=gh_headers)
             if check_resp.status_code == 404:
                 create_resp = req_lib.post(
-                    "https://api.github.com/user/repos",
+                    create_url,
                     headers=gh_headers,
                     json={"name": target_repo_name, "private": False, "auto_init": True},
                 )
                 # Do NOT ignore the result — a 401/403/422 here is the #1 reason
                 # a greenfield repo never appears. Surface it as a hard error.
                 if create_resp.status_code not in (201, 422):
-                    err = f"GitHub repo creation failed: HTTP {create_resp.status_code} - {create_resp.text[:300]}"
+                    err = (f"GitHub repo creation failed at {create_url}: "
+                           f"HTTP {create_resp.status_code} - {create_resp.text[:300]}")
                     print(f"  ❌ {err}")
                     pipeline_store[thread_id].update({"status": "ERROR", "error": err})
                     save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
