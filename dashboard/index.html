@@ -813,6 +813,7 @@
         for (const k of [...notifiedApprovals]) {
           if (k.startsWith(selectedThread + ':')) notifiedApprovals.delete(k);
         }
+        clearApprovalTitle();
       }
     } catch (e) {
       // Quiet — next tick retries. Never throws into the timer loop.
@@ -1586,6 +1587,19 @@
       html += sectionClose();
     }
 
+    // ── Approval fallback (status-driven, not data-driven) ──────────────────
+    // Each phase block above renders its approve/reject zone ONLY when that
+    // phase's artifact data is present (e.g. `state.sprint_plan`). If a pipeline
+    // pauses in a WAITING_* status but its artifact data is missing, empty, or
+    // not yet in current_state, none of those blocks render — leaving a paused
+    // pipeline the user CANNOT act on. That was the bug: "paused for approval,
+    // but no approve/reject shown." Approval is fundamentally a function of
+    // STATUS, not of whether artifacts happened to render — so if we're waiting
+    // and no approval zone was emitted above, emit one now.
+    if (isWaiting && !html.includes('Human Review Required')) {
+      html += approvalZone(selectedThread);
+    }
+
     el.innerHTML = html;
 
     // Render Mermaid diagrams that aren't cached yet
@@ -1757,6 +1771,21 @@
       const banner = document.getElementById('poll-time');
       if (banner) banner.textContent = '⚠ ' + msg + ' — review below';
     } catch (e) { /* DOM not ready; the rendered approval zone still shows */ }
+
+    // Page-title alert — the MOST reliable cross-window signal because it shows
+    // in the browser tab strip / window title even when the tab is inactive and
+    // requires NO permission (unlike the Notification API). Cleared by
+    // clearApprovalTitle() once the pipeline leaves the waiting state.
+    try {
+      document.title = '🔔 Approval needed — SDLC-V2';
+    } catch (e) { /* ignore */ }
+  }
+
+  // Restore the normal page title once nothing is awaiting approval.
+  function clearApprovalTitle() {
+    try {
+      if (document.title !== 'SDLC-V2') document.title = 'SDLC-V2';
+    } catch (e) { /* ignore */ }
   }
 
   function approvalZone(threadId) {
