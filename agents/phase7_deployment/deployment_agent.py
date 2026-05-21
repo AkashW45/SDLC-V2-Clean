@@ -253,7 +253,7 @@ def resolve_deploy_sequence(state: DeploymentState) -> DeploymentState:
     merged_shas = state.get("merged_shas") or {}
     if merged_shas:
         print(f"  📌 Pinning repos to merged SHAs from Phase 6: "
-              f"{', '.join(f'{k}={(v or '?')[:7]}' for k, v in merged_shas.items())}")
+              f"{', '.join(f"{k}={(v or '?')[:7]}" for k, v in merged_shas.items())}")
 
     # affected_repos from Phase 3 now carries full metadata (name, url, type, …)
     # enriched from Phase 0's selected_repos. Build a name→meta lookup so we can
