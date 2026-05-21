@@ -180,11 +180,11 @@ def _detect_existing(generated_changes: list, existing_files_in_repo: set[str]) 
 
 
 def _ask_llm_for_decision(
-    requirement: str,
-    adr: Optional[dict],
-    architecture: Optional[dict],
-    generated_changes: list,
-    existing_files_in_repo: set[str],
+        requirement: str,
+        adr: Optional[dict],
+        architecture: Optional[dict],
+        generated_changes: list,
+        existing_files_in_repo: set[str],
 ) -> dict:
     """One LLM call to make the deployment decision. Falls back to a safe
     default if the LLM errors out."""
@@ -582,12 +582,12 @@ def _render_github_workflow(decision: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def generate_cicd_artifacts(
-    requirement: str,
-    generated_changes: list,
-    adr: Optional[dict] = None,
-    architecture: Optional[dict] = None,
-    existing_files_in_repo: Optional[set] = None,
-    is_brownfield: bool = False,
+        requirement: str,
+        generated_changes: list,
+        adr: Optional[dict] = None,
+        architecture: Optional[dict] = None,
+        existing_files_in_repo: Optional[set] = None,
+        is_brownfield: bool = False,
 ) -> dict:
     """Decide what CI/CD artifacts to generate and produce their content.
 
@@ -627,6 +627,34 @@ def generate_cicd_artifacts(
         decision = _ask_llm_for_decision(
             requirement, adr, architecture, generated_changes, existing_files_in_repo
         )
+        # GREENFIELD GUARANTEE: a brand-new repo MUST ship a deploy contract,
+        # otherwise Phase 7 has nothing to deploy. The old logic only generated
+        # infra for Python services (`is_python_service`), so non-Python projects
+        # (e.g. a static HTML site) got NO .deploy.yaml and deployment silently
+        # had nothing to act on. For greenfield we force the full stack for any
+        # slot not already present, inferring a sensible target by language.
+        _existing = _detect_existing(generated_changes, existing_files_in_repo)
+        is_static_site = (
+                not any(c.get("file_path", "").endswith((".py", ".js", ".ts", ".go", ".java"))
+                        for c in generated_changes)
+                and any(c.get("file_path", "").endswith((".html", ".htm", ".css"))
+                        for c in generated_changes)
+        )
+        if not decision.get("deploy_target"):
+            decision["deploy_target"] = "static-site" if is_static_site else "ecs-prod"
+        if not decision.get("service_name"):
+            decision["service_name"] = "service"
+        # Force-fill any missing infra slot (sanitizer below still won't clobber
+        # files that already exist on disk).
+        if not _existing["has_deploy_yaml"]:
+            decision["needs_deploy_yaml"] = True
+        if not _existing["has_github_workflow"]:
+            decision["needs_ci_cd_workflow"] = True
+        # A static site has no container; only force a Dockerfile for services.
+        if not is_static_site and not _existing["has_dockerfile"]:
+            decision["needs_dockerfile"] = True
+        print(f"  [cicd] greenfield guarantee applied "
+              f"(static_site={is_static_site}, target={decision['deploy_target']})")
 
     new_files: list = []
 
@@ -675,11 +703,11 @@ def generate_cicd_artifacts(
 
 
 def _brownfield_decision(
-    requirement: str,
-    adr: Optional[dict],
-    architecture: Optional[dict],
-    generated_changes: list,
-    existing_files_in_repo: set,
+        requirement: str,
+        adr: Optional[dict],
+        architecture: Optional[dict],
+        generated_changes: list,
+        existing_files_in_repo: set,
 ) -> dict:
     """Brownfield-specific decision: respect existing infra, almost always.
 

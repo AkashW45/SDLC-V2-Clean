@@ -1697,7 +1697,13 @@ def run_phase6(thread_id: str, feedback: str = ""):
                 save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
                 return
 
-        branch_name = "main" if is_new_project else f"feature/{thread_id}"
+        # BOTH greenfield and brownfield now push to a feature branch and open a
+        # real PR into main. Previously greenfield pushed straight to main (no PR),
+        # which (a) bypassed the human review gate and (b) left pr_urls holding a
+        # repo URL the merge step couldn't parse, failing Phase 7. The repo's main
+        # branch already exists (auto_init for new repos), so a feature→main PR
+        # works for new projects exactly like existing ones.
+        branch_name = f"feature/{thread_id}"
 
         graph = build_delivery_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p6"}}

@@ -384,32 +384,16 @@ def create_pr(state: DeliveryState) -> DeliveryState:
     # Extract repo name from URL
     repo_name = repo_url.split("/")[-1].replace(".git", "")
 
-    # New project: code was pushed directly to default branch — no PR needed.
-    # GitHub can't open a PR from main → main, so we record the repo URL instead.
-    # But only AFTER confirming the branch really has our commit — otherwise we'd
-    # hand back a link to an empty/nonexistent repo (the original bug).
+    # Guard: we should never be on main/master here anymore — both greenfield
+    # and brownfield push to a feature branch and open a PR into main. If a
+    # caller still passes main/master, that's a misconfiguration: fail loudly
+    # rather than silently pushing to the default branch with no review.
     if branch_name in ("main", "master"):
-        headers = {
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
-        }
-        verify_url = (
-            f"https://api.github.com/repos/{EFFECTIVE_OWNER}/{repo_name}/"
-            f"branches/{branch_name}"
-        )
-        verify = requests.get(verify_url, headers=headers)
-        if verify.status_code != 200:
-            msg = (f"Push verification failed — branch '{branch_name}' not found "
-                   f"on {EFFECTIVE_OWNER}/{repo_name} (HTTP {verify.status_code}). "
-                   f"Code did not land.")
-            print(f"  ❌ {msg}")
-            return {**state, "status": "PUSH_FAILED", "error": msg}
-
-        push_url = f"https://github.com/{EFFECTIVE_OWNER}/{repo_name}"
-        sha = (verify.json().get("commit", {}).get("sha") or "")[:7]
-        print(f"  ℹ️  New project — code pushed to {branch_name} ({sha}), no PR needed.")
-        print(f"  Repo: {push_url}")
-        return {**state, "pr_urls": [push_url], "status": "PR_SKIPPED_NEW_PROJECT"}
+        msg = (f"Refusing to open a PR from '{branch_name}' into itself. "
+               f"Delivery must use a feature branch (feature/<thread>). "
+               f"This indicates run_phase6 set the wrong branch_name.")
+        print(f"  ❌ {msg}")
+        return {**state, "status": "PR_FAILED", "error": msg}
 
     # Build PR body
     changes_summary = "\n".join([
