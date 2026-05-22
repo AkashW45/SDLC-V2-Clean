@@ -1776,17 +1776,51 @@ def run_phase7(thread_id: str, feedback: str = ""):
 
         pipeline_store[thread_id].update({"status": "PHASE_7_RUNNING", "sub_stage": "Resolving deployment sequence...", "phase": 7})
 
-        # affected_repos in impact_report is now a list of enriched dicts
-        # (name, url, type, …) produced by Phase 3 using Phase 0's metadata.
-        # No need to separately read selected_repos for git URL resolution.
-        affected_repos = state.get("impact_report", {}).get("affected_repos", [])
-        if not affected_repos:
-            # Fallback: use selected_repos names if impact report is empty
-            affected_repos = [r["name"] for r in state.get("selected_repos", [])]
-
-        # Pull the SHAs Phase 6 merged so Phase 7 deploys exactly that code,
-        # not whatever HEAD-of-main happens to be at clone time.
+        # ── Build the deploy set from what Phase 6 ACTUALLY merged ─────────────
+        # Single source of truth for "what to deploy" = merged_shas, the dict
+        # Phase 6 fills with {repo_name: sha} for every repo it really merged.
+        # We enrich each of those repos with its full metadata (name, type, url)
+        # from selected_repos — which already carries all three — so Phase 7 gets
+        # the complete per-repo info it's designed to use, with NO reconstruction
+        # guesswork and NO Phase-0 phantom repos (e.g. a frontend that was
+        # declared up front but never generated for a hello-world).
         merged_shas = state.get("merged_shas", {}) or {}
+
+        # name -> metadata lookup from selected_repos ({name, type, url, ...})
+        selected_meta = {
+            r["name"]: r
+            for r in state.get("selected_repos", [])
+            if isinstance(r, dict) and r.get("name")
+        }
+
+        if merged_shas:
+            affected_repos = []
+            for repo_name in merged_shas.keys():
+                meta = selected_meta.get(repo_name, {})
+                affected_repos.append({
+                    "name": repo_name,
+                    "type": meta.get("type", "backend"),
+                    "url": meta.get(
+                        "url",
+                        f"https://github.com/{os.getenv('GITHUB_REPO_OWNER', 'SDLC-V2-Team')}/{repo_name}.git",
+                    ),
+                })
+            print(f"[Phase 7] Deploying repos merged in Phase 6: "
+                  f"{[r['name'] for r in affected_repos]}")
+            declared = set(selected_meta) - set(merged_shas)
+            if declared:
+                print(f"[Phase 7] Skipping declared-but-not-merged repo(s): {sorted(declared)}")
+        else:
+            # No merge info (e.g. re-deploy of existing repos): fall back to the
+            # impact report's enriched list, then to selected_repos.
+            affected_repos = state.get("impact_report", {}).get("affected_repos", [])
+            if not affected_repos:
+                affected_repos = [
+                    {"name": r["name"], "type": r.get("type", "backend"), "url": r.get("url")}
+                    for r in state.get("selected_repos", [])
+                ]
+            print(f"[Phase 7] No merged_shas — deploying from impact/selected repos: "
+                  f"{[r['name'] if isinstance(r, dict) else r for r in affected_repos]}")
 
         graph = build_deployment_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p7"}}
