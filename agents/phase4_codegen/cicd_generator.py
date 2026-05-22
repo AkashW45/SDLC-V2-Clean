@@ -232,11 +232,87 @@ def _ask_llm_for_decision(
             "rationale": "LLM unavailable; defaulted to Python/FastAPI ECS service.",
         }
 
+    # ── Authoritative language detection from the ACTUAL generated files ──────
+    # The LLM (or the fallback above) only *guesses* the language, and it can be
+    # wrong — e.g. picking "java" because the word appears in the requirement,
+    # then emitting a Maven Dockerfile (COPY pom.xml / COPY src) for a project
+    # that has no pom.xml or src/. We override that guess with what the files
+    # actually are, so the Dockerfile template always matches reality.
+    detected = _detect_language_from_files(generated_changes)
+    if detected and detected != (decision.get("language") or "").lower():
+        print(f"  [cicd] language override: LLM said "
+              f"'{decision.get('language')}', files indicate '{detected}' — "
+              f"using '{detected}'")
+        decision["language"] = detected
+    elif detected:
+        decision["language"] = detected
+
+    # Record whether a real build manifest is present, so the Dockerfile selector
+    # won't emit a Maven build (COPY pom.xml) for a "java" project that has no
+    # pom.xml — which is exactly the build failure this guards against.
+    _paths = [(c.get("file_path", "") or "").lower() for c in generated_changes]
+    decision["_has_pom"] = any(p == "pom.xml" or p.endswith("/pom.xml")
+                               or p.endswith("build.gradle") or p.endswith("build.gradle.kts")
+                               for p in _paths)
+    decision["_has_package_json"] = any(p == "package.json" or p.endswith("/package.json")
+                                        for p in _paths)
+
     # Sanitize: never generate files that already exist
     decision["needs_dockerfile"] = bool(decision.get("needs_dockerfile")) and not existing["has_dockerfile"]
     decision["needs_deploy_yaml"] = bool(decision.get("needs_deploy_yaml")) and not existing["has_deploy_yaml"]
     decision["needs_ci_cd_workflow"] = bool(decision.get("needs_ci_cd_workflow")) and not existing["has_github_workflow"]
     return decision
+
+
+def _detect_language_from_files(generated_changes: list) -> str:
+    """Determine the project language from the files actually generated, by
+    looking at build manifests first (most reliable) then file extensions.
+
+    Returns one of: 'java', 'node', 'python', 'go', 'csharp', 'static', or ''
+    (empty = couldn't tell, leave the existing decision alone).
+
+    Build-manifest signals are authoritative because they're what the
+    Dockerfile templates actually depend on (e.g. the Java template does
+    `COPY pom.xml` / `COPY src`, so we only call it Java if a pom.xml exists).
+    """
+    paths = [(c.get("file_path", "") or "").lower() for c in generated_changes]
+    if not paths:
+        return ""
+
+    def has(name: str) -> bool:
+        return any(p == name or p.endswith("/" + name) for p in paths)
+
+    def has_ext(*exts: str) -> bool:
+        return any(p.endswith(exts) for p in paths)
+
+    # 1) Build manifests — the strongest signal, and exactly what the templates need.
+    if has("pom.xml") or has("build.gradle") or has("build.gradle.kts"):
+        return "java"
+    if has("package.json"):
+        return "node"
+    if has("requirements.txt") or has("pyproject.toml") or has("setup.py"):
+        return "python"
+    if has("go.mod"):
+        return "go"
+    if any(p.endswith(".csproj") for p in paths):
+        return "csharp"
+
+    # 2) No manifest — fall back to file extensions (presence, not guess).
+    if has_ext(".java"):
+        return "java"
+    if has_ext(".py"):
+        return "python"
+    if has_ext(".ts", ".js", ".jsx", ".tsx"):
+        return "node"
+    if has_ext(".go"):
+        return "go"
+    if has_ext(".cs"):
+        return "csharp"
+    # Pure front-end assets with no server-side code → static site (nginx).
+    if has_ext(".html", ".htm") and not has_ext(".py", ".js", ".ts", ".java", ".go", ".cs"):
+        return "static"
+
+    return ""  # genuinely can't tell — don't override
 
 
 # ---------------------------------------------------------------------------
@@ -568,9 +644,22 @@ def _render_dockerfile(decision: dict) -> str:
     if language == "python":
         return PYTHON_DOCKERFILE.format(port=port, start_command=start_command)
     if language in ("node", "javascript", "typescript"):
-        return NODE_DOCKERFILE.format(port=port, start_command=start_command)
+        # The Node template runs `npm install`/build, which needs package.json.
+        if decision.get("_has_package_json", True):
+            return NODE_DOCKERFILE.format(port=port, start_command=start_command)
+        print("  [cicd] ⚠ language=node but no package.json found — "
+              "using static nginx Dockerfile instead (likely plain HTML/JS)")
+        return STATIC_DOCKERFILE.format(port=port or 80)
     if language == "java":
-        return JAVA_DOCKERFILE.format(port=port)
+        # The Java template does `COPY pom.xml` + `mvn package`, which only works
+        # if a Maven/Gradle build file was actually generated. Without one, that
+        # build fails ("/pom.xml: not found"). Fall back to a static nginx image
+        # so the deploy still succeeds rather than hard-failing on a missing pom.
+        if decision.get("_has_pom", True):
+            return JAVA_DOCKERFILE.format(port=port)
+        print("  [cicd] ⚠ language=java but no pom.xml/build.gradle found — "
+              "Maven build impossible; using static nginx Dockerfile instead")
+        return STATIC_DOCKERFILE.format(port=port or 80)
     # Fallback — generic Python (most common case in this codebase)
     return PYTHON_DOCKERFILE.format(port=port, start_command=start_command)
 
