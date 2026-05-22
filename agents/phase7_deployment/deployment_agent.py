@@ -106,11 +106,44 @@ def _utcnow() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
+# ---------------------------------------------------------------------------
+# Trace logging — make the deployment flow observable end-to-end so a failure
+# can be pinpointed to the exact step and repo.
+# ---------------------------------------------------------------------------
+
+def _trace_step(name: str) -> None:
+    """Mark entry into a deployment step (a graph node)."""
+    print(f"\n{'═' * 60}\n[Phase 7 ▶] {name}\n{'═' * 60}")
+
+
+def _trace_results(step: str, results: list) -> bool:
+    """Print a per-repo SUCCESS/FAILED summary for a step's results and return
+    True if all succeeded. Surfaces the error of any failed result so the
+    failure point is never hidden inside a returned dict."""
+    if not results:
+        print(f"  [{step}] no results (nothing to do)")
+        return True
+    all_ok = True
+    for r in results:
+        status = r.get("status", "UNKNOWN")
+        repo = r.get("repo", r.get("target", "?"))
+        if status in ("SUCCESS", "SKIPPED"):
+            print(f"  [{step}] ✅ {repo}: {status}")
+        else:
+            all_ok = False
+            print(f"  [{step}] ❌ {repo}: {status} — {r.get('error', 'no error detail')}")
+    print(f"  [{step}] overall: {'ALL OK' if all_ok else 'HAS FAILURES'}")
+    return all_ok
+
+
 def _load_cfg(state: DeploymentState) -> DeploymentConfig:
     """Load config, honoring caller's override of `dry_run`."""
     cfg = load_deployment_config(state.get("config_path"))
     if "dry_run" in state and state["dry_run"] is not None:
         cfg.dry_run = bool(state["dry_run"])
+    print(f"  [config] dry_run={cfg.dry_run} "
+          f"targets={list(cfg.deploy_targets)} "
+          f"registries={list(cfg.registries)}")
     return cfg
 
 
@@ -252,8 +285,10 @@ def resolve_deploy_sequence(state: DeploymentState) -> DeploymentState:
     # just want whatever's on main right now.
     merged_shas = state.get("merged_shas") or {}
     if merged_shas:
-        print(f"  📌 Pinning repos to merged SHAs from Phase 6: "
-              f"{', '.join(f"{k}={(v or '?')[:7]}" for k, v in merged_shas.items())}")
+        _sha_summary = ", ".join(
+            f"{k}={(v or '?')[:7]}" for k, v in merged_shas.items()
+        )
+        print(f"  📌 Pinning repos to merged SHAs from Phase 6: {_sha_summary}")
 
     # affected_repos from Phase 3 now carries full metadata (name, url, type, …)
     # enriched from Phase 0's selected_repos. Build a name→meta lookup so we can
@@ -336,12 +371,14 @@ def fetch_repos_node(state: DeploymentState) -> DeploymentState:
     repo's contract changed its `type`, re-sort the deploy_sequence.
     """
     from pathlib import Path
+    _trace_step("FETCH REPOS (git clone + read .deploy.yaml)")
     cfg = _load_cfg(state)
     repos = _repos_from_state(state)
+    print(f"  fetching {len(repos)} repo(s): {[r.name for r in repos]}")
 
     # 1) Clone everything
     results = fetch_repos(repos, cfg)
-    all_ok = all(r["status"] in ("SUCCESS", "SKIPPED") for r in results)
+    all_ok = _trace_results("fetch", results)
     if not all_ok:
         return {
             **state, "fetch_results": results,
@@ -416,10 +453,12 @@ def fetch_repos_node(state: DeploymentState) -> DeploymentState:
 
 
 def build_images_node(state: DeploymentState) -> DeploymentState:
+    _trace_step("BUILD IMAGES (docker build per repo)")
     cfg = _load_cfg(state)
     repos = _repos_from_state(state)
+    print(f"  building {len(repos)} image(s): {[r.name for r in repos]}")
     results = build_images(repos, cfg)
-    all_ok = all(r["status"] == "SUCCESS" for r in results)
+    all_ok = _trace_results("build", results)
     return {
         **state,
         "build_results": results,
@@ -430,15 +469,16 @@ def build_images_node(state: DeploymentState) -> DeploymentState:
 def registry_login_node(state: DeploymentState) -> DeploymentState:
     """Log in to every distinct registry referenced by the deploy sequence.
     Skips entirely if no repo declares a registry (e.g. compose-only deploys)."""
+    _trace_step("REGISTRY LOGIN")
     cfg = _load_cfg(state)
     repos = _repos_from_state(state)
     needs_login = any(r.registry and r.push and not r.skip for r in repos)
     if not needs_login:
-        print("\n[Phase 7] No registries configured — skipping login")
+        print("  No registries configured — skipping login")
         return {**state, "login_results": [], "status": "REGISTRY_LOGIN_SKIPPED"}
 
     results = registry_logins(repos, cfg)
-    all_ok = all(r["status"] == "SUCCESS" for r in results)
+    all_ok = _trace_results("registry-login", results)
     return {
         **state,
         "login_results": results,
@@ -447,10 +487,11 @@ def registry_login_node(state: DeploymentState) -> DeploymentState:
 
 
 def push_images_node(state: DeploymentState) -> DeploymentState:
+    _trace_step("PUSH IMAGES (docker push to registry)")
     cfg = _load_cfg(state)
     repos = _repos_from_state(state)
     results = push_images(repos, cfg)
-    all_ok = all(r["status"] in ("SUCCESS", "SKIPPED") for r in results)
+    all_ok = _trace_results("push", results)
     return {
         **state,
         "push_results": results,
@@ -518,7 +559,7 @@ def execute_deployment(state: DeploymentState) -> DeploymentState:
     blocking input() prompt — fine for CLI/dev use, NOT for production
     pipelines where approvals should be async. Marked TODO below.
     """
-    print("\n[Phase 7] Executing deployment...")
+    _trace_step("EXECUTE DEPLOYMENT (provision if needed + deploy to AWS)")
     cfg = _load_cfg(state)
     deploy_results: list = []
     all_ok = True
@@ -530,6 +571,10 @@ def execute_deployment(state: DeploymentState) -> DeploymentState:
         if repo is None:
             repo = cfg.get_repo(step["repo"])
             repo.repo_type = step["type"]
+
+        print(f"\n  ── deploying '{repo.name}' "
+              f"(type={repo.repo_type}, target={repo.deploy_target}, "
+              f"multi_env={bool(repo.environments)}) ──")
 
         if repo.environments:
             # Multi-env promotion path

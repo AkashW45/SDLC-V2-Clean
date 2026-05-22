@@ -111,6 +111,16 @@ def _run(
         "stderr": (proc.stderr or "").strip()[-2000:],
         "dry_run": False,
     }
+    # Always report the outcome so a failing command is never silent in the log.
+    # (Previously a failed command with check=False returned a dict whose error
+    # was never printed — making the trace "cut off" with no visible cause.)
+    if proc.returncode == 0:
+        print(f"    ✓ exit 0")
+    else:
+        print(f"    ✗ exit {proc.returncode}")
+        if result["stderr"]:
+            # Show the tail of stderr — this is the actual failure reason.
+            print(f"    ↳ stderr: {result['stderr'][-800:]}")
     if proc.returncode != 0 and check:
         raise RuntimeError(
             f"Command failed (exit {proc.returncode}): {pretty}\n"
