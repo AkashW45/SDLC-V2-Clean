@@ -583,6 +583,16 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
     if not approved:
         audit(thread_id, f"phase{current_phase}", "REJECTED", actor, {"feedback": feedback})
 
+        # Phase 7 production gate: rejecting must RESUME the paused deployment
+        # graph with approved=False (so it can skip deploy / take its rejection
+        # path) — not restart it via run_phase7.
+        if current_phase == "7":
+            entry["status"] = "PHASE_7_REJECTED"
+            entry["sub_stage"] = "Production deployment rejected"
+            save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
+            background_tasks.add_task(resume_phase7, thread_id, False, feedback)
+            return {"status": "REJECTED", "phase": "7"}
+
         # Shantanu's Surgical Replay applies only to Phase 1
         if current_phase == "1" and SURGICAL_REPLAY_ENABLED:
             target_artifact = extract_target_artifact(body)
@@ -610,6 +620,20 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
 
     # APPROVAL LOGIC
     audit(thread_id, f"phase{current_phase}", "APPROVED", actor, {"feedback": feedback})
+
+    # ── Phase 7 production gate ───────────────────────────────────────────────
+    # At WAITING_PHASE_7_APPROVAL the deployment graph is PAUSED at its
+    # human_approval_gate (interrupt_before). Approving must RESUME that paused
+    # graph so it continues into execute_deployment — NOT fall through to the
+    # next_phase logic below, which would compute next_phase="8", match no
+    # branch, and silently do nothing (the bug where approval didn't deploy).
+    if current_phase == "7":
+        entry["status"] = "PHASE_7_APPROVED"
+        entry["sub_stage"] = "Production approved — deploying..."
+        save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
+        background_tasks.add_task(resume_phase7, thread_id, True, feedback)
+        return {"status": "APPROVED", "phase": "7", "action": "deploying"}
+
     entry["status"] = f"PHASE_{current_phase}_APPROVED"
     entry["sub_stage"] = f"Phase {current_phase} approved — proceeding..."
     save_pipeline(thread_id, entry, _safe_state(entry.get("current_state", {})))
@@ -1848,6 +1872,81 @@ def run_phase7(thread_id: str, feedback: str = ""):
     except Exception as e:
         import traceback
         traceback.print_exc()   # so the real error shows in the uvicorn log
+        pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
+        save_pipeline(
+            thread_id,
+            pipeline_store[thread_id],
+            _safe_state(pipeline_store[thread_id].get("current_state", {})),
+        )
+
+
+def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
+    """Resume the PAUSED Phase 7 deployment graph past the human approval gate.
+
+    Phase 7's graph is compiled with interrupt_before=['human_approval_gate'],
+    so run_phase7 runs up to that gate and stops (WAITING_PHASE_7_APPROVAL).
+    Approving must RESUME that same interrupted graph — not start a new one.
+    The old code re-invoked run_phase7 on approval, which rebuilt the graph from
+    scratch and simply re-paused at the gate, so execute_deployment never ran
+    (the "approval does nothing" bug). Here we resume the stored graph with
+    Command(resume=...) via resume_deployment(), letting execution continue into
+    execute_deployment → monitor and actually deploy.
+    """
+    try:
+        from agents.phase7_deployment.deployment_agent import resume_deployment
+
+        entry = pipeline_store.get(thread_id, {})
+        graph = entry.get("graph")
+        config = entry.get("config")
+        if graph is None or config is None:
+            # No live graph in memory (e.g. the server restarted between pausing
+            # and approval). Fall back to a fresh run so the user isn't stuck —
+            # it'll re-pause at the gate, but it's not silently broken.
+            print("[Phase 7] ⚠ no paused graph in memory — falling back to run_phase7")
+            return run_phase7(thread_id, feedback)
+
+        if not approved:
+            pipeline_store[thread_id].update({
+                "status": "REJECTED",
+                "sub_stage": "Production deployment rejected",
+            })
+            save_pipeline(thread_id, pipeline_store[thread_id],
+                          _safe_state(entry.get("current_state", {})))
+            return
+
+        pipeline_store[thread_id].update({
+            "status": "PHASE_7_RUNNING",
+            "sub_stage": "Approved — executing deployment to AWS...",
+        })
+        save_pipeline(thread_id, pipeline_store[thread_id],
+                      _safe_state(entry.get("current_state", {})))
+
+        # Resume the interrupted graph — continues into execute_deployment.
+        result = resume_deployment(graph, config, approved=True, feedback=feedback)
+
+        state = entry.get("current_state", {})
+        merged = {**state}
+        for k in ("deploy_sequence", "feature_flags", "deploy_results",
+                  "monitoring_results", "rollback_triggered"):
+            if k in result:
+                merged[k] = result[k]
+
+        deploy_results = result.get("deploy_results", [])
+        deploy_ok = bool(deploy_results) and all(
+            r.get("status") in ("SUCCESS", "SKIPPED") for r in deploy_results
+        )
+        final_status = "PHASE_7_COMPLETE" if deploy_ok else "DEPLOY_FAILED"
+        sub = ("Deployment complete" if deploy_ok
+               else "Deployment failed — see deploy_results")
+        pipeline_store[thread_id].update({
+            "current_state": merged,
+            "status": final_status,
+            "sub_stage": sub,
+        })
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
         save_pipeline(
             thread_id,
