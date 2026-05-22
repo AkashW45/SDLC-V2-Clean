@@ -19,11 +19,13 @@ workspace_dir: /tmp/sdlc-deploy-workspace
 # Set true to log every git/docker/aws/HTTP call without actually running it.
 dry_run: false
 
-# Auto-install missing CLIs (docker, aws, etc.). ON by default now so
-# Phase 7 just works on fresh runners. The runner must have apt-get
-# (or another supported package manager) reachable for the install_command
-# of each CLI in `required_clis` below.
-cli_auto_install: true
+# CLIs (docker, aws, git) are now baked into the Docker image (see Dockerfile),
+# so runtime auto-install is OFF. If a CLI is somehow missing, Phase 7 should
+# fail loudly (pointing to an image-build problem) rather than silently trying
+# a runtime install that can half-succeed — e.g. installing the docker client
+# but not a working daemon. Set to true only if you run Phase 7 on a bare host
+# where installing CLIs at runtime is genuinely appropriate.
+cli_auto_install: false
 
 # ---------------------------------------------------------------------
 # How to find the git URL for a repo when it's not pre-declared below.
@@ -32,7 +34,9 @@ cli_auto_install: true
 # ---------------------------------------------------------------------
 repo_resolver:
   url_template: "https://github.com/{org}/{name}.git"
-  org: ${GITHUB_REPO_OWNER:-AkashW45}
+  # Org/owner for cloning repos to deploy. Defaults to the SDLC-V2-Team org.
+  # Set GITHUB_REPO_OWNER in .env to your org (or personal account) to override.
+  org: ${GITHUB_REPO_OWNER:-SDLC-V2-Team}
 
 # ---------------------------------------------------------------------
 # Platform defaults applied to every repo (unless overridden by the

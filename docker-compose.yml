@@ -21,7 +21,7 @@ services:
       - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
-      - NEO4J_dbms_default__listen__address=0.0.0.0 
+      - NEO4J_dbms_default__listen__address=0.0.0.0
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
@@ -60,7 +60,13 @@ services:
       - neo4j
     volumes:
       - ./repos:/repos
-    restart: unless-stopped  
+      # Mount the HOST's Docker daemon socket so Phase 7 can run `docker build`
+      # / `docker push` using the host's Docker engine. This is what lets a
+      # containerized app build images without running a daemon inside itself
+      # (which an unprivileged container can't do). The `docker` CLI inside this
+      # container talks to the host daemon over this socket.
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
 
 volumes:
   qdrant_data:

@@ -268,6 +268,25 @@ EXPOSE {port}
 CMD ["sh", "-c", "{start_command}"]
 """
 
+STATIC_DOCKERFILE = """\
+# syntax=docker/dockerfile:1
+# Static site (plain HTML/CSS/JS) served by nginx. A container must listen on a
+# port for ECS/App Runner to route traffic to it — a bare .html file can't be
+# "deployed" on its own, so we wrap it in a tiny nginx web server.
+FROM nginx:1.27-alpine
+
+# nginx listens on {port}
+RUN sed -i 's/listen\\s*80;/listen {port};/' /etc/nginx/conf.d/default.conf || true
+
+# Copy the site into nginx's web root. Works whether the static files are at the
+# repo root or under common build/output dirs.
+COPY . /usr/share/nginx/html
+
+EXPOSE {port}
+
+CMD ["nginx", "-g", "daemon off;"]
+"""
+
 NODE_DOCKERFILE = """\
 # syntax=docker/dockerfile:1
 FROM node:20-alpine AS builder
@@ -540,6 +559,12 @@ def _render_dockerfile(decision: dict) -> str:
     port = int(decision.get("container_port") or 8000)
     start_command = decision.get("start_command") or "echo 'no start_command set'"
 
+    # Static site: no application runtime, just files served by nginx. Detected
+    # either by an explicit language marker or a static deploy target.
+    if language in ("static", "html", "static-site") or \
+            (decision.get("deploy_target") or "") == "static-site":
+        # nginx defaults to port 80; for ECS we honor the chosen port.
+        return STATIC_DOCKERFILE.format(port=port or 80)
     if language == "python":
         return PYTHON_DOCKERFILE.format(port=port, start_command=start_command)
     if language in ("node", "javascript", "typescript"):
@@ -641,7 +666,10 @@ def generate_cicd_artifacts(
                         for c in generated_changes)
         )
         if not decision.get("deploy_target"):
-            decision["deploy_target"] = "static-site" if is_static_site else "ecs-prod"
+            # Everything deploys as a container to ECS now — including static
+            # sites, which ship as an nginx container. (No separate static-site
+            # target needs to exist.)
+            decision["deploy_target"] = "ecs-prod"
         if not decision.get("service_name"):
             decision["service_name"] = "service"
         # Force-fill any missing infra slot (sanitizer below still won't clobber
@@ -650,9 +678,13 @@ def generate_cicd_artifacts(
             decision["needs_deploy_yaml"] = True
         if not _existing["has_github_workflow"]:
             decision["needs_ci_cd_workflow"] = True
-        # A static site has no container; only force a Dockerfile for services.
-        if not is_static_site and not _existing["has_dockerfile"]:
+        # A static site is now deployed as an nginx CONTAINER on ECS, so it
+        # DOES need a Dockerfile (the nginx template). Force it on for greenfield
+        # static sites unless one already exists.
+        if not _existing["has_dockerfile"]:
             decision["needs_dockerfile"] = True
+        if is_static_site:
+            decision["language"] = "static"
         print(f"  [cicd] greenfield guarantee applied "
               f"(static_site={is_static_site}, target={decision['deploy_target']})")
 

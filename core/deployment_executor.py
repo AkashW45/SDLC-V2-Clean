@@ -801,34 +801,266 @@ def _aws_region_args(target: DeployTarget) -> List[str]:
     return ["--region", region] if region else []
 
 
+def _ecs_describe_json(cmd: List[str], env: Dict[str, str], dry_run: bool) -> Optional[dict]:
+    """Run an aws describe/list command and parse JSON stdout. Returns None on
+    any failure or in dry_run (caller treats None as 'not found / unknown')."""
+    r = _run(cmd, env=env, dry_run=dry_run, check=False, timeout=60)
+    if dry_run or r["returncode"] != 0:
+        return None
+    try:
+        return json.loads(r["stdout"])
+    except Exception:
+        return None
+
+
+def _ensure_ecs_infra(repo: RepoConfig, target: DeployTarget,
+                      config: DeploymentConfig, image: str) -> Dict[str, Any]:
+    """Create the minimum ECS infrastructure if it doesn't already exist, so a
+    brand-new account can deploy without manual setup.
+
+    SCOPE (deliberately minimal to limit blast radius):
+      - Reuses the account's DEFAULT VPC + its subnets (does NOT create a VPC,
+        subnets, gateways, or a load balancer).
+      - Creates, only if missing: a Fargate ECS cluster, a CloudWatch log group,
+        an execution IAM role (or reuses one named by config), a task definition,
+        a security group allowing the container port, and a Fargate service with
+        a public IP.
+    Every step is idempotent (check-then-create) and honours dry_run.
+
+    Returns {"ok": True, "task_def_arn": <arn or None>} on success, or a _fail
+    dict on error.
+    """
+    env = _aws_env(target)
+    region_args = _aws_region_args(target)
+    dry = config.dry_run
+    cluster = _opt(repo, target, "cluster", "sdlc-cluster")
+    service = _opt(repo, target, "service", repo.name)
+    container_port = int(_opt(repo, target, "container_port", 8000))
+    cpu = str(_opt(repo, target, "cpu", "256"))
+    memory = str(_opt(repo, target, "memory", "512"))
+    exec_role = _opt(repo, target, "execution_role_arn", "")
+    log_group = f"/ecs/{service}"
+
+    print(f"\n  [ecs-provision] ensuring infra for service='{service}' "
+          f"cluster='{cluster}' (dry_run={dry})")
+
+    # 1) Cluster — create if missing (create-cluster is idempotent: returns the
+    #    existing cluster if it already exists).
+    _run(["aws", "ecs", "create-cluster", "--cluster-name", cluster,
+          "--capacity-providers", "FARGATE", *region_args],
+         env=env, dry_run=dry, check=False, timeout=60)
+
+    # 2) CloudWatch log group — create if missing (ignore "already exists").
+    _run(["aws", "logs", "create-log-group", "--log-group-name", log_group,
+          *region_args], env=env, dry_run=dry, check=False, timeout=60)
+
+    # 3) Execution role — required so ECS can pull from ECR and write logs.
+    #    If the caller didn't supply one, reuse/create the AWS-conventional
+    #    'ecsTaskExecutionRole'. Creating IAM roles needs iam permissions; if
+    #    that fails we surface a clear message rather than a cryptic ECS error.
+    if not exec_role:
+        role_name = "ecsTaskExecutionRole"
+        got = _ecs_describe_json(
+            ["aws", "iam", "get-role", "--role-name", role_name],
+            env=env, dry_run=dry)
+        if got is None and not dry:
+            # Try to create it with the standard trust + managed policy.
+            trust = ('{"Version":"2012-10-17","Statement":[{"Effect":"Allow",'
+                     '"Principal":{"Service":"ecs-tasks.amazonaws.com"},'
+                     '"Action":"sts:AssumeRole"}]}')
+            create = _run(["aws", "iam", "create-role", "--role-name", role_name,
+                           "--assume-role-policy-document", trust],
+                          env=env, dry_run=dry, check=False, timeout=60)
+            if create["returncode"] != 0 and "EntityAlreadyExists" not in create.get("stderr", ""):
+                return _fail("ensure_ecs_infra",
+                             f"could not create execution role '{role_name}': "
+                             f"{create['stderr'][-300:]} — the IAM user needs "
+                             f"iam:CreateRole/AttachRolePolicy, or set "
+                             f"execution_role_arn in config.", repo=repo.name)
+            _run(["aws", "iam", "attach-role-policy", "--role-name", role_name,
+                  "--policy-arn",
+                  "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"],
+                 env=env, dry_run=dry, check=False, timeout=60)
+        # Resolve the ARN for the task definition.
+        if not dry:
+            role_json = _ecs_describe_json(
+                ["aws", "iam", "get-role", "--role-name", role_name],
+                env=env, dry_run=dry)
+            if role_json:
+                exec_role = role_json["Role"]["Arn"]
+        if not exec_role and not dry:
+            return _fail("ensure_ecs_infra",
+                         f"execution role '{role_name}' unavailable",
+                         repo=repo.name)
+
+    # 4) Default VPC subnets + a security group opening the container port.
+    subnets: List[str] = []
+    sg_id = ""
+    if not dry:
+        vpc_json = _ecs_describe_json(
+            ["aws", "ec2", "describe-vpcs", "--filters",
+             "Name=isDefault,Values=true", *region_args],
+            env=env, dry_run=dry)
+        vpc_id = ""
+        if vpc_json and vpc_json.get("Vpcs"):
+            vpc_id = vpc_json["Vpcs"][0]["VpcId"]
+        if not vpc_id:
+            return _fail("ensure_ecs_infra",
+                         "no default VPC found in this region. Either create a "
+                         "default VPC (aws ec2 create-default-vpc) or set "
+                         "subnets/security_group in config.", repo=repo.name)
+        sn_json = _ecs_describe_json(
+            ["aws", "ec2", "describe-subnets", "--filters",
+             f"Name=vpc-id,Values={vpc_id}", *region_args],
+            env=env, dry_run=dry)
+        subnets = [s["SubnetId"] for s in (sn_json or {}).get("Subnets", [])][:3]
+        if not subnets:
+            return _fail("ensure_ecs_infra",
+                         f"default VPC {vpc_id} has no subnets", repo=repo.name)
+
+        # Security group: reuse one named sdlc-<service>-sg or create it.
+        sg_name = f"sdlc-{service}-sg"
+        sg_json = _ecs_describe_json(
+            ["aws", "ec2", "describe-security-groups", "--filters",
+             f"Name=group-name,Values={sg_name}",
+             f"Name=vpc-id,Values={vpc_id}", *region_args],
+            env=env, dry_run=dry)
+        if sg_json and sg_json.get("SecurityGroups"):
+            sg_id = sg_json["SecurityGroups"][0]["GroupId"]
+        else:
+            created = _ecs_describe_json(
+                ["aws", "ec2", "create-security-group", "--group-name", sg_name,
+                 "--description", f"SDLC deploy SG for {service}",
+                 "--vpc-id", vpc_id, *region_args],
+                env=env, dry_run=dry)
+            sg_id = (created or {}).get("GroupId", "")
+            if sg_id:
+                _run(["aws", "ec2", "authorize-security-group-ingress",
+                      "--group-id", sg_id, "--protocol", "tcp",
+                      "--port", str(container_port), "--cidr", "0.0.0.0/0",
+                      *region_args], env=env, dry_run=dry, check=False, timeout=60)
+
+    # 5) Register a task definition for this image (Fargate).
+    task_def_arn: Optional[str] = None
+    td = {
+        "family": service,
+        "networkMode": "awsvpc",
+        "requiresCompatibilities": ["FARGATE"],
+        "cpu": cpu,
+        "memory": memory,
+        "executionRoleArn": exec_role or "ROLE_PLACEHOLDER",
+        "containerDefinitions": [{
+            "name": service,
+            "image": image,
+            "essential": True,
+            "portMappings": [{"containerPort": container_port, "protocol": "tcp"}],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": log_group,
+                    "awslogs-region": target.config.get("region", "us-east-1"),
+                    "awslogs-stream-prefix": "ecs",
+                },
+            },
+        }],
+    }
+    tmp_td = Path(config.workspace_dir) / f"{service}-taskdef.json"
+    tmp_td.parent.mkdir(parents=True, exist_ok=True)
+    tmp_td.write_text(json.dumps(td))
+    reg = _run(["aws", "ecs", "register-task-definition",
+                "--cli-input-json", f"file://{tmp_td}", *region_args],
+               env=env, dry_run=dry, check=False, timeout=60)
+    if reg["returncode"] != 0 and not dry:
+        return _fail("ensure_ecs_infra",
+                     f"register-task-definition failed: {reg['stderr'][-300:]}",
+                     repo=repo.name)
+    if not dry:
+        try:
+            task_def_arn = json.loads(reg["stdout"])["taskDefinition"]["taskDefinitionArn"]
+        except Exception:
+            pass
+
+    # 6) Service — create if missing, else the caller's update path handles it.
+    svc_json = _ecs_describe_json(
+        ["aws", "ecs", "describe-services", "--cluster", cluster,
+         "--services", service, *region_args], env=env, dry_run=dry)
+    svc_exists = bool(
+        svc_json and svc_json.get("services")
+        and svc_json["services"][0].get("status") == "ACTIVE"
+    )
+    if not svc_exists:
+        net_cfg = (
+            "awsvpcConfiguration={"
+            f"subnets=[{','.join(subnets)}],"
+            f"securityGroups=[{sg_id}],"
+            "assignPublicIp=ENABLED}"
+        ) if not dry else "awsvpcConfiguration={subnets=[...],securityGroups=[...],assignPublicIp=ENABLED}"
+        create_svc = _run(
+            ["aws", "ecs", "create-service", "--cluster", cluster,
+             "--service-name", service,
+             "--task-definition", task_def_arn or service,
+             "--desired-count", "1", "--launch-type", "FARGATE",
+             "--network-configuration", net_cfg, *region_args],
+            env=env, dry_run=dry, check=False, timeout=120)
+        if create_svc["returncode"] != 0 and not dry:
+            return _fail("ensure_ecs_infra",
+                         f"create-service failed: {create_svc['stderr'][-300:]}",
+                         repo=repo.name)
+        print(f"  [ecs-provision] created service '{service}'")
+        return {"ok": True, "task_def_arn": task_def_arn, "created_service": True}
+
+    return {"ok": True, "task_def_arn": task_def_arn, "created_service": False}
+
+
 def _deploy_ecs(repo: RepoConfig, target: DeployTarget,
                 config: DeploymentConfig) -> Dict[str, Any]:
-    """ECS deployment via aws CLI.
+    """ECS (Fargate) deployment via aws CLI, with create-if-missing infra.
 
-    Strategy:
-      1. If `task_definition_template` is set, render it (substituting
-         {image}/{repo}/{tag}/{commit}), register a new task def revision,
-         then `update-service` pointing at the new revision. Immutable image
-         refs, real audit log.
-      2. Otherwise, just `update-service --force-new-deployment` against the
-         existing task def (assumes a mutable tag like `:latest`).
-    Then optionally wait on `services-stable`.
+    If `auto_provision` is enabled (default True), missing infra — cluster,
+    execution role, task definition, security group, and the Fargate service —
+    is created automatically using the account's DEFAULT VPC/subnets. No VPC,
+    gateways, or load balancer are created. Then:
+      - first deploy: the service is created already pointing at the new image.
+      - later deploys: update-service --force-new-deployment (optionally with a
+        freshly registered task def revision).
     """
-    cluster = _opt(repo, target, "cluster")
+    cluster = _opt(repo, target, "cluster", "sdlc-cluster")
     service = _opt(repo, target, "service", repo.name)
-    if not cluster:
-        return _fail("trigger_deploy", "ecs target needs `cluster` "
-                                       "(in target.config or repo's .deploy.yaml `deploy:` block)",
-                     repo=repo.name)
 
     registry = config.get_registry(repo.registry) if repo.registry else None
     image = _registry_qualified_image(repo, registry)
     env = _aws_env(target)
     region_args = _aws_region_args(target)
 
-    new_task_def_arn: Optional[str] = None
+    auto_provision = bool(_opt(repo, target, "auto_provision", True))
+    provisioned_task_def: Optional[str] = None
+    just_created_service = False
+    if auto_provision:
+        infra = _ensure_ecs_infra(repo, target, config, image)
+        if not infra.get("ok"):
+            return infra  # already a _fail dict
+        provisioned_task_def = infra.get("task_def_arn")
+        just_created_service = infra.get("created_service", False)
+
+    # If provisioning just created the service, it's already running the new
+    # image — no update needed (and update-service would race the creation).
+    if just_created_service:
+        if _opt(repo, target, "wait_for_stable", True):
+            _run(["aws", "ecs", "wait", "services-stable",
+                  "--cluster", cluster, "--services", service, *region_args],
+                 env=env, dry_run=config.dry_run, check=False, timeout=900)
+        return _ok("trigger_deploy", repo=repo.name, target=target.name,
+                   kind="ecs", cluster=cluster, service=service, image=image,
+                   task_definition_arn=provisioned_task_def, created=True)
+
+    if not cluster:
+        return _fail("trigger_deploy", "ecs target needs `cluster` "
+                                       "(in target.config or repo's .deploy.yaml `deploy:` block)",
+                     repo=repo.name)
+
+    new_task_def_arn: Optional[str] = provisioned_task_def
     td_template_path = _opt(repo, target, "task_definition_template")
-    if td_template_path:
+    if td_template_path and not new_task_def_arn:
         # Render the template. We use plain str.replace (not str.format)
         # because the template is JSON — every `{` and `}` in JSON would
         # otherwise be parsed as a format placeholder.
