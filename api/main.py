@@ -1937,7 +1937,7 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
         # The dashboard's TERMINAL_STATUSES recognizes PHASE_7_COMPLETE as the
         # finished state (NOT DEPLOYMENT_COMPLETE), so we must set exactly that
         # for the UI to stop showing "in progress".
-        final_status = "DEPLOYMENT_COMPLETE" if deploy_ok else "DEPLOY_FAILED"
+        final_status = "PHASE_7_COMPLETE" if deploy_ok else "DEPLOY_FAILED"
         sub = ("Deployment complete" if deploy_ok
                else "Deployment failed — see deploy_results")
         pipeline_store[thread_id].update({
