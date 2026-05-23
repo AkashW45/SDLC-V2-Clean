@@ -496,6 +496,7 @@
 
   const TERMINAL_STATUSES = new Set([
     'PIPELINE_COMPLETE', 'DEPLOYMENT_COMPLETE', 'PHASE_7_COMPLETE',
+    'DEPLOY_FAILED', 'ROLLED_BACK',   // ← missing
     'ERROR', 'REJECTED', 'PIPELINE_REJECTED'
   ]);
 
@@ -599,10 +600,22 @@
     const p = activePipelines[selectedThread];
     if (!p) return;
 
-    // FIX 2a — Terminal states never change again
+    // FIX 2a — Terminal states never change again, so we stop polling. But we
+    // MUST render the final state first. This early-return runs at the TOP of
+    // the next poll using last poll's status — so the poll that first observed
+    // the terminal status returned through the 200 branch below (which renders),
+    // but if that render was ever skipped (e.g. a 304 race, or the terminal
+    // status arrived via the other poll loop), the spinner from the running
+    // state would be stranded on screen forever. Rendering here guarantees the
+    // finished UI is painted on whatever poll first lands here terminal —
+    // exactly the same reasoning as the waiting-state branch (2b) below.
     if (TERMINAL_STATUSES.has(p.status)) {
       document.getElementById('poll-time').textContent =
               'Pipeline ' + p.status.toLowerCase() + ' — polling stopped';
+      renderSidebar();
+      renderPipelineBar();
+      renderContent();
+      pollingPaused = true;
       return;
     }
 
@@ -647,6 +660,19 @@
         document.getElementById('poll-time').textContent =
                 'Last poll: ' + new Date().toLocaleTimeString() + ' (304 — no change)' +
                 (pollIntervalMs > POLL_BASE_MS ? ', slowed to ' + (pollIntervalMs/1000) + 's' : '');
+        // Safety net: a 304 means "your cached body is current". If that cached
+        // body is already a terminal status, the running-state spinner must not
+        // be left on screen. Render the final state and stop polling. Without
+        // this, a 304 arriving right after completion (e.g. the other poll loop
+        // cached the completed ETag) would return here without ever painting
+        // the done UI — the exact stuck-spinner-after-success symptom.
+        const cur304 = activePipelines[selectedThread];
+        if (cur304 && TERMINAL_STATUSES.has(cur304.status)) {
+          renderSidebar();
+          renderPipelineBar();
+          renderContent();
+          pollingPaused = true;
+        }
         return;
       }
 
@@ -760,7 +786,7 @@
     if (activePollTimer) clearTimeout(activePollTimer);
     activePollTimer = setTimeout(async () => {
       await pollActiveOnly();
-      scheduleActivePoll(pollIntervalMs);
+      if (!pollingPaused) scheduleActivePoll(pollIntervalMs);
     }, delayMs);
   }
 
@@ -825,7 +851,10 @@
     if (approvalWatchTimer) clearTimeout(approvalWatchTimer);
     approvalWatchTimer = setTimeout(async () => {
       await watchForApproval();
-      scheduleApprovalWatch(APPROVAL_WATCH_MS);
+      const p = activePipelines[selectedThread];
+      if (!p || !TERMINAL_STATUSES.has(p.status)) {  // ← stop if terminal
+        scheduleApprovalWatch(APPROVAL_WATCH_MS);
+      }
     }, delayMs);
   }
 
@@ -946,7 +975,10 @@
     const state = p.current_state || {};
     const isWaiting = status.includes('WAITING');
     const isRunning = status.includes('RUNNING');
-    const isComplete = status === 'PIPELINE_COMPLETE';
+    const isComplete =
+            status === 'PIPELINE_COMPLETE' ||
+            status === 'PHASE_7_COMPLETE' ||
+            status === 'DEPLOYMENT_COMPLETE';
     const isError = status === 'ERROR';
 
     let html = `
@@ -1544,13 +1576,46 @@
     }
 
     // ── PHASE 7 — Deployment ────────────────────────────────────
-    const showPhase7 = p.phase === 7 || status.includes('PHASE_7') || status === 'DEPLOYMENT_COMPLETE' || status === 'WAITING_PHASE_7_APPROVAL';
+    // Must remain TRUE after completion. On success the backend sets
+    // status='PIPELINE_COMPLETE' AND phase=8 — so `p.phase === 7` and the
+    // 'PHASE_7'/'WAITING_PHASE_7' checks all go false. Without the terminal
+    // statuses below, the whole Phase 7 panel (and its "✓ Done" block) would
+    // stop rendering the instant it finished, leaving whatever was last painted
+    // (the spinner) on screen. Include every terminal/late status here.
+    const showPhase7 = p.phase === 7 || p.phase === 8 ||
+            status.includes('PHASE_7') ||
+            status === 'DEPLOYMENT_COMPLETE' || status === 'PIPELINE_COMPLETE' ||
+            status === 'DEPLOY_FAILED' || status === 'ROLLED_BACK' ||
+            status === 'WAITING_PHASE_7_APPROVAL';
     if (showPhase7) {
       const needsApproval = status === 'WAITING_PHASE_7_APPROVAL';
-      html += sectionHeader('07', 'Deployment', needsApproval);
 
-      // LIVE sub-stage indicator
-      if (p.phase === 7 && isRunning) {
+      // Phase 7 has THREE real states, not two. The generic sectionHeader only
+      // knows "awaiting approval" vs "✓ DONE", so the moment you approved it
+      // flipped straight to "✓ DONE" while deployment was still running — the
+      // contradictory "DONE badge + spinning spinner" in the bug report.
+      // Compute the true badge here and pass it in explicitly.
+      const deployFailed = status === 'DEPLOY_FAILED' || status === 'ROLLED_BACK';
+      const deployDone = isComplete;                 // PIPELINE_COMPLETE / *_COMPLETE
+      // "deploying" = past approval, not yet terminal.
+      const deploying = !needsApproval && !deployDone && !deployFailed &&
+              (status.includes('PHASE_7') || status === 'PHASE_7_APPROVED' || isRunning);
+
+      let badge;
+      if (needsApproval)   badge = { text: '⏸ AWAITING APPROVAL', warn: true };
+      else if (deployFailed) badge = { text: '✗ FAILED', danger: true };
+      else if (deploying)  badge = { text: '⏳ DEPLOYING', running: true };
+      else if (deployDone) badge = { text: '✓ DONE', done: true };
+      else                 badge = { text: '… PENDING', running: true };
+
+      html += sectionHeader('07', 'Deployment', needsApproval, badge);
+
+      // LIVE sub-stage indicator — show ONLY while genuinely deploying, never
+      // once a terminal status (complete OR failed) has arrived. Previously
+      // this keyed only off `isRunning`; pairing it with the explicit
+      // `deploying` flag (and excluding terminal states) means the spinner
+      // disappears the instant the backend reports completion or failure.
+      if (deploying) {
         html += `<div style="background:linear-gradient(135deg,rgba(0,212,255,0.08),rgba(0,255,136,0.05));border:1px solid var(--accent);border-radius:8px;padding:14px;margin-bottom:14px">
         <div style="display:flex;align-items:center;gap:10px">
           <div class="spinner"></div>
@@ -1558,6 +1623,20 @@
             <div style="font-size:9px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase">Phase 7 · Live</div>
             <div style="font-size:12px;color:var(--accent);font-weight:700;margin-top:2px">${p.sub_stage || 'Working...'}</div>
           </div>
+        </div>
+      </div>`;
+      } else if (deployDone) {
+        html += `<div style="background:rgba(0,255,136,0.06);border:1px solid var(--accent);border-radius:8px;padding:14px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:18px">✅</span>
+          <div style="font-size:12px;color:var(--accent);font-weight:700">Deployment completed successfully</div>
+        </div>
+      </div>`;
+      } else if (deployFailed) {
+        html += `<div style="background:rgba(255,77,79,0.06);border:1px solid var(--danger);border-radius:8px;padding:14px;margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:18px">❌</span>
+          <div style="font-size:12px;color:var(--danger);font-weight:700">${status === 'ROLLED_BACK' ? 'Deployment rolled back' : 'Deployment failed — see deploy results'}</div>
         </div>
       </div>`;
       }
@@ -1652,16 +1731,32 @@
   }
   // ── UI Helpers ──────────────────────────────────────────────────────
 
-  function sectionHeader(num, title, needsApproval) {
+  function sectionHeader(num, title, needsApproval, badge) {
+    // `badge` is optional. When omitted (every caller except Phase 7), fall
+    // back to the original two-state behavior so nothing else changes.
+    if (!badge) {
+      badge = needsApproval
+              ? { text: '⏸ AWAITING APPROVAL', warn: true }
+              : { text: '✓ DONE', done: true };
+    }
+    const bg = badge.warn   ? 'rgba(240,165,0,0.15)'
+            : badge.danger ? 'rgba(255,77,79,0.15)'
+                    : badge.running? 'rgba(0,212,255,0.15)'
+                            :                'rgba(0,255,136,0.1)';
+    const fg = badge.warn   ? 'var(--warn)'
+            : badge.danger ? 'var(--danger)'
+                    : badge.running? 'var(--blue)'
+                            :                'var(--accent)';
+    const borderWarn = needsApproval ? 'rgba(240,165,0,0.4)' : 'var(--border)';
     return `
-    <div style="background:var(--surface);border:1px solid ${needsApproval ? 'rgba(240,165,0,0.4)' : 'var(--border)'};border-radius:8px;padding:20px;margin-bottom:16px">
+    <div style="background:var(--surface);border:1px solid ${borderWarn};border-radius:8px;padding:20px;margin-bottom:16px">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
         <div style="display:flex;align-items:center;gap:10px">
           <div style="background:var(--surface3);border-radius:6px;padding:4px 10px;font-size:10px;color:var(--text2);font-weight:700">${num}</div>
           <div style="font-family:'Syne',sans-serif;font-size:15px;font-weight:700">${title}</div>
         </div>
-        <span style="font-size:9px;padding:3px 8px;border-radius:3px;font-weight:700;background:${needsApproval ? 'rgba(240,165,0,0.15)' : 'rgba(0,255,136,0.1)'};color:${needsApproval ? 'var(--warn)' : 'var(--accent)'}">
-          ${needsApproval ? '⏸ AWAITING APPROVAL' : '✓ DONE'}
+        <span style="font-size:9px;padding:3px 8px;border-radius:3px;font-weight:700;background:${bg};color:${fg}">
+          ${badge.text}
         </span>
       </div>`;
   }

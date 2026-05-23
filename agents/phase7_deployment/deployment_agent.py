@@ -519,8 +519,10 @@ def setup_feature_flags(state: DeploymentState) -> DeploymentState:
 
 
 def human_approval_gate(state: DeploymentState) -> DeploymentState:
-    """Hard interrupt — graph is compiled with interrupt_before on this node,
-    so execution pauses here until resume_deployment() is called."""
+    """Dynamic interrupt — execution pauses at the interrupt() call below until
+    resume_deployment() resumes with Command(resume={"approved": ..., ...}).
+    The graph uses ONLY this interrupt() (no interrupt_before) so resume cleanly
+    delivers the human payload here; see build_deployment_graph() for why."""
     print("\n[Phase 7] ⏸ Awaiting production deployment approval...")
     print(f"  Deploy sequence: {[s['repo'] for s in state.get('deploy_sequence', [])]}")
     print(f"  Feature flags: {[f['flag_name'] for f in state.get('feature_flags', [])]}")
@@ -867,14 +869,25 @@ def build_deployment_graph():
     builder.add_edge("execute_rollback", END)
 
     memory = MemorySaver()
-    # The previous code both compiled with `interrupt_before=[...]` AND called
-    # `interrupt(...)` inside the same node — that double-pauses. We keep
-    # interrupt_before only; the inner `interrupt(...)` still works at resume
-    # time to extract the human payload via Command(resume=...).
-    return builder.compile(
-        checkpointer=memory,
-        interrupt_before=["human_approval_gate"],
-    )
+    # SINGLE interrupt mechanism — this was the stuck-spinner bug.
+    #
+    # The old code compiled with `interrupt_before=["human_approval_gate"]` AND
+    # the node body called `interrupt(...)`. That double-pauses on resume:
+    #   1. invoke(initial)            → pauses BEFORE the node (interrupt_before)
+    #   2. invoke(Command(resume=..)) → enters the node, the resume payload is
+    #      consumed by the interrupt_before machinery, then the body hits
+    #      interrupt(...) for the FIRST time and pauses AGAIN — still parked at
+    #      human_approval_gate, `approved` never set, execute_deployment never
+    #      runs. The pipeline status stayed PHASE_7_RUNNING forever, so the
+    #      dashboard spinner ("executing deployment to AWS...") never cleared.
+    #
+    # Fix: keep ONLY the dynamic interrupt() inside the node. The first
+    # invoke(initial) still pauses at that interrupt() (so run_phase7's
+    # WAITING_PHASE_7_APPROVAL pause is preserved), and invoke(Command(resume=..))
+    # now delivers {approved, feedback} straight into `human_input`, the node
+    # finishes, route_after_approval sends it to execute_deployment, and the
+    # graph runs to a terminal status — clearing the spinner.
+    return builder.compile(checkpointer=memory)
 
 
 # ---------------------------------------------------------------------------
