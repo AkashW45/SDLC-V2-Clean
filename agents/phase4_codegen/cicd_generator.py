@@ -370,7 +370,14 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --only=production
+# Use `npm ci` only when a lockfile exists (it requires one); otherwise fall
+# back to `npm install`. `--omit=dev` is the modern replacement for the removed
+# `--only=production` flag (npm 9+ errors on the old flag, dumping help text).
+RUN if [ -f package-lock.json ]; then \\
+        npm ci --omit=dev; \\
+    else \\
+        npm install --omit=dev; \\
+    fi
 
 COPY . .
 
@@ -589,7 +596,7 @@ LANG_SETUP_NODE = """\
           cache: npm
 
       - name: Install Node deps
-        run: npm ci
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
 """
 
 LANG_SETUP_JAVA = """\
