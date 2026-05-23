@@ -1932,9 +1932,18 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
                 merged[k] = result[k]
 
         deploy_results = result.get("deploy_results", [])
-        deploy_ok = bool(deploy_results) and all(
-            r.get("status") in ("SUCCESS", "SKIPPED") for r in deploy_results
+        # A deploy is OK if the graph reported overall success OR every per-repo
+        # deploy result is SUCCESS/SKIPPED. We check BOTH because the per-repo
+        # results list and the graph's own status are populated differently.
+        graph_status = result.get("status", "")
+        deploy_ok = (
+                graph_status in ("DEPLOYMENT_COMPLETE", "PHASE_7_COMPLETE")
+                or (bool(deploy_results) and all(
+            r.get("status") in ("SUCCESS", "SKIPPED") for r in deploy_results))
         )
+        # The dashboard's TERMINAL_STATUSES recognizes PHASE_7_COMPLETE as the
+        # finished state (NOT DEPLOYMENT_COMPLETE), so we must set exactly that
+        # for the UI to stop showing "in progress".
         final_status = "PHASE_7_COMPLETE" if deploy_ok else "DEPLOY_FAILED"
         sub = ("Deployment complete" if deploy_ok
                else "Deployment failed — see deploy_results")
