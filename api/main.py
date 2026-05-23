@@ -751,13 +751,6 @@ def pipeline_resume(
 
     return {"thread_id": thread_id, "status": "RESUMED", "resuming_from_phase": phase}
 
-@app.get("/pipeline/list")
-def pipeline_list():
-    return {
-        "pipelines": [{"thread_id": tid, "phase": e.get("phase", ""), "status": e.get("status", "")} for tid, e in pipeline_store.items()],
-        "total": len(pipeline_store)
-    }
-
 @app.delete("/pipeline/{thread_id}")
 def pipeline_delete(thread_id: str):
     if thread_id not in pipeline_store:
@@ -1944,7 +1937,7 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
         # The dashboard's TERMINAL_STATUSES recognizes PHASE_7_COMPLETE as the
         # finished state (NOT DEPLOYMENT_COMPLETE), so we must set exactly that
         # for the UI to stop showing "in progress".
-        final_status = "PHASE_7_COMPLETE" if deploy_ok else "DEPLOY_FAILED"
+        final_status = "DEPLOYMENT_COMPLETE" if deploy_ok else "DEPLOY_FAILED"
         sub = ("Deployment complete" if deploy_ok
                else "Deployment failed — see deploy_results")
         pipeline_store[thread_id].update({
@@ -1952,6 +1945,9 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
             "status": final_status,
             "sub_stage": sub,
         })
+
+        pipeline_store[thread_id]["graph"] = None
+        pipeline_store[thread_id]["config"] = None
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
     except Exception as e:
         import traceback
