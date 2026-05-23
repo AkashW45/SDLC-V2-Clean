@@ -13,7 +13,7 @@
 # `${VAR}` and `${VAR:-default}` are expanded from env at load time.
 # =====================================================================
 
-project_name: leave-mgmt
+project_name: sdlc-development
 workspace_dir: /tmp/sdlc-deploy-workspace
 
 # Set true to log every git/docker/aws/HTTP call without actually running it.
@@ -112,7 +112,7 @@ deploy_targets:
       access_key_id: ${AWS_ACCESS_KEY_ID}
       secret_access_key: ${AWS_SECRET_ACCESS_KEY}
       region: ${AWS_REGION:-us-east-1}
-      cluster: leave-mgmt-cluster
+      cluster: sdlc-development-cluster
       # service is omitted here — repos provide their own via .deploy.yaml
       wait_for_stable: true
 
