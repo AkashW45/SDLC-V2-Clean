@@ -107,8 +107,12 @@ def _run(
     result = {
         "cmd": pretty,
         "returncode": proc.returncode,
-        "stdout": (proc.stdout or "").strip()[-2000:],   # cap for state size
-        "stderr": (proc.stderr or "").strip()[-2000:],
+        # Keep the FULL stdout/stderr — callers parse this as JSON (e.g.
+        # describe-subnets returns >2000 chars, and truncating it produced
+        # invalid JSON → "no subnets" false failures). Truncation is applied
+        # only when DISPLAYING below, never to the stored value.
+        "stdout": (proc.stdout or "").strip(),
+        "stderr": (proc.stderr or "").strip(),
         "dry_run": False,
     }
     # Always report the outcome so a failing command is never silent in the log.
@@ -119,12 +123,13 @@ def _run(
     else:
         print(f"    ✗ exit {proc.returncode}")
         if result["stderr"]:
-            # Show the tail of stderr — this is the actual failure reason.
+            # Show only the tail of stderr in the log — this is the actual
+            # failure reason (the full value is preserved in result for callers).
             print(f"    ↳ stderr: {result['stderr'][-800:]}")
     if proc.returncode != 0 and check:
         raise RuntimeError(
             f"Command failed (exit {proc.returncode}): {pretty}\n"
-            f"stderr: {result['stderr']}"
+            f"stderr: {result['stderr'][-2000:]}"
         )
     return result
 
