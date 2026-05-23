@@ -623,21 +623,33 @@
     // until someone clicks approve/reject IN THIS TAB. The click handler
     // (approvePipeline) already schedules a refresh — no timer needed.
     //
-    // IMPORTANT: we must still RENDER before returning. The transition INTO a
-    // waiting state can happen while the tab is hidden (polling is paused), so
-    // the normal change-detection branch below never ran for it. When the user
-    // returns, the resume poll lands here with status already == WAITING_* — if
-    // we returned without rendering, the approval zone (and its popup) would
-    // never appear. Rendering here makes the approval UI show on any poll that
-    // observes a waiting state, not only the one that caught the live change.
+    // IMPORTANT: we must still RENDER before returning, AND we must render from
+    // FRESH state. This branch keys off `p.status` captured at the top of the
+    // poll, which may have been advanced to WAITING_* by the lightweight
+    // approval watcher that copies status without the full `current_state`.
+    // Rendering straight from `p` could therefore paint the approval zone with
+    // a stale/empty deploy_sequence (the "approval shown, sequence missing"
+    // bug). So do ONE full fetch here to pull in current_state (deploy_sequence,
+    // feature_flags) before rendering. This is cheap — it happens at most once
+    // per entry into the waiting state, then we return and stop polling.
     if (WAITING_STATUSES.has(p.status)) {
+      try {
+        const rw = await fetch(`${API}/pipeline/status/${selectedThread}`);
+        if (rw.ok) {
+          const dw = await rw.json();
+          activePipelines[selectedThread] = { ...activePipelines[selectedThread], ...dw };
+          const ew = rw.headers.get('ETag');
+          if (ew) lastPipelineStatusETag = ew;
+        }
+      } catch (e) { /* fall back to whatever local state we have */ }
+      const pw = activePipelines[selectedThread];
       document.getElementById('poll-time').textContent =
               'Awaiting approval — polling paused';
-      lastPipelineSignature = pipelineSignature(p);  // keep change-detect in sync
+      lastPipelineSignature = pipelineSignature(pw);  // keep change-detect in sync
       renderSidebar();
       renderPipelineBar();
       renderContent();
-      maybeNotifyApproval(p);  // fire the popup/notification if not already shown
+      maybeNotifyApproval(pw);  // fire the popup/notification if not already shown
       return;
     }
 
@@ -825,13 +837,32 @@
       const r = await fetch(`${API}/pipeline/status/${selectedThread}`);
       if (!r.ok) return;
       const d = await r.json();
-      // Keep local state fresh enough that a later render shows the right thing,
-      // but do NOT touch ETag/backoff/signature state owned by the UI poller.
+      // Merge the FULL payload into local state — not just status/phase. The
+      // earlier version copied only those two fields "to keep state fresh",
+      // but that dropped `current_state` (which carries deploy_sequence and
+      // feature_flags). Because this watcher runs every 5s and is never paused
+      // while the main UI poller backs off to as slow as 30s during the long
+      // build/push prep, the watcher is usually the FIRST loop to observe
+      // WAITING_PHASE_7_APPROVAL. If it advances status to "waiting" without
+      // also bringing in the resolved deploy_sequence, the approval zone renders
+      // with an empty sequence — the "approval shown but deployment sequence not
+      // shown" bug. Merging the whole payload (then rendering) fixes that, and
+      // it deliberately does NOT touch the poller-owned ETag/backoff/signature
+      // vars, so the two loops still don't fight over those.
       if (activePipelines[selectedThread]) {
-        activePipelines[selectedThread].status = d.status || activePipelines[selectedThread].status;
-        activePipelines[selectedThread].phase = (d.phase != null) ? d.phase : activePipelines[selectedThread].phase;
+        activePipelines[selectedThread] = { ...activePipelines[selectedThread], ...d };
+      } else {
+        activePipelines[selectedThread] = d;
       }
       if (d && WAITING_STATUSES.has(d.status)) {
+        // Render so the freshly-merged deploy_sequence/feature_flags appear
+        // alongside the approval zone, even though the slow UI poller hasn't
+        // ticked yet.
+        if (selectedThread) {
+          renderSidebar();
+          renderPipelineBar();
+          renderContent();
+        }
         maybeNotifyApproval({ thread_id: selectedThread, status: d.status, phase: d.phase });
       } else if (d) {
         // Left the waiting state — clear this thread's flags so a future
