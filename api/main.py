@@ -480,10 +480,12 @@ def pipeline_status(thread_id: str,
 
     entry = pipeline_store[thread_id]
     safe = _safe_state(entry.get("current_state", {}))
+    _status = entry.get("status", "")
+    _TERMINAL_STATUSES = {"PIPELINE_COMPLETE", "DEPLOY_FAILED", "ROLLED_BACK", "REJECTED", "ERROR"}
     payload = {
         "thread_id": thread_id,
         "phase": entry.get("phase", ""),
-        "status": entry.get("status", ""),
+        "status": _status,
         "sub_stage": entry.get("sub_stage", ""),
         "requirement": entry.get("requirement", ""),
         "pr_urls": entry.get("pr_urls", []),
@@ -492,7 +494,8 @@ def pipeline_status(thread_id: str,
         "selected_project": safe.get("selected_project", {}),
         "selected_repos": safe.get("selected_repos", []),
         "target_repo": safe.get("target_repo", ""),
-        "current_state": safe
+        "current_state": safe,
+        "is_complete": _status in _TERMINAL_STATUSES,
     }
 
     # ── ETag handling ────────────────────────────────────────────────────
@@ -536,6 +539,7 @@ def pipeline_list(request: Request, response: Response, user_id: str = Depends(g
         rows = cur.fetchall()
         cur.close()
 
+    _TERMINAL_STATUSES = {"PIPELINE_COMPLETE", "DEPLOY_FAILED", "ROLLED_BACK", "REJECTED", "ERROR"}
     payload = [
         {
             "thread_id": r[0],
@@ -544,6 +548,7 @@ def pipeline_list(request: Request, response: Response, user_id: str = Depends(g
             "sub_stage": r[3] or "",
             "phase": r[4] or "",
             "updated_at": str(r[5]) if r[5] else "",
+            "is_complete": (r[2] or "") in _TERMINAL_STATUSES,
         }
         for r in rows
     ]
@@ -750,13 +755,6 @@ def pipeline_resume(
     elif phase == 7: background_tasks.add_task(run_phase7, thread_id, "")
 
     return {"thread_id": thread_id, "status": "RESUMED", "resuming_from_phase": phase}
-
-@app.get("/pipeline/list")
-def pipeline_list():
-    return {
-        "pipelines": [{"thread_id": tid, "phase": e.get("phase", ""), "status": e.get("status", "")} for tid, e in pipeline_store.items()],
-        "total": len(pipeline_store)
-    }
 
 @app.delete("/pipeline/{thread_id}")
 def pipeline_delete(thread_id: str):
@@ -1892,20 +1890,24 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
     Command(resume=...) via resume_deployment(), letting execution continue into
     execute_deployment → monitor and actually deploy.
     """
+    print(f"\n{'='*60}\n[resume_phase7] START thread={thread_id} approved={approved}\n{'='*60}")
     try:
         from agents.phase7_deployment.deployment_agent import resume_deployment
 
         entry = pipeline_store.get(thread_id, {})
         graph = entry.get("graph")
         config = entry.get("config")
+        print(f"[resume_phase7] graph_present={graph is not None} "
+              f"config_present={config is not None}")
         if graph is None or config is None:
             # No live graph in memory (e.g. the server restarted between pausing
             # and approval). Fall back to a fresh run so the user isn't stuck —
             # it'll re-pause at the gate, but it's not silently broken.
-            print("[Phase 7] ⚠ no paused graph in memory — falling back to run_phase7")
+            print("[resume_phase7] ⚠ no paused graph in memory — falling back to run_phase7")
             return run_phase7(thread_id, feedback)
 
         if not approved:
+            print("[resume_phase7] rejected → setting REJECTED")
             pipeline_store[thread_id].update({
                 "status": "REJECTED",
                 "sub_stage": "Production deployment rejected",
@@ -1914,6 +1916,7 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
                           _safe_state(entry.get("current_state", {})))
             return
 
+        print("[resume_phase7] setting PHASE_7_RUNNING, about to resume graph...")
         pipeline_store[thread_id].update({
             "status": "PHASE_7_RUNNING",
             "sub_stage": "Approved — executing deployment to AWS...",
@@ -1922,7 +1925,11 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
                       _safe_state(entry.get("current_state", {})))
 
         # Resume the interrupted graph — continues into execute_deployment.
+        print("[resume_phase7] >>> calling resume_deployment() ...")
         result = resume_deployment(graph, config, approved=True, feedback=feedback)
+        print(f"[resume_phase7] <<< resume_deployment() RETURNED")
+        print(f"[resume_phase7] result.status = {result.get('status')!r}")
+        print(f"[resume_phase7] result keys = {list(result.keys())}")
 
         state = entry.get("current_state", {})
         merged = {**state}
@@ -1932,20 +1939,42 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
                 merged[k] = result[k]
 
         deploy_results = result.get("deploy_results", [])
-        deploy_ok = bool(deploy_results) and all(
-            r.get("status") in ("SUCCESS", "SKIPPED") for r in deploy_results
+        print(f"[resume_phase7] deploy_results count={len(deploy_results)} "
+              f"statuses={[r.get('status') for r in deploy_results]}")
+        # A deploy is OK if the graph reported overall success OR every per-repo
+        # deploy result is SUCCESS/SKIPPED. We check BOTH because the per-repo
+        # results list and the graph's own status are populated differently.
+        graph_status = result.get("status", "")
+        deploy_ok = (
+                graph_status in ("DEPLOYMENT_COMPLETE", "PHASE_7_COMPLETE")
+                or (bool(deploy_results) and all(
+            r.get("status") in ("SUCCESS", "SKIPPED") for r in deploy_results))
         )
-        final_status = "PHASE_7_COMPLETE" if deploy_ok else "DEPLOY_FAILED"
-        sub = ("Deployment complete" if deploy_ok
+        # Phase 7 is the FINAL phase, so a successful deploy means the whole
+        # pipeline is complete. The dashboard renders the finished/"done" state
+        # only for PIPELINE_COMPLETE (its per-phase ✓ and isComplete checks key
+        # off exactly that value), so we set PIPELINE_COMPLETE on success — not
+        # PHASE_7_COMPLETE, which stopped polling but never showed the pipeline
+        # as finished. Both are terminal in the UI, but only PIPELINE_COMPLETE
+        # marks it done.
+        final_status = "PIPELINE_COMPLETE" if deploy_ok else "DEPLOY_FAILED"
+        sub = ("Pipeline complete — deployment successful" if deploy_ok
                else "Deployment failed — see deploy_results")
+        print(f"[resume_phase7] deploy_ok={deploy_ok} → setting status={final_status!r}")
         pipeline_store[thread_id].update({
             "current_state": merged,
             "status": final_status,
             "sub_stage": sub,
+            "phase": 8,
         })
+
+        pipeline_store[thread_id]["graph"] = None
+        pipeline_store[thread_id]["config"] = None
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+        print(f"[resume_phase7] DONE — persisted status={final_status!r}\n{'='*60}")
     except Exception as e:
         import traceback
+        print(f"[resume_phase7] ❌ EXCEPTION: {type(e).__name__}: {e}")
         traceback.print_exc()
         pipeline_store[thread_id].update({"status": "ERROR", "error": str(e)})
         save_pipeline(
@@ -1953,6 +1982,7 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
             pipeline_store[thread_id],
             _safe_state(pipeline_store[thread_id].get("current_state", {})),
         )
+        print(f"[resume_phase7] set status=ERROR after exception\n{'='*60}")
 
 
 def _safe_state(state: dict) -> dict:

@@ -337,10 +337,19 @@ def generate_fresh_project(state: CodegenState) -> CodegenState:
     1. Read the ADR and Architecture to determine the EXACT programming languages and frameworks required.
     2. Generate a complete, production-ready starter project scaffold for ALL requested nodes.
     3. Include standard configuration files appropriate for the chosen stack (e.g., package.json, tsconfig.json, pom.xml, or requirements.txt).
-    4. CRITICAL: You MUST generate a `Dockerfile` for every deployable service so Phase 7 can containerize and push it to AWS ECR.
-    5. Provide the core application entry points, routes/controllers, models, and a README.md.
-    6. Prefix file paths with the service/repo name to keep them organized (e.g., 'backend/main.py' or 'frontend/src/App.tsx').
-    7. CRITICAL: DO NOT default to Python unless explicitly specified in the ADR or Architecture.
+    4. Provide the core application entry points, routes/controllers, models, and a README.md.
+    5. CRITICAL — FILE PATHS: Each service gets its OWN repository, so the repo
+       IS the service. Generate every file at its NATURAL path relative to the
+       repository root — do NOT wrap files in an extra service/component folder.
+       Correct:   "Dockerfile", "index.html", "src/main.py", "package.json",
+                  "README.md", ".github/workflows/ci.yml"
+       WRONG:     "static-server/Dockerfile", "backend/src/main.py",
+                  "my-service/index.html"  (no wrapper directory — the repo
+                  already represents this one service).
+       Standard project subfolders that belong to the language convention are
+       fine (e.g. "src/", "app/", "tests/", "public/"); only the artificial
+       top-level service-name wrapper is disallowed.
+    6. CRITICAL: DO NOT default to Python unless explicitly specified in the ADR or Architecture.
 
     Return ONLY valid JSON in this exact format:
     {{
@@ -367,6 +376,16 @@ def generate_fresh_project(state: CodegenState) -> CodegenState:
         print(f"  [Phase 4] JSON parse failed: {e}")
         generated_changes = []
 
+    # ── Normalize file paths: strip a spurious common wrapper directory ───────
+    # The repo IS the service, so files should sit at the repo root. If the LLM
+    # still nested EVERY file under one common top-level folder (e.g.
+    # "static-server/...", "backend/..."), strip that single shared prefix so
+    # paths are repo-root-relative. We only strip when ALL files share one
+    # top-level dir AND that dir looks like a service wrapper (not a real
+    # language convention folder like src/app/tests/public/lib). This is a
+    # deterministic backstop in case the LLM ignores the prompt instruction.
+    generated_changes = _strip_common_wrapper_dir(generated_changes)
+
     errors = []
     for change in generated_changes:
         errors.extend(validate_python(change.get("content", ""), change.get("file_path", "")))
@@ -378,6 +397,48 @@ def generate_fresh_project(state: CodegenState) -> CodegenState:
         "validation_errors": errors,
         "status": "CODE_GENERATED" if not errors else "CODE_GENERATION_FAILED"
     }
+
+
+# Real language/convention folders that are legitimate at the repo root — we
+# must NOT mistake these for a service wrapper and strip them.
+_CONVENTION_DIRS = {
+    "src", "app", "tests", "test", "public", "lib", "cmd", "internal",
+    "pkg", "api", "static", "templates", "config", "scripts", ".github",
+}
+
+
+def _strip_common_wrapper_dir(changes: list) -> list:
+    """If every generated file is nested under one shared top-level directory
+    that looks like an artificial service wrapper, strip that prefix so files
+    land at the repo root. No-op if files are already at root, span multiple
+    top-level dirs, or the shared dir is a real convention folder."""
+    if not changes:
+        return changes
+
+    top_dirs = set()
+    for c in changes:
+        p = (c.get("file_path", "") or "").lstrip("/")
+        if "/" not in p:
+            # A root-level file exists → not all nested → nothing to strip.
+            return changes
+        top_dirs.add(p.split("/", 1)[0])
+
+    if len(top_dirs) != 1:
+        return changes  # multiple top-level dirs → real structure, leave it
+
+    wrapper = next(iter(top_dirs))
+    if wrapper.lower() in _CONVENTION_DIRS:
+        return changes  # it's a legit convention folder, not a wrapper
+
+    # Strip the single shared wrapper directory from every path.
+    print(f"  [Phase 4] Normalizing paths: stripping wrapper dir '{wrapper}/' "
+          f"so files sit at the repo root")
+    out = []
+    for c in changes:
+        c = dict(c)
+        c["file_path"] = c["file_path"].lstrip("/")[len(wrapper) + 1:]
+        out.append(c)
+    return out
 
 
 
