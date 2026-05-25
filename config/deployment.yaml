@@ -17,7 +17,7 @@ project_name: leave-mgmt
 workspace_dir: /tmp/sdlc-deploy-workspace
 
 # Set true to log every git/docker/aws/HTTP call without actually running it.
-dry_run: false
+dry_run: False
 
 # CLIs (docker, aws, git) are now baked into the Docker image (see Dockerfile),
 # so runtime auto-install is OFF. If a CLI is somehow missing, Phase 7 should
@@ -46,6 +46,8 @@ defaults:
   branch: main
   dockerfile: Dockerfile
   docker_context: .
+          # empty = no push by default
+    # was: ecs-prod
   registry: ecr-prod                      # default registry name
   deploy_target: ecs-prod                 # default deploy target name
   image_tag: ${BUILD_TAG:-latest}
@@ -115,6 +117,12 @@ deploy_targets:
       cluster: leave-mgmt-cluster
       # service is omitted here — repos provide their own via .deploy.yaml
       wait_for_stable: true
+      execution_role_arn: arn:aws:iam::209082373721:role/ecsTaskExecutionRole
+      vpc_id: vpc-07b32185f455b0c84
+      subnets:
+      - subnet-07408a491ebf70c22
+      - subnet-0f8b3f8726a2dbb7c
+      - subnet-08bbad1b6f97ea11d
 
   - name: ecs-staging
     kind: ecs

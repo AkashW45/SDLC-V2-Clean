@@ -835,9 +835,12 @@ def build_deployment_graph():
     )
     builder.add_conditional_edges(
         "build_images",
-        _route_after_step("IMAGES_BUILT", "BUILD_FAILED"),
+        _route_after_step("IMAGES_BUILT"),
         {"proceed": "push_images", "fail": END},
     )
+    
+
+    
     builder.add_conditional_edges(
         "push_images",
         _route_after_step("IMAGES_PUSHED", "PUSH_FAILED"),

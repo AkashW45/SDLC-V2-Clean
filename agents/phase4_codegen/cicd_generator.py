@@ -161,11 +161,19 @@ def _summarize_arch(arch: Optional[dict]) -> str:
 
 
 def _detect_existing(generated_changes: list, existing_files_in_repo: set[str]) -> dict:
-    """Detect whether deployment artifacts already exist either in the existing
-    repo OR in the just-generated changes (we should never double-generate)."""
     paths_being_written = {c.get("file_path", "") for c in generated_changes}
-    all_paths = paths_being_written | existing_files_in_repo
-
+    # Normalize: strip leading path components for repo-prefixed paths
+    normalized = set()
+    for p in paths_being_written:
+        normalized.add(p)
+        # Also add just the filename portion
+        normalized.add(os.path.basename(p))
+        # Add after first slash (repo-name/Dockerfile -> Dockerfile)
+        parts = p.replace("\\", "/").split("/", 1)
+        if len(parts) > 1:
+            normalized.add(parts[1])
+    all_paths = normalized | existing_files_in_repo
+    
     has_dockerfile = any(p == "Dockerfile" or p.endswith("/Dockerfile") for p in all_paths)
     has_deploy_yaml = any(p == ".deploy.yaml" or p.endswith("/.deploy.yaml") for p in all_paths)
     has_workflow = any(

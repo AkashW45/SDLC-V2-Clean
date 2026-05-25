@@ -15,6 +15,15 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from dotenv import load_dotenv
 import requests
+# Auto-register newly-created repos into the knowledge layer so subsequent
+# pipelines (Phase 0 routing, manual repo picker, semantic search) can find them.
+try:
+    from knowledge_layer.project_registry import register_project
+    from agents.indexer_queue import get_queue
+    _REGISTRY_AVAILABLE = True
+except ImportError as _e:
+    print(f"[Phase 6] Auto-register dependencies missing: {_e}")
+    _REGISTRY_AVAILABLE = False
 
 load_dotenv()
 
@@ -309,11 +318,13 @@ def push_code(state: DeliveryState) -> DeliveryState:
 
     repo_check = requests.get(repo_check_url, headers=headers)
     # Repo does not exist → create it (and wait for auto_init commit inside).
+    newly_created = False
     if repo_check.status_code == 404:
         print(f"  ℹ️  Repo '{repo_name}' does not exist. Creating...")
         try:
             create_github_repo(repo_name=repo_name)
             print(f"  ✅ Repository created: {repo_name}")
+            newly_created = True
         except Exception as e:
             print(f"  ❌ Repo creation failed: {e}")
             return {**state, "status": "PUSH_FAILED", "error": str(e)}
@@ -364,11 +375,52 @@ def push_code(state: DeliveryState) -> DeliveryState:
     # pipeline as if code landed — that was the bug that hid empty repos.
     if push_result["status"] == "PUSH_SUCCESS":
         print(f"  ✅ Pushed {push_result.get('files_pushed', 0)} files")
+        # ─── Auto-register newly-created repos into the knowledge layer ───
+    # Without this, Phase 0 routing and the manual repo picker won't see
+    # the new repo on subsequent pipeline runs. The repo exists on GitHub
+    # but is invisible to the platform's knowledge layer.
+    if newly_created and _REGISTRY_AVAILABLE:
+        try:
+            print(f"  [Phase 6] Auto-registering '{repo_name}' into knowledge layer...")
+            register_project(
+                project_id=repo_name,
+                project_name=repo_name.replace("-", " ").title(),
+                description=(state.get("requirement", "")[:300]
+                             or f"Auto-created by SDLC-V2 pipeline"),
+                domain="generated",
+                tech_stack=[],   # detected later by indexer
+                repos=[repo_name],
+                owner_team="SDLC-V2",
+            )
+            print(f"  [Phase 6] ✅ Registered '{repo_name}' in projects table + Qdrant")
+
+            # Queue the indexer so symbols/code embeddings get populated too.
+            # Without this, the repo is route-able but Phase 3 can't actually
+            # do impact analysis on it (no code_embeddings).
+            try:
+                queue = get_queue()
+                repo_url_for_index = f"https://github.com/{EFFECTIVE_OWNER}/{repo_name}.git"
+                job_id = queue.enqueue(
+                    repo_name=repo_name,
+                    repo_url=repo_url_for_index,
+                    branch="main",
+                    force=False,
+                )
+                print(f"  [Phase 6] ✅ Queued indexer job {job_id} for '{repo_name}'")
+            except Exception as queue_err:
+                print(f"  [Phase 6] ⚠️  Indexer queue unavailable: {queue_err} "
+                      f"(repo registered but symbols not indexed)")
+        except Exception as e:
+            # Non-fatal — pipeline must continue even if registration fails.
+            # User can always re-sync manually via /knowledge/projects/sync.
+            print(f"  [Phase 6] ⚠️  Auto-register failed: {e} — pipeline continues. "
+                  f"Run /knowledge/projects/sync to register manually.")
         return {**state, "status": "CODE_PUSHED"}
 
     err = push_result.get("error") or push_result["status"]
     print(f"  ❌ Push did not succeed: {err}")
     return {**state, "status": "PUSH_FAILED", "error": err}
+
 
 
 def create_pr(state: DeliveryState) -> DeliveryState:

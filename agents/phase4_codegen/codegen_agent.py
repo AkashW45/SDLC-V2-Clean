@@ -337,9 +337,10 @@ def generate_fresh_project(state: CodegenState) -> CodegenState:
     1. Read the ADR and Architecture to determine the EXACT programming languages and frameworks required.
     2. Generate a complete, production-ready starter project scaffold for ALL requested nodes.
     3. Include standard configuration files appropriate for the chosen stack (e.g., package.json, tsconfig.json, pom.xml, or requirements.txt).
-    4. Provide the core application entry points, routes/controllers, models, and a README.md.
-    5. Prefix file paths with the service/repo name to keep them organized (e.g., 'backend/main.py' or 'frontend/src/App.tsx').
-    6. CRITICAL: DO NOT default to Python unless explicitly specified in the ADR or Architecture.
+    4. CRITICAL: You MUST generate a `Dockerfile` for every deployable service so Phase 7 can containerize and push it to AWS ECR.
+    5. Provide the core application entry points, routes/controllers, models, and a README.md.
+    6. Prefix file paths with the service/repo name to keep them organized (e.g., 'backend/main.py' or 'frontend/src/App.tsx').
+    7. CRITICAL: DO NOT default to Python unless explicitly specified in the ADR or Architecture.
 
     Return ONLY valid JSON in this exact format:
     {{

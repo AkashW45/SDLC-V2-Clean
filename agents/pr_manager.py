@@ -196,12 +196,31 @@ def create_pr_for_artifact(artifact: dict, asp: dict, thread_id: str,
     is_new = not target_repo.get("exists", True) or asp.get("_is_new_project", False)
 
     # ── ENSURE REPO EXISTS ──
+    repo_was_new = False
     if not _repo_exists(repo_name):
         print(f"  [PR Manager] Creating repo: {repo_name}")
         if not _create_repo(repo_name, asp.get("user_input", "")):
             return {"status": "error", "error": f"Failed to create repo {repo_name}",
                     "unique_request_id": unique_request_id}
         audit(thread_id, "pr_manager", "REPO_CREATED", {"repo": repo_name})
+        repo_was_new = True
+
+    # Auto-register new repos into knowledge layer (best-effort, non-fatal)
+    if repo_was_new:
+        try:
+            from knowledge_layer.project_registry import register_project
+            register_project(
+                project_id=repo_name,
+                project_name=repo_name.replace("-", " ").title(),
+                description=asp.get("user_input", "")[:300] or "Auto-created by SDLC-V2",
+                domain="generated",
+                tech_stack=[],
+                repos=[repo_name],
+                owner_team="SDLC-V2",
+            )
+            print(f"  [PR Manager] ✅ Registered '{repo_name}' in knowledge layer")
+        except Exception as e:
+            print(f"  [PR Manager] ⚠️  Auto-register failed: {e}")
 
     # ── BRANCH ──
     default_branch = _get_default_branch(repo_name)

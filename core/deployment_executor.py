@@ -74,15 +74,21 @@ def _run(
     `stdin` is piped to the command's stdin (use for password-stdin).
     `secret=True` redacts the printed command — use when args carry a token.
     """
+    import sys
+    is_win = sys.platform == "win32"
+
+    
     pretty = "<redacted>" if secret else " ".join(shlex.quote(c) for c in cmd)
     if dry_run:
         print(f"  [dry-run] would run: {pretty} (cwd={cwd or os.getcwd()})")
         return {"cmd": pretty, "returncode": 0, "stdout": "", "stderr": "", "dry_run": True}
 
     print(f"  $ {pretty}")
+    run_cmd = " ".join(cmd) if is_win else cmd
     try:
         proc = subprocess.run(
-            cmd,
+            run_cmd,
+            shell=is_win,
             cwd=str(cwd) if cwd else None,
             env={**os.environ, **(env or {})},
             input=stdin,
@@ -497,8 +503,17 @@ def build_image(repo: RepoConfig, workspace: Path,
 
     dockerfile = repo_path / repo.dockerfile
     if not dockerfile.is_file() and not dry_run:
-        return _fail("build_image",
-                     f"Dockerfile not found at {dockerfile}", repo=repo.name)
+        # Search one level deep for Dockerfile in subdirectories
+        found = list(repo_path.rglob("Dockerfile"))
+        if found:
+            dockerfile = found[0]
+            # Update docker_context to the directory containing the Dockerfile
+            repo.docker_context = str(dockerfile.parent.relative_to(repo_path))
+            print(f"  [{repo.name}] Dockerfile found at subdirectory: {dockerfile}")
+        else:
+            return _fail("build_image",
+                        f"Dockerfile not found at {dockerfile} or any subdirectory",
+                        repo=repo.name)
 
     local_tag = f"{repo.image_name}:{repo.image_tag}"
     qualified_tag = _registry_qualified_image(repo, registry)
@@ -509,7 +524,7 @@ def build_image(repo: RepoConfig, workspace: Path,
     cmd.extend(["-f", str(dockerfile)])
     for k, v in repo.build_args.items():
         cmd.extend(["--build-arg", f"{k}={v}"])
-    cmd.append(str(repo_path / repo.docker_context))
+    cmd.append(str(dockerfile.parent) if repo.docker_context == "." else str(repo_path / repo.docker_context))
 
     try:
         result = _run(cmd, dry_run=dry_run, timeout=1800)
@@ -906,28 +921,41 @@ def _ensure_ecs_infra(repo: RepoConfig, target: DeployTarget,
     # 4) Default VPC subnets + a security group opening the container port.
     subnets: List[str] = []
     sg_id = ""
+    vpc_id = "" # <--- ADD THIS INITIALIZATION
     if not dry:
-        vpc_json = _ecs_describe_json(
-            ["aws", "ec2", "describe-vpcs", "--filters",
-             "Name=isDefault,Values=true", *region_args],
-            env=env, dry_run=dry)
-        vpc_id = ""
-        if vpc_json and vpc_json.get("Vpcs"):
-            vpc_id = vpc_json["Vpcs"][0]["VpcId"]
-        if not vpc_id:
-            return _fail("ensure_ecs_infra",
-                         "no default VPC found in this region. Either create a "
-                         "default VPC (aws ec2 create-default-vpc) or set "
-                         "subnets/security_group in config.", repo=repo.name)
-        sn_json = _ecs_describe_json(
-            ["aws", "ec2", "describe-subnets", "--filters",
-             f"Name=vpc-id,Values={vpc_id}", *region_args],
-            env=env, dry_run=dry)
-        subnets = [s["SubnetId"] for s in (sn_json or {}).get("Subnets", [])][:3]
-        if not subnets:
-            return _fail("ensure_ecs_infra",
-                         f"default VPC {vpc_id} has no subnets", repo=repo.name)
-
+        # Check for pre-configured subnets first
+        configured_subnets = _opt(repo, target, "subnets", [])
+        if configured_subnets:
+            subnets = configured_subnets
+            vpc_id = _opt(repo, target, "vpc_id", "") # <--- ADD THIS LINE
+            print(f"  [ecs-provision] using pre-configured subnets: {subnets}")
+        else:
+            vpc_json = _ecs_describe_json(
+                ["aws", "ec2", "describe-vpcs", "--filters",
+                "Name=isDefault,Values=true", *region_args],
+                env=env, dry_run=dry)
+            vpc_id = ""
+            if vpc_json and vpc_json.get("Vpcs"):
+                vpc_id = vpc_json["Vpcs"][0]["VpcId"]
+            if not vpc_id:
+                return _fail("ensure_ecs_infra",
+                            "no default VPC found in this region. Either create a "
+                            "default VPC or set subnets in config.", repo=repo.name)
+            sn_result = _run(
+                ["aws", "ec2", "describe-subnets",
+                "--filters", f"Name=vpc-id,Values={vpc_id}",
+                "--filters", "Name=defaultForAz,Values=true",
+                *region_args],
+                env=env, dry_run=dry, check=False, timeout=30)
+            try:
+                import json as _j
+                sn_data = _j.loads(sn_result["stdout"])
+                subnets = [s["SubnetId"] for s in sn_data.get("Subnets", [])][:3]
+            except Exception:
+                subnets = []
+            if not subnets:
+                return _fail("ensure_ecs_infra",
+                            f"default VPC {vpc_id} has no subnets", repo=repo.name)
         # Security group: reuse one named sdlc-<service>-sg or create it.
         sg_name = f"sdlc-{service}-sg"
         sg_json = _ecs_describe_json(
