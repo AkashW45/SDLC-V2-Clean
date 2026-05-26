@@ -84,6 +84,26 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != VALID_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorised")
 
+@app.on_event("startup")
+async def _backfill_registry_on_startup():
+    """
+    Self-healing: on every startup, scan GitHub for repos owned by
+    GITHUB_REPO_OWNER and ensure each one has a registry entry. This guarantees
+    no repo created by a previous pipeline run is orphaned in the knowledge layer.
+    """
+    try:
+        from agents.phase0_selector.selector_agent import sync_github_repos_to_registry
+        owner = os.getenv("GITHUB_REPO_OWNER", "")
+        if not owner:
+            print("[Startup] GITHUB_REPO_OWNER not set — skipping registry backfill")
+            return
+        print(f"[Startup] Backfilling registry from GitHub ({owner})...")
+        result = sync_github_repos_to_registry(owner=owner)
+        print(f"[Startup] Registry backfill complete: {result}")
+    except Exception as e:
+        # Non-fatal — uvicorn must always start
+        print(f"[Startup] Registry backfill failed (non-fatal): {e}")
+        import traceback; traceback.print_exc()
 
 # ── Request Models ────────────────────────────────────────────────────────────
 class StartRequest(BaseModel):

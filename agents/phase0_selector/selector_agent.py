@@ -184,3 +184,76 @@ def build_selector_graph():
     g.add_edge("process_approval", END)
 
     return g.compile(checkpointer=MemorySaver())
+
+def sync_github_repos_to_registry(owner: str = None) -> dict:
+    """
+    Permanent fix: ensure every repo under `owner` has a registry entry.
+
+    This is idempotent — registers missing ones, leaves existing untouched.
+    Called on uvicorn startup AND can be called manually.
+
+    Returns: {"added": [...], "skipped": [...], "errors": [...]}
+    """
+    import requests
+    from knowledge_layer.project_registry import register_project, list_all_projects
+
+    owner = owner or os.getenv("GITHUB_REPO_OWNER", "")
+    if not owner:
+        return {"added": [], "skipped": [], "errors": ["GITHUB_REPO_OWNER not set"]}
+
+    token = os.getenv("GITHUB_TOKEN", "")
+    if not token:
+        return {"added": [], "skipped": [], "errors": ["GITHUB_TOKEN not set"]}
+
+    # Get list of all repos under owner
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    try:
+        all_repos = []
+        page = 1
+        while True:
+            resp = requests.get(
+                f"https://api.github.com/users/{owner}/repos?per_page=100&page={page}",
+                headers=headers, timeout=20
+            )
+            if resp.status_code != 200:
+                return {"added": [], "skipped": [], "errors": [f"GitHub API {resp.status_code}: {resp.text[:200]}"]}
+            batch = resp.json()
+            if not batch:
+                break
+            all_repos.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+    except Exception as e:
+        return {"added": [], "skipped": [], "errors": [f"GitHub fetch failed: {e}"]}
+
+    # Get current registry
+    existing = {p["project_id"] for p in list_all_projects()}
+
+    added = []
+    skipped = []
+    errors = []
+
+    for repo in all_repos:
+        repo_name = repo.get("name", "")
+        if not repo_name:
+            continue
+        if repo_name in existing:
+            skipped.append(repo_name)
+            continue
+        try:
+            register_project(
+                project_id=repo_name,
+                project_name=repo_name.replace("-", " ").title(),
+                description=repo.get("description", "") or f"GitHub repo {owner}/{repo_name}",
+                domain="",
+                tech_stack=[repo.get("language", "")] if repo.get("language") else [],
+                repos=[repo_name],
+                owner_team="",
+            )
+            added.append(repo_name)
+        except Exception as e:
+            errors.append(f"{repo_name}: {e}")
+
+    print(f"[Registry Backfill] Added {len(added)}, Skipped {len(skipped)}, Errors {len(errors)}")
+    return {"added": added, "skipped": skipped, "errors": errors}    
