@@ -17,7 +17,15 @@ project_name: sdlc-development
 workspace_dir: /tmp/sdlc-deploy-workspace
 
 # Set true to log every git/docker/aws/HTTP call without actually running it.
-dry_run: False
+dry_run: false
+
+# Max repos deployed concurrently WITHIN a dependency level. Repos of the same
+# type (library/backend/frontend/...) form a level and deploy in parallel;
+# levels themselves stay strictly sequential so dependencies are honoured (a
+# backend never starts before its libraries finish). Set to 1 to force the old
+# fully-sequential behavior. Keep modest to avoid docker/registry/AWS rate
+# limits.
+deploy_parallelism: 4
 
 # CLIs (docker, aws, git) are now baked into the Docker image (see Dockerfile),
 # so runtime auto-install is OFF. If a CLI is somehow missing, Phase 7 should
@@ -46,8 +54,6 @@ defaults:
   branch: main
   dockerfile: Dockerfile
   docker_context: .
-          # empty = no push by default
-    # was: ecs-prod
   registry: ecr-prod                      # default registry name
   deploy_target: ecs-prod                 # default deploy target name
   image_tag: ${BUILD_TAG:-latest}
@@ -117,12 +123,50 @@ deploy_targets:
       cluster: sdlc-development-cluster
       # service is omitted here — repos provide their own via .deploy.yaml
       wait_for_stable: true
-      execution_role_arn: arn:aws:iam::209082373721:role/ecsTaskExecutionRole
-      vpc_id: vpc-07b32185f455b0c84
-      subnets:
-      - subnet-07408a491ebf70c22
-      - subnet-0f8b3f8726a2dbb7c
-      - subnet-08bbad1b6f97ea11d
+
+  # ---- AWS ECS behind an Application Load Balancer (stable URL) ------
+  # Use this target (or set enable_alb: true on any ecs target / in a repo's
+  # .deploy.yaml `deploy:` block) to get a stable, demoable HTTPS-ready URL.
+  #
+  # Smart detection (no naming convention needed):
+  #   * service absent            -> creates ALB + target group + listener,
+  #                                  then creates the service wired to it.
+  #   * service already has an LB -> reuses it (detected from the service's
+  #                                  own loadBalancers[], any ALB name), just
+  #                                  rolls the new image.
+  #   * service exists, no LB      -> updates image only (AWS forbids attaching
+  #                                  an ALB to an existing service; needs a
+  #                                  one-time recreate to add one).
+  #
+  # The deployed app's URL is returned as `endpoint` in the deploy result and
+  # collected into state as `deploy_endpoints`.
+  - name: ecs-prod-alb
+    kind: ecs
+    config:
+      access_key_id: ${AWS_ACCESS_KEY_ID}
+      secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+      region: ${AWS_REGION:-us-east-1}
+      cluster: sdlc-development-cluster
+      wait_for_stable: true
+      enable_alb: true                 # turn on ALB provisioning/detection
+      container_port: 8000             # the port your app listens on
+      health_check_path: /health       # ALB health check path (must return 200)
+      # cpu/memory default to 256/512; override per-repo in .deploy.yaml
+      #
+      # --- Bring-up latency tuning (fast-demo defaults) ----------------------
+      # These reduce the time from "deploy done" to "URL serving" from the AWS
+      # default of ~150s to ~20s, WITHOUT skipping the health check. A fresh
+      # target serves traffic after hc_healthy_threshold × hc_interval_seconds.
+      # NOTE: the real floor is your app's own startup time — if the app needs
+      # 20s to answer /health, no tuning beats that. For an instant demo, also
+      # PRE-WARM: deploy before the audience is watching; once healthy the URL
+      # responds immediately, and redeploys stay warm (rolling config keeps a
+      # healthy task up before draining the old one).
+      hc_interval_seconds: 10          # how often the ALB probes (min sane ~10)
+      hc_healthy_threshold: 2          # consecutive passes before routing
+      hc_timeout_seconds: 5            # per-probe timeout
+      deregistration_delay_seconds: 30 # drain time on redeploy (AWS dflt 300)
+      health_poll_interval_seconds: 3  # how often WE check health (observation)
 
   - name: ecs-staging
     kind: ecs

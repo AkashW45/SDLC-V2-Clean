@@ -20,12 +20,17 @@ import datetime as _dt
 import json
 import os
 import re
+import threading
 from typing import TypedDict, List, Optional
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from dotenv import load_dotenv
+
+# Serializes the interactive per-env approval prompt so concurrent same-level
+# deploys never interleave on stdin.
+_APPROVAL_PROMPT_LOCK = threading.Lock()
 
 load_dotenv()
 
@@ -88,6 +93,7 @@ class DeploymentState(TypedDict, total=False):
     build_results: list
     push_results: list
     deploy_results: list
+    deploy_endpoints: list
     monitoring_results: dict
 
     rollback_triggered: bool
@@ -546,20 +552,102 @@ def human_approval_gate(state: DeploymentState) -> DeploymentState:
     }
 
 
+def _deploy_one_repo(step: dict, repos_by_name: dict, cfg) -> list:
+    """Deploy a SINGLE repo (one entry of the deploy_sequence) and return its
+    list of result dicts. This is the exact per-repo logic the sequential loop
+    used — extracted verbatim so it can be run either sequentially OR inside a
+    thread pool for same-level parallelism. No behavior change per repo.
+
+    Returns a list of result dicts (multi-env returns several; single-env one),
+    each carrying `step` and `repo` so ordering/attribution is preserved.
+    """
+    repo = repos_by_name.get(step["repo"])
+    if repo is None:
+        repo = cfg.get_repo(step["repo"])
+        repo.repo_type = step["type"]
+
+    print(f"\n  ── deploying '{repo.name}' "
+          f"(type={repo.repo_type}, target={repo.deploy_target}, "
+          f"multi_env={bool(repo.environments)}) ──")
+
+    results: list = []
+    if repo.environments:
+        # Multi-env promotion path (unchanged)
+        env_results = _deploy_through_environments(repo, cfg)
+        for r in env_results:
+            r["step"] = step["step"]
+            r["repo"] = repo.name
+        results.extend(env_results)
+        if any(r["status"] not in ("SUCCESS", "SKIPPED") for r in env_results):
+            print(f"  ❌ {repo.name}: deployment chain failed")
+        else:
+            print(f"  ✅ {repo.name}: deployed through "
+                  f"{len(repo.environments)} environment(s)")
+    else:
+        # Single-env path (unchanged)
+        result = trigger_deploy(repo, cfg)
+        result["step"] = step["step"]
+        result.setdefault("repo", repo.name)
+        results.append(result)
+        if result["status"] != "SUCCESS":
+            print(f"  ❌ {repo.name}: deploy failed — {result.get('error')}")
+        else:
+            print(f"  ✅ {repo.name}: deployed")
+    return results
+
+
+def _group_into_levels(deploy_sequence: list) -> list:
+    """Group the ordered deploy_sequence into dependency LEVELS.
+
+    Repos of the same `type` (library / backend / frontend / batch / service)
+    share a level — they don't depend on each other, so they're safe to deploy
+    concurrently. Levels stay in sequence order, so a later level (e.g. backend)
+    never starts until the earlier level it depends on (e.g. library) is fully
+    deployed. This is what makes the fan-out safe: the dependency ORDER your
+    pipeline already encodes via classification.order is preserved exactly.
+
+    We group by `type` while walking the already-sorted sequence, so a level is
+    a maximal run of consecutive same-type steps. (Walking the sorted sequence
+    rather than bucketing by type also means that if the sort order ever
+    interleaves types, we never merge non-adjacent groups — staying strictly
+    conservative about ordering.)
+    """
+    levels: list = []
+    current: list = []
+    current_type = None
+    for step in deploy_sequence:
+        t = step.get("type")
+        if current and t != current_type:
+            levels.append(current)
+            current = []
+        current.append(step)
+        current_type = t
+    if current:
+        levels.append(current)
+    return levels
+
+
 def execute_deployment(state: DeploymentState) -> DeploymentState:
-    """Trigger deployment for each repo, in sequence order.
+    """Trigger deployment for each repo, honouring dependency order, with
+    SAME-LEVEL PARALLELISM for speed.
 
-    Two modes per repo:
-      - Multi-env: repo has `environments: [...]` from .deploy.yaml. Deploy
-        to each env in order, run smoke test, gate on requires_approval.
-        Same image promotes across all envs (built once, deployed many).
-      - Single-env: repo just has `deploy_target`. Original behavior.
+    Ordering & safety model:
+      - resolve_deploy_sequence already sorts repos by classification.order
+        (library -> backend -> frontend -> batch -> service), because later
+        types depend on earlier ones.
+      - We group that ordered sequence into LEVELS of same-type repos. Repos in
+        one level are independent of each other, so we deploy them CONCURRENTLY
+        (thread pool — the work is subprocess/network I/O: git, docker, aws).
+      - Levels run STRICTLY in order. A level does not start until the previous
+        level finished. If ANY repo in a level fails, we STOP and do not start
+        the next level — so a dependent repo is never deployed when the thing
+        it depends on failed. This is the exact failure you flagged, prevented
+        structurally.
 
-    Note on the in-loop approval prompt: LangGraph's `interrupt_before` is
-    per-graph-node, so a clean state-machine approach to per-env approvals
-    would require a re-entrant approval node. For the demo / POC, we use a
-    blocking input() prompt — fine for CLI/dev use, NOT for production
-    pipelines where approvals should be async. Marked TODO below.
+    Per-repo behavior (multi-env promotion, single-env, ALB endpoint capture)
+    is unchanged — see _deploy_one_repo. Set `deploy_parallelism` in config to
+    cap concurrency (default 4); set it to 1 to force the old fully-sequential
+    behavior.
     """
     _trace_step("EXECUTE DEPLOYMENT (provision if needed + deploy to AWS)")
     cfg = _load_cfg(state)
@@ -567,45 +655,86 @@ def execute_deployment(state: DeploymentState) -> DeploymentState:
     all_ok = True
 
     repos_by_name = {r.name: r for r in _repos_from_state(state)}
+    levels = _group_into_levels(state["deploy_sequence"])
 
-    for step in state["deploy_sequence"]:
-        repo = repos_by_name.get(step["repo"])
-        if repo is None:
-            repo = cfg.get_repo(step["repo"])
-            repo.repo_type = step["type"]
+    # Concurrency cap — protects against hitting docker/registry/AWS rate
+    # limits when a level is large. Configurable; 1 == fully sequential.
+    max_workers = int(getattr(cfg, "deploy_parallelism", 4) or 4)
 
-        print(f"\n  ── deploying '{repo.name}' "
-              f"(type={repo.repo_type}, target={repo.deploy_target}, "
-              f"multi_env={bool(repo.environments)}) ──")
+    print(f"\n[Phase 7] Deploying {len(state['deploy_sequence'])} repo(s) "
+          f"across {len(levels)} dependency level(s) "
+          f"(max {max_workers} concurrent per level)")
 
-        if repo.environments:
-            # Multi-env promotion path
-            env_results = _deploy_through_environments(repo, cfg)
-            for r in env_results:
-                r["step"] = step["step"]
-                r["repo"] = repo.name
-            deploy_results.extend(env_results)
-            if any(r["status"] not in ("SUCCESS", "SKIPPED") for r in env_results):
-                all_ok = False
-                print(f"  ❌ {repo.name}: deployment chain failed")
-                break
-            print(f"  ✅ {repo.name}: deployed through "
-                  f"{len(repo.environments)} environment(s)")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    for lvl_idx, level in enumerate(levels, start=1):
+        lvl_type = level[0].get("type", "?")
+        names = [s["repo"] for s in level]
+        print(f"\n  ═══ Level {lvl_idx}/{len(levels)} "
+              f"(type={lvl_type}): {names} ═══")
+
+        level_results: list = []
+        if len(level) == 1 or max_workers <= 1:
+            # Single repo in the level (or parallelism disabled) — run inline.
+            for step in level:
+                level_results.extend(_deploy_one_repo(step, repos_by_name, cfg))
         else:
-            # Single-env (existing) path
-            result = trigger_deploy(repo, cfg)
-            result["step"] = step["step"]
-            deploy_results.append(result)
-            if result["status"] != "SUCCESS":
-                all_ok = False
-                print(f"  ❌ {repo.name}: deploy failed — {result.get('error')}")
-                break
-            else:
-                print(f"  ✅ {repo.name}: deployed")
+            # Fan out the repos in THIS level concurrently.
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(level))) as pool:
+                future_to_step = {
+                    pool.submit(_deploy_one_repo, step, repos_by_name, cfg): step
+                    for step in level
+                }
+                for fut in as_completed(future_to_step):
+                    step = future_to_step[fut]
+                    try:
+                        level_results.extend(fut.result())
+                    except Exception as e:
+                        # A crash (not a graceful FAILED dict) — record it so
+                        # the level is treated as failed and we stop.
+                        level_results.append({
+                            "action": "trigger_deploy", "status": "FAILED",
+                            "repo": step["repo"], "step": step["step"],
+                            "error": f"unexpected error: {e}", "at": _utcnow(),
+                        })
+
+        deploy_results.extend(level_results)
+
+        # Gate: if anything in this level failed, do NOT proceed to the next
+        # (dependent) level. Same stop-on-failure guarantee as the old loop,
+        # now at level granularity.
+        level_failed = any(
+            r["status"] not in ("SUCCESS", "SKIPPED") for r in level_results
+        )
+        if level_failed:
+            all_ok = False
+            failed = [r.get("repo") for r in level_results
+                      if r["status"] not in ("SUCCESS", "SKIPPED")]
+            print(f"  ❌ Level {lvl_idx} had failures ({failed}) — "
+                  f"stopping before dependent levels run")
+            break
+        print(f"  ✅ Level {lvl_idx} complete: {names}")
+
+    # Collect any stable URLs (ALB DNS names) the deploy produced, so the
+    # summary and dashboard can show "open your app here". (Unchanged.)
+    endpoints = []
+    for r in deploy_results:
+        if r.get("status") == "SUCCESS" and r.get("endpoint"):
+            entry = {"repo": r.get("repo"), "url": r["endpoint"],
+                     "alb_state": r.get("alb_state")}
+            if r.get("environment"):
+                entry["environment"] = r["environment"]
+            endpoints.append(entry)
+
+    if endpoints:
+        print("\n  🌐 Application URL(s):")
+        for e in endpoints:
+            print(f"     {e['repo']}: {e['url']}")
 
     return {
         **state,
         "deploy_results": deploy_results,
+        "deploy_endpoints": endpoints,
         "status": "DEPLOYED" if all_ok else "DEPLOY_FAILED",
     }
 
@@ -621,13 +750,18 @@ def _deploy_through_environments(repo: RepoConfig,
         # TODO: replace blocking input() with a re-entrant LangGraph node for
         # async approvals in production pipelines.
         if env.requires_approval and not is_first and not cfg.dry_run:
-            print(f"\n  ⏸ [{repo.name}] approval required to promote to "
-                  f"'{env.name}'...")
-            print(f"     image: {repo.image_name}:{repo.image_tag}")
-            try:
-                answer = input(f"     promote to {env.name}? [y/N]: ").strip().lower()
-            except (EOFError, OSError):
-                answer = "n"
+            # Serialize the interactive prompt: under same-level parallelism two
+            # repos could reach this concurrently and interleave on stdin. The
+            # lock ensures one prompt is answered at a time; the deploys still
+            # run in parallel otherwise.
+            with _APPROVAL_PROMPT_LOCK:
+                print(f"\n  ⏸ [{repo.name}] approval required to promote to "
+                      f"'{env.name}'...")
+                print(f"     image: {repo.image_name}:{repo.image_tag}")
+                try:
+                    answer = input(f"     promote to {env.name}? [y/N]: ").strip().lower()
+                except (EOFError, OSError):
+                    answer = "n"
             if answer not in ("y", "yes"):
                 print(f"  ⏹ [{repo.name}] promotion to '{env.name}' rejected — "
                       f"stopping chain")
@@ -837,12 +971,9 @@ def build_deployment_graph():
     )
     builder.add_conditional_edges(
         "build_images",
-        _route_after_step("IMAGES_BUILT"),
+        _route_after_step("IMAGES_BUILT", "BUILD_FAILED"),
         {"proceed": "push_images", "fail": END},
     )
-    
-
-    
     builder.add_conditional_edges(
         "push_images",
         _route_after_step("IMAGES_PUSHED", "PUSH_FAILED"),
@@ -940,6 +1071,7 @@ def run_deployment(
         "build_results": [],
         "push_results": [],
         "deploy_results": [],
+        "deploy_endpoints": [],
         "monitoring_results": {},
         "rollback_triggered": False,
         "human_feedback": "",

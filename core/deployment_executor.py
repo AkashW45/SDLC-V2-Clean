@@ -23,7 +23,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.deployment_config import (
     DeploymentConfig,
@@ -74,21 +74,15 @@ def _run(
     `stdin` is piped to the command's stdin (use for password-stdin).
     `secret=True` redacts the printed command — use when args carry a token.
     """
-    import sys
-    is_win = sys.platform == "win32"
-
-    
     pretty = "<redacted>" if secret else " ".join(shlex.quote(c) for c in cmd)
     if dry_run:
         print(f"  [dry-run] would run: {pretty} (cwd={cwd or os.getcwd()})")
         return {"cmd": pretty, "returncode": 0, "stdout": "", "stderr": "", "dry_run": True}
 
     print(f"  $ {pretty}")
-    run_cmd = " ".join(cmd) if is_win else cmd
     try:
         proc = subprocess.run(
-            run_cmd,
-            shell=is_win,
+            cmd,
             cwd=str(cwd) if cwd else None,
             env={**os.environ, **(env or {})},
             input=stdin,
@@ -508,17 +502,8 @@ def build_image(repo: RepoConfig, workspace: Path,
 
     dockerfile = repo_path / repo.dockerfile
     if not dockerfile.is_file() and not dry_run:
-        # Search one level deep for Dockerfile in subdirectories
-        found = list(repo_path.rglob("Dockerfile"))
-        if found:
-            dockerfile = found[0]
-            # Update docker_context to the directory containing the Dockerfile
-            repo.docker_context = str(dockerfile.parent.relative_to(repo_path))
-            print(f"  [{repo.name}] Dockerfile found at subdirectory: {dockerfile}")
-        else:
-            return _fail("build_image",
-                        f"Dockerfile not found at {dockerfile} or any subdirectory",
-                        repo=repo.name)
+        return _fail("build_image",
+                     f"Dockerfile not found at {dockerfile}", repo=repo.name)
 
     local_tag = f"{repo.image_name}:{repo.image_tag}"
     qualified_tag = _registry_qualified_image(repo, registry)
@@ -529,7 +514,7 @@ def build_image(repo: RepoConfig, workspace: Path,
     cmd.extend(["-f", str(dockerfile)])
     for k, v in repo.build_args.items():
         cmd.extend(["--build-arg", f"{k}={v}"])
-    cmd.append(str(dockerfile.parent) if repo.docker_context == "." else str(repo_path / repo.docker_context))
+    cmd.append(str(repo_path / repo.docker_context))
 
     try:
         result = _run(cmd, dry_run=dry_run, timeout=1800)
@@ -844,7 +829,8 @@ def _ecs_describe_json(cmd: List[str], env: Dict[str, str], dry_run: bool) -> Op
 
 
 def _ensure_ecs_infra(repo: RepoConfig, target: DeployTarget,
-                      config: DeploymentConfig, image: str) -> Dict[str, Any]:
+                      config: DeploymentConfig, image: str,
+                      target_group_arn: Optional[str] = None) -> Dict[str, Any]:
     """Create the minimum ECS infrastructure if it doesn't already exist, so a
     brand-new account can deploy without manual setup.
 
@@ -853,12 +839,20 @@ def _ensure_ecs_infra(repo: RepoConfig, target: DeployTarget,
         subnets, gateways, or a load balancer).
       - Creates, only if missing: a Fargate ECS cluster, a CloudWatch log group,
         an execution IAM role (or reuses one named by config), a task definition,
-        a security group allowing the container port, and a Fargate service with
-        a public IP.
+        a security group allowing the container port, and a Fargate service.
+
+    ALB wiring (greenfield only): if `target_group_arn` is provided, the service
+    is created with a `--load-balancers` block registering it to that target
+    group. This MUST happen at create-service time — AWS does not allow adding a
+    load balancer to an already-created service. So the caller resolves/creates
+    the ALB + target group FIRST, then passes the ARN here.
+
     Every step is idempotent (check-then-create) and honours dry_run.
 
-    Returns {"ok": True, "task_def_arn": <arn or None>} on success, or a _fail
-    dict on error.
+    Returns {"ok": True, "task_def_arn": <arn or None>, "vpc_id": <id>,
+    "subnets": [...], "container_port": <int>} on success, or a _fail dict.
+    The vpc_id/subnets are returned so the caller can build an ALB in the same
+    VPC without re-discovering it.
     """
     env = _aws_env(target)
     region_args = _aws_region_args(target)
@@ -926,41 +920,28 @@ def _ensure_ecs_infra(repo: RepoConfig, target: DeployTarget,
     # 4) Default VPC subnets + a security group opening the container port.
     subnets: List[str] = []
     sg_id = ""
-    vpc_id = "" # <--- ADD THIS INITIALIZATION
+    vpc_id = ""
     if not dry:
-        # Check for pre-configured subnets first
-        configured_subnets = _opt(repo, target, "subnets", [])
-        if configured_subnets:
-            subnets = configured_subnets
-            vpc_id = _opt(repo, target, "vpc_id", "") # <--- ADD THIS LINE
-            print(f"  [ecs-provision] using pre-configured subnets: {subnets}")
-        else:
-            vpc_json = _ecs_describe_json(
-                ["aws", "ec2", "describe-vpcs", "--filters",
-                "Name=isDefault,Values=true", *region_args],
-                env=env, dry_run=dry)
-            vpc_id = ""
-            if vpc_json and vpc_json.get("Vpcs"):
-                vpc_id = vpc_json["Vpcs"][0]["VpcId"]
-            if not vpc_id:
-                return _fail("ensure_ecs_infra",
-                            "no default VPC found in this region. Either create a "
-                            "default VPC or set subnets in config.", repo=repo.name)
-            sn_result = _run(
-                ["aws", "ec2", "describe-subnets",
-                "--filters", f"Name=vpc-id,Values={vpc_id}",
-                "--filters", "Name=defaultForAz,Values=true",
-                *region_args],
-                env=env, dry_run=dry, check=False, timeout=30)
-            try:
-                import json as _j
-                sn_data = _j.loads(sn_result["stdout"])
-                subnets = [s["SubnetId"] for s in sn_data.get("Subnets", [])][:3]
-            except Exception:
-                subnets = []
-            if not subnets:
-                return _fail("ensure_ecs_infra",
-                            f"default VPC {vpc_id} has no subnets", repo=repo.name)
+        vpc_json = _ecs_describe_json(
+            ["aws", "ec2", "describe-vpcs", "--filters",
+             "Name=isDefault,Values=true", *region_args],
+            env=env, dry_run=dry)
+        if vpc_json and vpc_json.get("Vpcs"):
+            vpc_id = vpc_json["Vpcs"][0]["VpcId"]
+        if not vpc_id:
+            return _fail("ensure_ecs_infra",
+                         "no default VPC found in this region. Either create a "
+                         "default VPC (aws ec2 create-default-vpc) or set "
+                         "subnets/security_group in config.", repo=repo.name)
+        sn_json = _ecs_describe_json(
+            ["aws", "ec2", "describe-subnets", "--filters",
+             f"Name=vpc-id,Values={vpc_id}", *region_args],
+            env=env, dry_run=dry)
+        subnets = [s["SubnetId"] for s in (sn_json or {}).get("Subnets", [])][:3]
+        if not subnets:
+            return _fail("ensure_ecs_infra",
+                         f"default VPC {vpc_id} has no subnets", repo=repo.name)
+
         # Security group: reuse one named sdlc-<service>-sg or create it.
         sg_name = f"sdlc-{service}-sg"
         sg_json = _ecs_describe_json(
@@ -1038,35 +1019,107 @@ def _ensure_ecs_infra(repo: RepoConfig, target: DeployTarget,
             f"securityGroups=[{sg_id}],"
             "assignPublicIp=ENABLED}"
         ) if not dry else "awsvpcConfiguration={subnets=[...],securityGroups=[...],assignPublicIp=ENABLED}"
-        create_svc = _run(
-            ["aws", "ecs", "create-service", "--cluster", cluster,
-             "--service-name", service,
-             "--task-definition", task_def_arn or service,
-             "--desired-count", "1", "--launch-type", "FARGATE",
-             "--network-configuration", net_cfg, *region_args],
-            env=env, dry_run=dry, check=False, timeout=120)
+        create_cmd = [
+            "aws", "ecs", "create-service", "--cluster", cluster,
+            "--service-name", service,
+            "--task-definition", task_def_arn or service,
+            "--desired-count", "1", "--launch-type", "FARGATE",
+            "--network-configuration", net_cfg,
+                                 ]
+        # ALB wiring — ONLY possible at create-service time. If the caller
+        # resolved/created a target group (greenfield-with-ALB), register the
+        # service to it now. Health-check grace gives the container time to
+        # boot before the ALB starts failing it.
+        if target_group_arn:
+            lb_cfg = (
+                f"targetGroupArn={target_group_arn},"
+                f"containerName={service},"
+                f"containerPort={container_port}"
+            )
+            create_cmd.extend([
+                "--load-balancers", lb_cfg,
+                "--health-check-grace-period-seconds", "60",
+            ])
+            # Zero-downtime rolling: keep 100% of tasks healthy and allow a
+            # second task during deploys (200%). On a REDEPLOY this brings up a
+            # new healthy task BEFORE draining the old one, so the demo URL
+            # never goes cold (no 503 window mid-demo). Only meaningful with an
+            # ALB, so scoped to the ALB-wired branch.
+            create_cmd.extend([
+                "--deployment-configuration",
+                "minimumHealthyPercent=100,maximumPercent=200",
+            ])
+        create_cmd.extend(region_args)
+        create_svc = _run(create_cmd, env=env, dry_run=dry,
+                          check=False, timeout=120)
         if create_svc["returncode"] != 0 and not dry:
             return _fail("ensure_ecs_infra",
                          f"create-service failed: {create_svc['stderr'][-300:]}",
                          repo=repo.name)
         print(f"  [ecs-provision] created service '{service}'")
-        return {"ok": True, "task_def_arn": task_def_arn, "created_service": True}
+        return {"ok": True, "task_def_arn": task_def_arn,
+                "created_service": True, "vpc_id": vpc_id, "subnets": subnets,
+                "container_port": container_port}
 
-    return {"ok": True, "task_def_arn": task_def_arn, "created_service": False}
+    return {"ok": True, "task_def_arn": task_def_arn, "created_service": False,
+            "vpc_id": vpc_id, "subnets": subnets,
+            "container_port": container_port}
+
+
+def _discover_default_vpc_subnets(env: Dict[str, str], region_args: List[str],
+                                  *, dry_run: bool) -> Tuple[str, List[str]]:
+    """Return (vpc_id, subnets) for the account's default VPC. Used to build an
+    ALB BEFORE the ECS service exists (greenfield-with-ALB), so the service can
+    be created already wired to the target group. Returns ("", []) on failure
+    or dry_run (caller handles)."""
+    if dry_run:
+        return ("vpc-dryrun", ["subnet-dry1", "subnet-dry2"])
+    vpc_json = _ecs_describe_json(
+        ["aws", "ec2", "describe-vpcs", "--filters",
+         "Name=isDefault,Values=true", *region_args], env=env, dry_run=False)
+    vpc_id = ""
+    if vpc_json and vpc_json.get("Vpcs"):
+        vpc_id = vpc_json["Vpcs"][0]["VpcId"]
+    if not vpc_id:
+        return ("", [])
+    sn_json = _ecs_describe_json(
+        ["aws", "ec2", "describe-subnets", "--filters",
+         f"Name=vpc-id,Values={vpc_id}", *region_args], env=env, dry_run=False)
+    subnets = [s["SubnetId"] for s in (sn_json or {}).get("Subnets", [])][:3]
+    return (vpc_id, subnets)
 
 
 def _deploy_ecs(repo: RepoConfig, target: DeployTarget,
                 config: DeploymentConfig) -> Dict[str, Any]:
-    """ECS (Fargate) deployment via aws CLI, with create-if-missing infra.
+    """ECS (Fargate) deployment via aws CLI, with create-if-missing infra and
+    SMART, detection-based ALB provisioning for a stable URL.
 
-    If `auto_provision` is enabled (default True), missing infra — cluster,
-    execution role, task definition, security group, and the Fargate service —
-    is created automatically using the account's DEFAULT VPC/subnets. No VPC,
-    gateways, or load balancer are created. Then:
-      - first deploy: the service is created already pointing at the new image.
-      - later deploys: update-service --force-new-deployment (optionally with a
-        freshly registered task def revision).
+    When `enable_alb` is true (opt-in; set it on the deploy target or in a
+    repo's .deploy.yaml `deploy:` block), the deploy first asks the ECS
+    service itself what it's attached to (describe-services -> loadBalancers[])
+    and reconciles to the minimum action:
+
+      * GREENFIELD (service absent): create ALB + target group + listener, then
+        create the service ALREADY wired to the target group (the only time AWS
+        allows attaching a load balancer). Returns the ALB DNS as `endpoint`.
+
+      * BROWNFIELD_WITH_ALB (service already behind a load balancer, of ANY
+        name — detected via the service's own wiring, not a naming convention):
+        create nothing, reuse the existing ALB, just roll the new image.
+        Returns the existing ALB's DNS as `endpoint`.
+
+      * BROWNFIELD_LB_LESS (service exists, no load balancer): update the image
+        only; do NOT try to attach an ALB (AWS forbids adding one to an existing
+        service). Logs that attaching requires a deliberate recreate.
+
+    If `enable_alb` is false, behaves exactly as before (public-IP Fargate, no
+    load balancer) — fully backward compatible.
     """
+    from core.alb_provisioner import (
+        detect_service_alb, ensure_alb_stack, dns_from_target_group,
+        wait_targets_healthy,
+    )
+
     cluster = _opt(repo, target, "cluster", "sdlc-cluster")
     service = _opt(repo, target, "service", repo.name)
 
@@ -1075,11 +1128,73 @@ def _deploy_ecs(repo: RepoConfig, target: DeployTarget,
     env = _aws_env(target)
     region_args = _aws_region_args(target)
 
+    enable_alb = bool(_opt(repo, target, "enable_alb", False))
+    health_check_path = str(_opt(repo, target, "health_check_path", "/health"))
+    container_port = int(_opt(repo, target, "container_port", 8000))
+
+    # Health-check / drain tuning — fast demo defaults, all overridable from
+    # the deploy target config or a repo's .deploy.yaml. These reduce the
+    # bring-up wait from the AWS default (~150s) to ~20s WITHOUT skipping the
+    # health check itself (no functionality removed — only the timings tuned).
+    hc_interval = int(_opt(repo, target, "hc_interval_seconds", 10))
+    hc_healthy_threshold = int(_opt(repo, target, "hc_healthy_threshold", 2))
+    hc_timeout = int(_opt(repo, target, "hc_timeout_seconds", 5))
+    deregistration_delay = int(_opt(repo, target, "deregistration_delay_seconds", 30))
+    health_poll_interval = int(_opt(repo, target, "health_poll_interval_seconds", 3))
+
+    # --- Detect current ALB state for this service (naming-independent) ------
+    alb_state = {"state": "GREENFIELD", "target_group_arn": None}
+    endpoint: Optional[str] = None
+    if enable_alb:
+        print(f"\n  [alb] detecting load-balancer state for service '{service}'...")
+        alb_state = detect_service_alb(cluster, service, env, region_args,
+                                       dry_run=config.dry_run)
+
+    # --- Greenfield-with-ALB: build the ALB BEFORE creating the service ------
+    greenfield_tg_arn: Optional[str] = None
+    if enable_alb and alb_state["state"] == "GREENFIELD":
+        vpc_id, subnets = _discover_default_vpc_subnets(
+            env, region_args, dry_run=config.dry_run)
+        if not config.dry_run and not vpc_id:
+            return _fail("trigger_deploy",
+                         "enable_alb=true but no default VPC found to host the "
+                         "ALB. Create a default VPC or set enable_alb=false.",
+                         repo=repo.name)
+        alb = ensure_alb_stack(
+            service, vpc_id, subnets, container_port, health_check_path,
+            env, region_args, dry_run=config.dry_run,
+            hc_interval=hc_interval,
+            hc_healthy_threshold=hc_healthy_threshold,
+            hc_timeout=hc_timeout,
+            deregistration_delay=deregistration_delay)
+        if not alb.get("ok"):
+            return alb  # _fail dict
+        greenfield_tg_arn = alb["target_group_arn"]
+        endpoint = alb.get("endpoint")
+
+    # --- Brownfield-with-ALB: reuse existing wiring, just roll the image -----
+    elif enable_alb and alb_state["state"] == "BROWNFIELD_WITH_ALB":
+        endpoint = dns_from_target_group(
+            alb_state["target_group_arn"], env, region_args,
+            dry_run=config.dry_run)
+        print(f"  [alb] reusing existing load balancer for '{service}' "
+              f"-> {endpoint}")
+
+    # --- Brownfield-LB-less: cannot attach an ALB to an existing service -----
+    elif enable_alb and alb_state["state"] == "BROWNFIELD_LB_LESS":
+        print(f"  [alb] ⚠ service '{service}' exists WITHOUT a load balancer. "
+              f"AWS does not allow attaching one to an existing service via "
+              f"update-service. Updating the image only. To put it behind an "
+              f"ALB, delete & redeploy the service (one-time recreate).")
+
     auto_provision = bool(_opt(repo, target, "auto_provision", True))
     provisioned_task_def: Optional[str] = None
     just_created_service = False
     if auto_provision:
-        infra = _ensure_ecs_infra(repo, target, config, image)
+        # Pass the target group ARN so a greenfield service is created wired to
+        # the ALB. For brownfield paths this is None (no new wiring).
+        infra = _ensure_ecs_infra(repo, target, config, image,
+                                  target_group_arn=greenfield_tg_arn)
         if not infra.get("ok"):
             return infra  # already a _fail dict
         provisioned_task_def = infra.get("task_def_arn")
@@ -1092,9 +1207,18 @@ def _deploy_ecs(repo: RepoConfig, target: DeployTarget,
             _run(["aws", "ecs", "wait", "services-stable",
                   "--cluster", cluster, "--services", service, *region_args],
                  env=env, dry_run=config.dry_run, check=False, timeout=900)
+        # For a greenfield ALB deploy, wait for the target to pass health checks
+        # so the URL is actually serving (ALB returns 503 until then). The
+        # tuned health check above means this typically clears in ~20s, and the
+        # fine poll interval means we return within ~3s of it going healthy.
+        if greenfield_tg_arn:
+            wait_targets_healthy(greenfield_tg_arn, env, region_args,
+                                 dry_run=config.dry_run,
+                                 poll_interval=health_poll_interval)
         return _ok("trigger_deploy", repo=repo.name, target=target.name,
                    kind="ecs", cluster=cluster, service=service, image=image,
-                   task_definition_arn=provisioned_task_def, created=True)
+                   task_definition_arn=provisioned_task_def, created=True,
+                   endpoint=endpoint, alb_state=alb_state["state"])
 
     if not cluster:
         return _fail("trigger_deploy", "ecs target needs `cluster` "
@@ -1168,7 +1292,8 @@ def _deploy_ecs(repo: RepoConfig, target: DeployTarget,
 
     return _ok("trigger_deploy", repo=repo.name, target=target.name,
                kind="ecs", cluster=cluster, service=service,
-               image=image, task_definition_arn=new_task_def_arn)
+               image=image, task_definition_arn=new_task_def_arn,
+               endpoint=endpoint, alb_state=alb_state["state"])
 
 
 def _deploy_lambda(repo: RepoConfig, target: DeployTarget,

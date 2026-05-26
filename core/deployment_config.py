@@ -221,6 +221,8 @@ class DeploymentConfig:
     default_feature_flags: List[Dict[str, Any]] = field(default_factory=list)
     default_rollback_steps: List[str] = field(default_factory=list)
     dry_run: bool = False           # if True, log commands but don't execute
+    deploy_parallelism: int = 4     # max concurrent repos per dependency level
+    # (1 = fully sequential)
 
     def get_repo(self, repo_name: str) -> RepoConfig:
         """Get repo config by name. Returns a default config if not declared
@@ -352,6 +354,7 @@ def _parse(raw: Dict[str, Any], source: str = "") -> DeploymentConfig:
     cfg.project_name = raw.get("project_name", cfg.project_name)
     cfg.workspace_dir = raw.get("workspace_dir", cfg.workspace_dir)
     cfg.dry_run = bool(raw.get("dry_run", False))
+    cfg.deploy_parallelism = int(raw.get("deploy_parallelism", 4) or 4)
     cfg.cli_auto_install = bool(raw.get("cli_auto_install", False))
 
     cfg.required_clis = [
