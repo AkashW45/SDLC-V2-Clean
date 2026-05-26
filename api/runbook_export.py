@@ -124,7 +124,15 @@ def export_runbook_excel(pipeline_state: dict) -> bytes:
     row = _kv(ws, row, "Change ID",          pipeline_state.get("thread_id", ""))
     row = _kv(ws, row, "Release Description", brd.get("title") or prd.get("title") or requirement[:80])
     row = _kv(ws, row, "Project",             brd.get("title", "SDLC-V2"))
-    row = _kv(ws, row, "Risk Level",          impact.get("risk_assessment", {}).get("risk_level", "TBD").upper())
+    # B13 fix: clearer messaging when Phase 3 hasn't run yet
+    _risk_assessment = (impact or {}).get("risk_assessment") or {}
+    _risk_level = _risk_assessment.get("risk_level")
+    if not _risk_level:
+        if impact:
+            _risk_level = "Low (Greenfield — no existing code)"
+        else:
+            _risk_level = "Pending Phase 3 Impact Analysis"
+    row = _kv(ws, row, "Risk Level", _risk_level)
     row = _kv(ws, row, "Generated",           datetime.now().strftime("%Y-%m-%d %H:%M"))
     row = _kv(ws, row, "Pipeline Status",     pipeline_state.get("status", ""))
     row += 1

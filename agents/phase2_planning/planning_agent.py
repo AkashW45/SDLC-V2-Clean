@@ -333,9 +333,48 @@ def create_jira_tickets(state: PlanningState) -> PlanningState:
 def generate_runbook(state: PlanningState) -> PlanningState:
     print("\n[Phase 2] Generating runbook...")
 
+    # B10/B12 fix: pull ADR + architecture so runbook tech stack matches what
+    # Phase 1 decided, instead of the LLM guessing Kubernetes for a Flask app.
+    adr = state.get("adr", {}) or {}
+    architecture = state.get("architecture", {}) or {}
+    scope_contract = state.get("scope_contract", {}) or {}
+    depth_level = scope_contract.get("depth_level", 3)
+
+    try:
+        adr_summary = json.dumps(adr, indent=2)[:2000] if adr else "No ADR provided."
+    except Exception:
+        adr_summary = str(adr)[:2000]
+
+    try:
+        arch_summary = json.dumps(architecture, indent=2)[:1500] if architecture else "No architecture provided."
+    except Exception:
+        arch_summary = str(architecture)[:1500]
+
     runbook = call_llm(f"""
 You are a senior DevOps engineer.
 Generate a deployment runbook for this feature.
+
+══════════════════════════════════════════════════════════════════════
+BINDING TECH STACK — Use this EXACTLY. Do NOT invent technologies.
+══════════════════════════════════════════════════════════════════════
+ADR (Architecture Decision Records — the authoritative tech choices):
+{adr_summary}
+
+ARCHITECTURE:
+{arch_summary}
+
+DEPTH LEVEL: {depth_level}
+
+DEPLOYMENT CONSTRAINTS — STRICT:
+1. Deployment commands MUST match the ADR's deployment platform and the architecture's deployment_model.
+2. Do NOT propose Kubernetes, Helm, kubectl, or container orchestration UNLESS the ADR explicitly specifies them.
+3. If ADR storage is in-memory or file-based: OMIT all database migration steps from pre_deployment_checklist and rollback_steps. Do NOT reference alembic, flyway, or any migration tool.
+4. If ADR storage is relational (PostgreSQL/MySQL/SQLite): include migrations using the matching tool (alembic for Python, flyway for Java, migrate for Go).
+5. Match runbook complexity to depth_level. A depth-2 Flask app gets a simple 5-step runbook with `python app.py` or `gunicorn app:app`, NOT a 20-step blue-green procedure.
+6. smoke_test_checklist must hit the actual endpoints the ADR/architecture defines.
+7. If depth_level <= 2 and ADR does not mention containers: deployment commands should be plain shell commands (`python -m venv venv`, `pip install`, `python app.py`) not Docker.
+══════════════════════════════════════════════════════════════════════
+
 Return ONLY valid JSON:
 {{
   "feature": "...",
@@ -344,9 +383,9 @@ Return ONLY valid JSON:
   "deployment_sequence": [
     {{
       "step": 1,
-      "repo": "leave-mgmt-backend",
+      "repo": "<repo name from architecture>",
       "action": "...",
-      "command": "...",
+      "command": "<concrete command matching the ADR platform>",
       "rollback_command": "..."
     }}
   ],
@@ -385,7 +424,6 @@ Sprint plan epics: {json.dumps([e['title'] for e in state['sprint_plan'].get('ep
 
     print(f"  ✅ Runbook generated: {len(runbook.get('deployment_sequence', []))} deployment steps")
     return {**state, "runbook": runbook, "status": "RUNBOOK_GENERATED"}
-
 
 def human_approval_gate(state: PlanningState) -> PlanningState:
     print("\n[Phase 2] ⏸ Waiting for human approval...")

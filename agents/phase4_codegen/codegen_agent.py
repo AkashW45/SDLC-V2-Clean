@@ -54,7 +54,7 @@ class CodegenState(TypedDict, total=False):
 # Helpers
 # -----------------------------------------
 
-def call_llm(prompt: str, max_tokens: int = 8192) -> str:
+def call_llm(prompt: str, max_tokens: int = 80000) -> str:
     response = client.chat.completions.create(
         model="deepseek-v4-flash",
         messages=[{"role": "user", "content": prompt}],
@@ -365,7 +365,7 @@ def generate_fresh_project(state: CodegenState) -> CodegenState:
     }}
     """
 
-    response = call_llm(prompt, max_tokens=4000)
+    response = call_llm(prompt, max_tokens=80000)
     if response.startswith("```"):
         response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
 
@@ -587,7 +587,7 @@ Return ONLY valid JSON in this exact format:
         success = False
 
         for attempt in range(1, max_retries + 1):
-            response = call_llm(prompt, max_tokens=4000)
+            response = call_llm(prompt, max_tokens=80000)
             if response.startswith("```"):
                 response = re.sub(r"```(?:json)?", "", response).strip().strip("```").strip()
 

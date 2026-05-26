@@ -332,23 +332,27 @@
     const allProjects = preview.all_projects || [];
     const newSlug = preview.new_project_preview?.slug || 'new-project';
 
-    // Collect unique repo names across all registered projects (for manual mode)
+    // Accept both string repos and object repos {name, url, type}
     const allRepos = Array.from(new Set(
-            allProjects.flatMap(p => p.repos || []).filter(r => typeof r === 'string')
+            allProjects.flatMap(p => (p.repos || []).map(r => {
+              if (typeof r === 'string') return r;
+              if (r && typeof r === 'object') return r.name || r.full_name;
+              return null;
+            }).filter(Boolean))
     )).sort();
 
     const candidatesHtml = candidates.length ? candidates.map((c, i) => `
-    <label style="display:block;padding:12px;border:1px solid #2a3a4a;border-radius:6px;margin-bottom:6px;cursor:pointer;background:#0f1620">
-      <input type="radio" name="route" value="existing:${c.id}" data-repos='${JSON.stringify(c.repos || [])}' ${i===0?'checked':''} />
-      <strong style="color:#00ff88">${c.name || c.id}</strong>
-      <span style="font-size:10px;color:#00d4ff;margin-left:8px">match: ${(c.score*100).toFixed(0)}%</span>
-      <div style="font-size:10px;color:#888;margin-top:4px">
-        ${(c.repos || []).map(r => typeof r === 'object' ? (r.name || r.full_name || 'unnamed') : r).join(', ')}
-      </div>
-      <div style="font-size:10px;color:#666;margin-top:2px">${(c.description || '').slice(0, 100)}</div>
-    </label>
-  `).join('') : '<div style="color:#888;font-size:11px;padding:10px">No semantic matches found.</div>';
-
+      <label style="display:block;padding:12px;border:1px solid #2a3a4a;border-radius:6px;margin-bottom:6px;cursor:pointer;background:#0f1620">
+        <input type="radio" name="route" value="existing:${c.project_id || c.id}" data-repos='${JSON.stringify(c.repos || [])}' ${i===0?'checked':''} />
+        <strong style="color:#00ff88">${c.project_name || c.name || c.project_id || c.id}</strong>
+        <span style="font-size:10px;color:#00d4ff;margin-left:8px">match: ${(c.score*100).toFixed(0)}%</span>
+        <div style="font-size:10px;color:#888;margin-top:4px">
+          ${(c.repos || []).map(r => typeof r === 'object' ? (r.name || r.full_name || 'unnamed') : r).join(', ')}
+        </div>
+        <div style="font-size:10px;color:#666;margin-top:2px">${(c.description || '').slice(0, 100)}</div>
+      </label>
+    `).join('') : '<div style="color:#888;font-size:11px;padding:10px">No semantic matches found.</div>';
+    
     const reposHtml = allRepos.map(r => `
     <label style="display:inline-block;padding:5px 10px;margin:3px;border:1px solid #2a3a4a;border-radius:14px;font-size:10px;cursor:pointer;color:#ccc">
       <input type="checkbox" name="manual_repo" value="${r}" /> ${r}
@@ -1044,9 +1048,10 @@
     if (state.selected_project) {
       const proj = state.selected_project;
       const isNew = state.is_new_project;
-      const repos = (state.selected_repos || []).map(r =>
-              `<code style="background:var(--surface2);color:var(--blue);padding:2px 6px;border-radius:4px;font-size:10px">${r.name}</code>`
-      ).join(' ');
+      const repos = (state.selected_repos || []).map(r => {
+        const name = typeof r === 'object' ? (r.name || r.full_name || 'unnamed') : r;
+        return `<code style="background:var(--surface2);color:var(--blue);padding:2px 6px;border-radius:4px;font-size:10px">${name}</code>`;
+      }).join(' ');
       html += `
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:16px">
         <div style="font-size:9px;color:var(--text3);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">
@@ -1709,8 +1714,37 @@
     if (isWaiting && !html.includes('Human Review Required')) {
       html += approvalZone(selectedThread);
     }
+    // B17 fix: preserve feedback textbox values across re-renders
+    const savedFeedback = {};
+    document.querySelectorAll('.feedback-input, textarea[id^="feedback-"], input[id^="feedback-"]').forEach(elt => {
+      if (elt.id) savedFeedback[elt.id] = elt.value;
+    });
 
+    // Also preserve which feedback field has focus and the cursor position
+    const activeEl = document.activeElement;
+    const activeFeedbackId = (activeEl && activeEl.id && activeEl.id.startsWith('feedback-'))
+      ? activeEl.id : null;
+    const activeCursorPos = activeFeedbackId
+      ? (activeEl.selectionStart || 0) : 0;
     el.innerHTML = html;
+    // B17 fix: restore feedback values after innerHTML replacement
+    Object.entries(savedFeedback).forEach(([id, val]) => {
+      const elem = document.getElementById(id);
+      if (elem && val) {
+        elem.value = val;
+      }
+    });
+
+    // Restore focus + cursor position to the feedback textbox the user was typing in
+    if (activeFeedbackId) {
+      const focusEl = document.getElementById(activeFeedbackId);
+      if (focusEl) {
+        focusEl.focus();
+        try {
+          focusEl.setSelectionRange(activeCursorPos, activeCursorPos);
+        } catch (e) { /* readonly fields don't support this */ }
+      }
+    }
 
     // Render Mermaid diagrams that aren't cached yet
     setTimeout(async () => {
@@ -1745,7 +1779,13 @@
                   .replace(/\s+(class\s+[A-Z_0-9]+\s+\w+Style)/g, '\n  $1')
                   .replace(/(\]|\))\s+([A-Z_][A-Z_0-9]*\s*(\[|\(|--))/g, '$1\n  $2');
         }
-
+        rawCode = rawCode.replace(/\|([^|]+)\|/g, (match, label) => {
+              const cleaned = label
+              .replace(/[()[\]{}"`'\\]/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+            return `|${cleaned}|`;
+        });
         try {
           const id = 'mermaid-svg-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
           const { svg } = await mermaid.render(id, rawCode);

@@ -375,46 +375,44 @@ def push_code(state: DeliveryState) -> DeliveryState:
     # pipeline as if code landed — that was the bug that hid empty repos.
     if push_result["status"] == "PUSH_SUCCESS":
         print(f"  ✅ Pushed {push_result.get('files_pushed', 0)} files")
-        # ─── Auto-register newly-created repos into the knowledge layer ───
-    # Without this, Phase 0 routing and the manual repo picker won't see
-    # the new repo on subsequent pipeline runs. The repo exists on GitHub
-    # but is invisible to the platform's knowledge layer.
-    if newly_created and _REGISTRY_AVAILABLE:
-        try:
-            print(f"  [Phase 6] Auto-registering '{repo_name}' into knowledge layer...")
-            register_project(
-                project_id=repo_name,
-                project_name=repo_name.replace("-", " ").title(),
-                description=(state.get("requirement", "")[:300]
-                             or f"Auto-created by SDLC-V2 pipeline"),
-                domain="generated",
-                tech_stack=[],   # detected later by indexer
-                repos=[repo_name],
-                owner_team="SDLC-V2",
-            )
-            print(f"  [Phase 6] ✅ Registered '{repo_name}' in projects table + Qdrant")
 
-            # Queue the indexer so symbols/code embeddings get populated too.
-            # Without this, the repo is route-able but Phase 3 can't actually
-            # do impact analysis on it (no code_embeddings).
+        # ─── Auto-register newly-created repos into the knowledge layer ───
+        # Without this, Phase 0 routing and the manual repo picker won't see
+        # the new repo on subsequent pipeline runs. The repo exists on GitHub
+        # but is invisible to the platform's knowledge layer.
+        if newly_created and _REGISTRY_AVAILABLE:
             try:
-                queue = get_queue()
-                repo_url_for_index = f"https://github.com/{EFFECTIVE_OWNER}/{repo_name}.git"
-                job_id = queue.enqueue(
-                    repo_name=repo_name,
-                    repo_url=repo_url_for_index,
-                    branch="main",
-                    force=False,
+                print(f"  [Phase 6] Auto-registering '{repo_name}' into knowledge layer...")
+                register_project(
+                    project_id=repo_name,
+                    project_name=repo_name.replace("-", " ").title(),
+                    description=(state.get("requirement", "")[:300]
+                                 or f"Auto-created by SDLC-V2 pipeline"),
+                    domain="generated",
+                    tech_stack=[],   # detected later by indexer
+                    repos=[repo_name],
+                    owner_team="SDLC-V2",
                 )
-                print(f"  [Phase 6] ✅ Queued indexer job {job_id} for '{repo_name}'")
-            except Exception as queue_err:
-                print(f"  [Phase 6] ⚠️  Indexer queue unavailable: {queue_err} "
-                      f"(repo registered but symbols not indexed)")
-        except Exception as e:
-            # Non-fatal — pipeline must continue even if registration fails.
-            # User can always re-sync manually via /knowledge/projects/sync.
-            print(f"  [Phase 6] ⚠️  Auto-register failed: {e} — pipeline continues. "
-                  f"Run /knowledge/projects/sync to register manually.")
+                print(f"  [Phase 6] ✅ Registered '{repo_name}' in projects table + Qdrant")
+                # Queue the indexer so symbols/code embeddings get populated too.
+                try:
+                    queue = get_queue()
+                    repo_url_for_index = f"https://github.com/{EFFECTIVE_OWNER}/{repo_name}.git"
+                    job_id = queue.enqueue(
+                        repo_name=repo_name,
+                        repo_url=repo_url_for_index,
+                        branch="main",
+                        force=False,
+                    )
+                    print(f"  [Phase 6] ✅ Queued indexer job {job_id} for '{repo_name}'")
+                except Exception as queue_err:
+                    print(f"  [Phase 6] ⚠️  Indexer queue unavailable: {queue_err} "
+                          f"(repo registered but symbols not indexed)")
+            except Exception as e:
+                # Non-fatal — pipeline must continue even if registration fails.
+                print(f"  [Phase 6] ⚠️  Auto-register failed: {e} — pipeline continues. "
+                      f"Run /knowledge/projects/sync to register manually.")
+
         return {**state, "status": "CODE_PUSHED"}
 
     err = push_result.get("error") or push_result["status"]

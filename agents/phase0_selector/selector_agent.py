@@ -49,24 +49,37 @@ def search_projects(requirement: str, top_k: int = 3):
 
     try:
         vector = embedder.encode(requirement).tolist()
-        results = qdrant.query_points(
+        results = get_qdrant().query_points(
             collection_name="project_embeddings",
             query=vector,
-            limit=top_k,
-            with_payload=True
+            limit=top_k * 3,           # over-fetch since we'll dedupe
+            with_payload=True,
         )
 
-        candidates = []
+        # ─── DEDUPE by project_id keeping highest score (B1 fix) ───
+        seen = {}
         for r in results.points:
-            payload = r.payload or {}
-            candidates.append({
-                "id": payload.get("project_id", ""),
-                "name": payload.get("name", ""),
-                "description": payload.get("description", ""),
-                "repos": payload.get("repos", []),
-                "score": round(r.score, 4)
+            p = r.payload or {}
+            pid = p.get("project_id", "")
+            if not pid:
+                continue
+            if pid not in seen or r.score > seen[pid].score:
+                seen[pid] = r
+
+        # Build candidate list from deduped results, top_k highest
+        deduped = sorted(seen.values(), key=lambda x: x.score, reverse=True)[:top_k]
+        out = []
+        for r in deduped:
+            p = r.payload or {}
+            out.append({
+                "project_id": p.get("project_id", ""),
+                "project_name": p.get("project_name", ""),
+                "description": p.get("description", ""),
+                "domain": p.get("domain", ""),
+                "repos": p.get("repos", []),
+                "score": round(r.score, 4),
             })
-        return candidates
+        return out
     except Exception as e:
         print(f"[Phase 0] Qdrant search failed: {e}")
         return []
@@ -88,7 +101,8 @@ def select_project_node(state: SelectorState) -> SelectorState:
         for c in candidates:
             print(f"    - {c['name']} (score: {c['score']})")
 
-    if candidates and candidates[0]["score"] >= 0.4:
+    threshold = float(os.getenv("PHASE0_MATCH_THRESHOLD", "0.55"))
+    if candidates and candidates[0]["score"] >= threshold:
         selected = candidates[0]
         print(f"  ✅ Auto-selected: {selected['name']} (score: {selected['score']})")
         return {

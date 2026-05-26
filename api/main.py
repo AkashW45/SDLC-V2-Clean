@@ -697,13 +697,9 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
 
     if next_phase == "2": background_tasks.add_task(run_phase2, thread_id, "")
     elif next_phase == "3":
-        # Main's Fix: Skip Phase 3 for new projects
-        if entry.get("current_state", {}).get("is_new_project", False):
-            print(f"  [Approve] New project — skipping Phase 3, jumping to Phase 4")
-            entry["phase"] = 4
-            background_tasks.add_task(run_phase4, thread_id)
-        else:
-            background_tasks.add_task(run_phase3, thread_id, "")
+    # Phase 3 runs for ALL pipelines. Greenfield gets an empty impact_report
+    # (no existing code to analyze) but still passes through the approval gate.
+        background_tasks.add_task(run_phase3, thread_id, "")
     elif next_phase == "4": background_tasks.add_task(run_phase4, thread_id)
     elif next_phase == "5": background_tasks.add_task(run_phase5, thread_id)
     elif next_phase == "6": background_tasks.add_task(run_phase6, thread_id, "")
@@ -1986,7 +1982,7 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
 
 
 def _safe_state(state: dict) -> dict:
-    safe_keys = ["selected_project", "selected_repos", "is_new_project", "candidates", "scope_contract", "classifier_output", "brd", "prd", "adr", "architecture", "sprint_plan", "runbook", "jira_tickets", "impact_report", "generated_changes", "test_files", "pr_urls", "target_repo", "deploy_results", "monitoring_results", "deploy_sequence", "feature_flags", "rollback_triggered", "status", "requirement", "merged_shas", "merge_errors", "phase6_final_status"]
+    safe_keys = ["selected_project", "selected_repos", "is_new_project", "candidates", "scope_contract", "classifier_output", "brd", "prd", "adr", "architecture", "sprint_plan", "runbook", "jira_tickets", "impact_report", "generated_changes", "test_files", "pr_urls", "target_repo", "deploy_results", "monitoring_results", "deploy_sequence", "feature_flags", "rollback_triggered", "status", "requirement", "merged_shas", "merge_errors", "phase6_final_status","depth_level"]
     result = {}
     for k in safe_keys:
         if k in state:
@@ -1995,6 +1991,12 @@ def _safe_state(state: dict) -> dict:
                 json.dumps(v)
                 result[k] = v
             except: result[k] = str(v)
+    # Surface depth_level at top-level for external querying (B8/B9 fix)
+    classifier_out = state.get("classifier_output", {})
+    if classifier_out and "depth_level" not in result:
+       asp = classifier_out.get("asp", {}) if isinstance(classifier_out, dict) else {}
+       if "depth_level" in asp:
+           result["depth_level"] = asp["depth_level"]        
     return result
 
 @app.get("/pipeline/{thread_id}/audit")

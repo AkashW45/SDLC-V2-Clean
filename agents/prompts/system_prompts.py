@@ -110,6 +110,12 @@ Words like "system", "platform", "enterprise" add nothing. "For our company" is 
 ANTI-DEFLATION: Explicit compliance terms force Level 5. "Production" + a named external
 system forces minimum Level 4.
 
+HARD RULES (override LLM judgment):
+- Any REST API requirement with 3 or more distinct endpoints is MINIMUM depth 3, regardless of production_intent.
+- Any requirement mentioning CRUD operations on a persistent entity is MINIMUM depth 3.
+- Any requirement involving authentication, authorization, or user accounts is MINIMUM depth 3.
+- These rules OVERRIDE any tendency to deflate depth based on missing production signals.
+
 POLICY MODE — infer from the requirement's risk:
 - "open":        user explicitly says "no constraints" / "go wild" / "full freedom", OR a
                  throwaway demo. Set allow_unbounded = true.
@@ -175,7 +181,7 @@ OUTPUT SCHEMA:
 
 FORBIDDEN ELEMENTS — populate based on depth (these are HARD blockers downstream):
 - depth 1-2: ["microservices","kubernetes","kafka","multi_region","load_balancer",
-              "api_gateway","service_mesh","ci_cd_pipeline"]
+              "api_gateway","service_mesh"]
 - depth 3:   ["microservices","multi_region","service_mesh"]  — add "kafka" UNLESS the
              requirement says "streaming" or "async"
 - depth 4:   ["service_mesh","multi_region"] — unless the requirement explicitly names them
@@ -267,7 +273,10 @@ OUTPUT — one JSON object:
 }
 
 RULES:
-- Stakeholders: only roles named or directly implied by the requirement. No inventions.
+- Stakeholders: ALWAYS produce a minimum of 3 stakeholder personas, even for small requirements.
+  Default trio when nothing else is implied: End User, Developer, Product Owner.
+  Add Compliance, Operations, Security, Support roles when the requirement implies them.
+  A BRD with only one stakeholder is invalid.
 - Risks: only risks the requirement's features/integrations actually create.
 - KPIs: only metrics measurable from what the requirement states.
 - Every FR's traces_to must point to a real core_capability phrase.
@@ -368,6 +377,12 @@ ABSOLUTE RULES:
 - Buzzword technologies (microservices, event-driven, CQRS, service mesh) appear ONLY
   if the PRD's NFRs genuinely justify them AND they are not in asp.forbidden_elements.
 
+PERSISTENT STORAGE MANDATE (B7 fix):
+- A REST API or service without persistent storage is NOT a real service — it is a demo.
+- Depth 1 (true toy/demo): in-memory dict OR SQLite acceptable, only if requirement explicitly says "temporary", "ephemeral", or "demo".
+- Depth 2: SQLite minimum. NEVER choose pure in-memory Python dict for depth 2 unless requirement explicitly mandates it.
+- Depth 3+: PostgreSQL, MySQL, or equivalent production database. SQLite acceptable only for read-heavy embedded use cases.
+- If you propose in-memory storage at depth 2 or higher, you have made a wrong decision. The data must survive a server restart.
 OUTPUT — one JSON object:
 
 {
@@ -496,6 +511,16 @@ ABSOLUTE RULES:
 - Acceptance criteria are copied from the PRD, not paraphrased.
 - Ticket hierarchy (Epic / Story / Task / Subtask) is used when the project genuinely
   has that structure — a small project may be flat Tasks; a large one needs Epics.
+
+  
+EPIC STRUCTURE REQUIREMENTS (B11 fix):
+- Generate AT MINIMUM 2 epics, regardless of how small the requirement is:
+  1. "Setup & Foundation" — scaffolding, dependencies, config, environment setup, base infrastructure
+  2. "Feature Implementation" — actual user-facing functionality from the PRD
+- Add a third epic "Testing & Quality" when depth >= 3 (test infrastructure, unit/integration tests, smoke tests)
+- Add a fourth epic "Deployment & Operations" when depth >= 4 (CI/CD, monitoring, runbook automation)
+- NEVER place all stories in a single epic. A sprint plan with only 1 epic is INVALID.
+- Each epic must contain at least 1 story. An empty epic is invalid.
 
 OUTPUT — one JSON object:
 
