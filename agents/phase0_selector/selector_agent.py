@@ -230,30 +230,65 @@ def sync_github_repos_to_registry(owner: str = None) -> dict:
     # Get current registry
     existing = {p["project_id"] for p in list_all_projects()}
 
+    # Get repos that have already been indexed (have a repo_maps row)
+    indexed_repos: set = set()
+    try:
+        from core.db_clients import pg_conn
+        with pg_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT repo_name FROM repo_maps")
+            indexed_repos = {row[0] for row in cur.fetchall()}
+            cur.close()
+    except Exception as e:
+        print(f"[Registry Backfill] Could not check repo_maps (non-fatal): {e}")
+
     added = []
     skipped = []
+    queued_index = []
     errors = []
+
+    try:
+        from agents.indexer_queue import get_queue
+        queue = get_queue()
+    except Exception as e:
+        queue = None
+        print(f"[Registry Backfill] Indexer queue unavailable (non-fatal): {e}")
 
     for repo in all_repos:
         repo_name = repo.get("name", "")
         if not repo_name:
             continue
-        if repo_name in existing:
-            skipped.append(repo_name)
-            continue
-        try:
-            register_project(
-                project_id=repo_name,
-                project_name=repo_name.replace("-", " ").title(),
-                description=repo.get("description", "") or f"GitHub repo {owner}/{repo_name}",
-                domain="",
-                tech_stack=[repo.get("language", "")] if repo.get("language") else [],
-                repos=[repo_name],
-                owner_team="",
-            )
-            added.append(repo_name)
-        except Exception as e:
-            errors.append(f"{repo_name}: {e}")
 
-    print(f"[Registry Backfill] Added {len(added)}, Skipped {len(skipped)}, Errors {len(errors)}")
-    return {"added": added, "skipped": skipped, "errors": errors}    
+        # Register if missing from registry
+        if repo_name not in existing:
+            try:
+                register_project(
+                    project_id=repo_name,
+                    project_name=repo_name.replace("-", " ").title(),
+                    description=repo.get("description", "") or f"GitHub repo {owner}/{repo_name}",
+                    domain="",
+                    tech_stack=[repo.get("language", "")] if repo.get("language") else [],
+                    repos=[repo_name],
+                    owner_team="",
+                )
+                added.append(repo_name)
+            except Exception as e:
+                errors.append(f"{repo_name}: {e}")
+                continue
+        else:
+            skipped.append(repo_name)
+
+        # Enqueue indexing if this repo has never been indexed (no repo_maps row)
+        if repo_name not in indexed_repos and queue is not None:
+            try:
+                clone_url = repo.get("clone_url") or f"https://github.com/{owner}/{repo_name}.git"
+                branch = repo.get("default_branch", "main")
+                queue.enqueue(repo_name=repo_name, repo_url=clone_url, branch=branch)
+                queued_index.append(repo_name)
+                print(f"[Registry Backfill] Enqueued index for unindexed repo: {repo_name}")
+            except Exception as e:
+                print(f"[Registry Backfill] Could not enqueue index for {repo_name}: {e}")
+
+    print(f"[Registry Backfill] Added {len(added)}, Skipped {len(skipped)}, "
+          f"Queued-for-index {len(queued_index)}, Errors {len(errors)}")
+    return {"added": added, "skipped": skipped, "queued_index": queued_index, "errors": errors}
