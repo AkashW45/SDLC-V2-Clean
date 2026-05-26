@@ -90,6 +90,31 @@ def slugify(text: str, max_len: int = 40) -> str:
     return slug or "new-project"
 
 
+def _infer_repo_kind(requirement: str) -> tuple:
+    """Infer (repo_type, language) for a greenfield repo from the requirement.
+
+    Greenfield produces ONE repo; we pick the most likely kind from keywords so
+    the repo name/type matches what codegen will actually generate. Defaults to
+    a Python backend — the most common case and what the CI/CD generator's
+    greenfield stack assumes — when nothing more specific is detected.
+    """
+    r = (requirement or "").lower()
+    frontend_kw = ("frontend", "front-end", "ui", "web app", "webapp",
+                   "react", "angular", "vue", "dashboard", "website",
+                   "landing page", "single page")
+    # Word-boundary match so short tokens like "ui" don't match inside
+    # unrelated words ("build", "guide", "require"). Multi-word phrases are
+    # checked as substrings since they can't false-match a single word.
+    def _hit(kw: str) -> bool:
+        if " " in kw or "-" in kw:
+            return kw in r
+        return re.search(rf"\b{re.escape(kw)}\b", r) is not None
+    if any(_hit(k) for k in frontend_kw):
+        return ("frontend", "typescript")
+    # Everything else (APIs, services, backends, jobs, generic) → backend.
+    return ("backend", "python")
+
+
 def select_project_node(state: SelectorState) -> SelectorState:
     print("\n[Phase 0] Searching for matching project...")
     requirement = state["requirement"]
@@ -99,12 +124,15 @@ def select_project_node(state: SelectorState) -> SelectorState:
     if candidates:
         print(f"  Found {len(candidates)} candidates:")
         for c in candidates:
-            print(f"    - {c['name']} (score: {c['score']})")
+            print(f"    - {c.get('project_name', c.get('name', '?'))} "
+                  f"(score: {c['score']})")
 
     threshold = float(os.getenv("PHASE0_MATCH_THRESHOLD", "0.55"))
     if candidates and candidates[0]["score"] >= threshold:
         selected = candidates[0]
-        print(f"  ✅ Auto-selected: {selected['name']} (score: {selected['score']})")
+        print(f"  ✅ Auto-selected: "
+              f"{selected.get('project_name', selected.get('name', '?'))} "
+              f"(score: {selected['score']})")
         return {
             **state,
             "candidates": candidates,
@@ -118,19 +146,29 @@ def select_project_node(state: SelectorState) -> SelectorState:
     slug = slugify(requirement)
     print(f"  🆕 NEW PROJECT — slug: {slug}")
 
+    # ─── B-FIX: create a SINGLE repo for greenfield ──────────────────────
+    # Previously this hardcoded TWO repos ({slug}-backend AND {slug}-frontend)
+    # for every new project. But Phase 4 (codegen) and Phase 3 (impact) only
+    # produce ONE repo's worth of code for greenfield, and Phase 6 pushes to a
+    # single target repo. The extra frontend repo was therefore created empty
+    # and never received code — a phantom repo. We now create one repo whose
+    # type/language is inferred from the requirement text, matching what the
+    # rest of the pipeline actually generates.
+    #
+    # The owner is read from env (GITHUB_ORG / GITHUB_REPO_OWNER) so the URL
+    # here matches where Phase 6 will actually create the repo, instead of a
+    # hardcoded personal account.
+    owner = (os.getenv("GITHUB_ORG", "").strip()
+             or os.getenv("GITHUB_REPO_OWNER", "AkashW45"))
+    repo_type, language = _infer_repo_kind(requirement)
+    repo_name = f"{slug}-{repo_type}" if repo_type != "service" else slug
+
     new_repos = [
         {
-            "name": f"{slug}-backend",
-            "type": "backend",
-            "language": "python",
-            "url": f"https://github.com/AkashW45/{slug}-backend.git",
-            "exists": False
-        },
-        {
-            "name": f"{slug}-frontend",
-            "type": "frontend",
-            "language": "typescript",
-            "url": f"https://github.com/AkashW45/{slug}-frontend.git",
+            "name": repo_name,
+            "type": repo_type,
+            "language": language,
+            "url": f"https://github.com/{owner}/{repo_name}.git",
             "exists": False
         }
     ]

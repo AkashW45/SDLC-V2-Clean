@@ -697,8 +697,8 @@ def pipeline_approve(thread_id: str, body: dict = Body(...), background_tasks: B
 
     if next_phase == "2": background_tasks.add_task(run_phase2, thread_id, "")
     elif next_phase == "3":
-    # Phase 3 runs for ALL pipelines. Greenfield gets an empty impact_report
-    # (no existing code to analyze) but still passes through the approval gate.
+        # Phase 3 runs for ALL pipelines. Greenfield gets an empty impact_report
+        # (no existing code to analyze) but still passes through the approval gate.
         background_tasks.add_task(run_phase3, thread_id, "")
     elif next_phase == "4": background_tasks.add_task(run_phase4, thread_id)
     elif next_phase == "5": background_tasks.add_task(run_phase5, thread_id)
@@ -1647,6 +1647,20 @@ def run_phase5(thread_id: str):
         )
 
 
+def _find_available_repo_name(owner, base_name, headers, req_lib, max_tries=50):
+    """Return the first repo name under `owner` that does NOT already exist,
+    trying base_name-2, base_name-3, … up to max_tries. Returns None if every
+    candidate in range is taken. Used to keep greenfield projects from reusing
+    a pre-existing same-named repo."""
+    for n in range(2, max_tries + 1):
+        candidate = f"{base_name}-{n}"
+        resp = req_lib.get(
+            f"https://api.github.com/repos/{owner}/{candidate}", headers=headers)
+        if resp.status_code == 404:
+            return candidate
+    return None
+
+
 def run_phase6(thread_id: str, feedback: str = ""):
     try:
         from agents.phase6_delivery.delivery_agent import build_delivery_graph, DeliveryState
@@ -1685,6 +1699,38 @@ def run_phase6(thread_id: str, feedback: str = ""):
 
         if is_new_project or not target_repo.get("exists", True):
             check_resp = req_lib.get(f"https://api.github.com/repos/{github_owner}/{target_repo_name}", headers=gh_headers)
+
+            # ─── B-FIX: greenfield must NOT reuse an existing repo ───────────
+            # Previously, if the requested name already existed (200), this
+            # block did nothing and the pipeline pushed its "new project" code
+            # straight into that pre-existing repo — silently reusing it. For a
+            # declared greenfield project that's wrong: it can clobber/mix into
+            # an unrelated repo that merely shares a name. If the name is taken,
+            # we find the next free name (-2, -3, …), create THAT fresh repo,
+            # and re-point the target so all downstream push/PR/deploy use it.
+            if check_resp.status_code in (200, 301):
+                print(f"  ⚠ greenfield name '{target_repo_name}' already exists "
+                      f"— finding a free name instead of reusing it")
+                free_name = _find_available_repo_name(
+                    github_owner, target_repo_name, gh_headers, req_lib)
+                if not free_name:
+                    err = (f"greenfield repo '{target_repo_name}' already exists "
+                           f"and no free variant (-2..-50) was available")
+                    print(f"  ❌ {err}")
+                    pipeline_store[thread_id].update({"status": "ERROR", "error": err})
+                    save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(state))
+                    return
+                print(f"  ↳ using fresh greenfield repo name: '{free_name}'")
+                target_repo_name = free_name
+                target_repo_url = f"https://github.com/{github_owner}/{target_repo_name}.git"
+                target_repo["name"] = free_name
+                target_repo["url"] = target_repo_url
+                # keep selected_repos / state consistent for later phases
+                state["selected_repos"] = selected_repos
+                check_resp = req_lib.get(
+                    f"https://api.github.com/repos/{github_owner}/{target_repo_name}",
+                    headers=gh_headers)
+
             if check_resp.status_code == 404:
                 create_resp = req_lib.post(
                     create_url,
@@ -1994,9 +2040,9 @@ def _safe_state(state: dict) -> dict:
     # Surface depth_level at top-level for external querying (B8/B9 fix)
     classifier_out = state.get("classifier_output", {})
     if classifier_out and "depth_level" not in result:
-       asp = classifier_out.get("asp", {}) if isinstance(classifier_out, dict) else {}
-       if "depth_level" in asp:
-           result["depth_level"] = asp["depth_level"]        
+        asp = classifier_out.get("asp", {}) if isinstance(classifier_out, dict) else {}
+        if "depth_level" in asp:
+            result["depth_level"] = asp["depth_level"]
     return result
 
 @app.get("/pipeline/{thread_id}/audit")
