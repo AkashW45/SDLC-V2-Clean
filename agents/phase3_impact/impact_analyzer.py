@@ -254,6 +254,7 @@ Assess the risk and return ONLY valid JSON:
     )
 
     content = response.choices[0].message.content.strip()
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
     try:
         if content.startswith("```"):

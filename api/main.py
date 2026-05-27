@@ -84,6 +84,26 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != VALID_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorised")
 
+@app.on_event("startup")
+async def _backfill_registry_on_startup():
+    """
+    Self-healing: on every startup, scan GitHub for repos owned by
+    GITHUB_REPO_OWNER and ensure each one has a registry entry. This guarantees
+    no repo created by a previous pipeline run is orphaned in the knowledge layer.
+    """
+    try:
+        from agents.phase0_selector.selector_agent import sync_github_repos_to_registry
+        owner = os.getenv("GITHUB_REPO_OWNER", "")
+        if not owner:
+            print("[Startup] GITHUB_REPO_OWNER not set — skipping registry backfill")
+            return
+        print(f"[Startup] Backfilling registry from GitHub ({owner})...")
+        result = sync_github_repos_to_registry(owner=owner)
+        print(f"[Startup] Registry backfill complete: {result}")
+    except Exception as e:
+        # Non-fatal — uvicorn must always start
+        print(f"[Startup] Registry backfill failed (non-fatal): {e}")
+        import traceback; traceback.print_exc()
 
 # ── Request Models ────────────────────────────────────────────────────────────
 class StartRequest(BaseModel):
@@ -1790,20 +1810,60 @@ def run_phase6(thread_id: str, feedback: str = ""):
         merged = {**state, "pr_urls": pr_urls, "target_repo": target_repo_name}
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "pr_urls": pr_urls, "status": "WAITING_PHASE_6_APPROVAL", "sub_stage": f"Pushed to {target_repo_name} — Awaiting PR approval"})
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
-        # ── FIX 5: RE-INDEX BROWNFIELD REPOS (BACKGROUND THREAD) ──
-        if not state.get("is_new_project", False):
-            import threading
-            def _bg_index(r_name):
-                # Calculate the path to your local 'repos' folder
-                repo_dir = os.path.join(os.getcwd(), "repos", r_name)
-                if os.path.isdir(repo_dir):
-                    print(f"  [Phase 6] Re-indexing {r_name} in background...")
-                    run_indexer(repo_dir, r_name)
+        # ── FINAL FIX: REGISTER AND INDEX IMMEDIATELY IN PHASE 6 ──
 
-            for repo in state.get("selected_repos", []):
-                rname = repo.get("name") if isinstance(repo, dict) else repo
-                if rname:
-                    threading.Thread(target=_bg_index, args=(rname,)).start()
+        # 1. Auto-Register Greenfield Projects the moment they hit GitHub
+        if state.get("is_new_project", False):
+            try:
+                from knowledge_layer.project_registry import register_project
+                proj_info = state.get("selected_project", {})
+                
+                register_project(
+                    project_id=proj_info.get("id", f"new-{thread_id}"),
+                    project_name=proj_info.get("name", "New Project"),
+                    description=proj_info.get("description", entry.get("requirement", "")),
+                    domain="Greenfield",
+                    tech_stack=[],
+                    repos=[r["name"] for r in state.get("selected_repos", []) if isinstance(r, dict)],
+                    owner_team="SDLC-Team"
+                )
+                print(f"[Phase 6] ✅ Auto-registered greenfield project into Knowledge Layer")
+            except Exception as reg_err:
+                print(f"[Phase 6] ⚠ Failed to auto-register project: {reg_err}")
+
+        # 2. Index the EXACT feature branch we just pushed (Background Thread)
+        import threading
+        import subprocess        
+        def _bg_index(r_name, target_branch):
+            print(f"  [Phase 6] Pulling {r_name} (Branch: {target_branch}) for indexing...")
+            try:
+                repo_dir = os.path.join(os.getcwd(), "repos", r_name)
+                r_url = f"https://github.com/{github_owner}/{r_name}.git" 
+                
+                os.makedirs(os.path.join(os.getcwd(), "repos"), exist_ok=True)
+                
+                # Fetch and checkout the specific branch we just pushed
+                if os.path.isdir(repo_dir):
+                    subprocess.run(["git", "fetch", "origin", target_branch], cwd=repo_dir, check=False)
+                    subprocess.run(["git", "checkout", target_branch], cwd=repo_dir, check=False)
+                    subprocess.run(["git", "pull", "origin", target_branch], cwd=repo_dir, check=False)
+                else:
+                    # Clone directly into the feature branch
+                    subprocess.run(["git", "clone", "--branch", target_branch, r_url, repo_dir], check=False)
+
+                if os.path.isdir(repo_dir):
+                    from knowledge_layer.indexer import index_repo
+                    index_repo(repo_dir, r_name)
+                    print(f"  [Phase 6] ✅ Successfully indexed {r_name}")
+                else:
+                    print(f"  [Phase 6] ❌ Failed to clone {r_name} to local directory.")
+            except Exception as e:
+                print(f"  [Phase 6] ❌ Indexing thread crashed: {e}")
+
+        for repo in state.get("selected_repos", []):
+            rname = repo.get("name") if isinstance(repo, dict) else repo
+            if rname:
+                threading.Thread(target=_bg_index, args=(rname, branch_name)).start()
         # ──────────────────────────────────────────────────────────
     except Exception as e:
         import traceback

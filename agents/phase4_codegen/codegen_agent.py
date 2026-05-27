@@ -63,7 +63,11 @@ def call_llm(prompt: str, max_tokens: int = 80000) -> str:
         extra_body={"thinking": {"type": "enabled"}},
         max_tokens=max_tokens
     )
-    return response.choices[0].message.content.strip()
+    content = response.choices[0].message.content.strip()
+    # Strip DeepSeek <think>...</think> reasoning blocks that precede the
+    # actual JSON response — leaving them in causes JSON parse failures.
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    return content
 
 
 def get_postgres():
@@ -374,7 +378,24 @@ def generate_fresh_project(state: CodegenState) -> CodegenState:
         generated_changes = data.get("files", [])
     except Exception as e:
         print(f"  [Phase 4] JSON parse failed: {e}")
+        # Fallback: try to extract the JSON object via regex — handles cases
+        # where the LLM emits extra text before/after the JSON, or where a
+        # file's content string contains unescaped control characters.
         generated_changes = []
+        try:
+            match = re.search(r'\{.*"files"\s*:\s*\[', response, re.DOTALL)
+            if match:
+                # Try progressively smaller tail slices until json.loads succeeds
+                for end in range(len(response), match.start(), -100):
+                    try:
+                        data = json.loads(response[match.start():end].rstrip().rstrip(",") + "}}")
+                        generated_changes = data.get("files", [])
+                        print(f"  [Phase 4] JSON recovered via fallback extraction ({len(generated_changes)} files)")
+                        break
+                    except Exception:
+                        continue
+        except Exception as e2:
+            print(f"  [Phase 4] JSON fallback also failed: {e2}")
 
     # ── Normalize file paths: strip a spurious common wrapper directory ───────
     # The repo IS the service, so files should sit at the repo root. If the LLM
