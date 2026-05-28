@@ -458,10 +458,10 @@ deploy_target: {deploy_target}
 # Service identifier — also used as the ECR repo name and ECS service name
 service_name: {service_name}
 
-# Port the container listens on, and the path the ALB health-checks.
-# Phase 7 uses these for the ALB target group. For a static (nginx) site these
+# Port the container listens on, and the path the health check probes.
+# Phase 7 uses these for the ECS target group. For a static (nginx) site these
 # MUST be 80 and "/" — nginx serves on 80 and has no /health route, so wrong
-# values cause the ALB health check to fail → 0 healthy targets → 502.
+# values cause the health check to fail → 0 healthy targets → 502.
 container_port: {container_port}
 health_check_path: {health_check_path}
 

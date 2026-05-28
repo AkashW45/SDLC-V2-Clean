@@ -522,6 +522,26 @@ def merge_repo_contract(
         if "build_args" in raw and isinstance(raw["build_args"], dict):
             merged.build_args = {**merged.build_args, **raw["build_args"]}
 
+        # Top-level deploy knobs that Phase 7's ALB/target-group setup reads via
+        # _opt(). The CICD generator writes container_port / health_check_path at
+        # the TOP LEVEL of .deploy.yaml (not inside a `deploy:` block), so we must
+        # collect them here into _deploy_overrides — otherwise Phase 7 falls back
+        # to the target's defaults (8000, /health), which for an nginx static
+        # site (port 80, no /health route) means the health check fails forever
+        # → target unhealthy → ECS crash-loop. This is exactly that bug.
+        _top_level_overrides = {}
+        for _k in ("container_port", "health_check_path",
+                   "hc_interval_seconds", "hc_healthy_threshold",
+                   "hc_timeout_seconds"):
+            if _k in raw:
+                _top_level_overrides[_k] = raw[_k]
+        if _top_level_overrides:
+            existing = getattr(merged, "_deploy_overrides", {}) or {}
+            setattr(merged, "_deploy_overrides", {**existing, **_top_level_overrides})
+        # Top-level deploy_target (the generator writes it at top level too).
+        if "deploy_target" in raw:
+            merged.deploy_target = raw["deploy_target"]
+
         # `kind: library` means: build but don't push or deploy.
         kind = raw.get("kind", "service").lower()
         if kind == "library":
@@ -563,7 +583,8 @@ def merge_repo_contract(
                 if k not in ("target", "environments")
             }
             if deploy_overrides:
-                setattr(merged, "_deploy_overrides", deploy_overrides)
+                existing = getattr(merged, "_deploy_overrides", {}) or {}
+                setattr(merged, "_deploy_overrides", {**existing, **deploy_overrides})
 
     # Validation: registry must exist in platform config (if set)
     if merged.registry and merged.registry not in platform.registries:
