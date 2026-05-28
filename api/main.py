@@ -440,7 +440,7 @@ def preview_routing(req: dict = Body(...), api_key: str = Depends(verify_api_key
 
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-    from agents.phase0_selector.selector_agent import search_projects, slugify
+    from agents.phase0_selector.selector_agent import search_projects, slugify, _infer_repo_kind
     from knowledge_layer.project_registry import list_all_projects
 
     # Top-5 semantic matches — give the user a real menu
@@ -456,8 +456,7 @@ def preview_routing(req: dict = Body(...), api_key: str = Depends(verify_api_key
         "all_projects": all_projects,              # full menu
         "new_project_preview": {
             "slug": slugify(requirement),
-            "backend_repo": f"{slugify(requirement)}-backend",
-            "frontend_repo": f"{slugify(requirement)}-frontend",
+            "repo": f"{slugify(requirement)}-{_infer_repo_kind(requirement)[0]}",
         },
     }
 
@@ -514,6 +513,12 @@ def pipeline_status(thread_id: str,
         "selected_project": safe.get("selected_project", {}),
         "selected_repos": safe.get("selected_repos", []),
         "target_repo": safe.get("target_repo", ""),
+        # Deployed application URL(s) — surfaced top-level so the dashboard can
+        # render a clickable link without digging into current_state. Falls back
+        # Read from persisted current_state.deploy_endpoints FIRST (durable),
+        # then the in-memory top-level field as a secondary source.
+        "application_urls": (safe.get("deploy_endpoints")
+                             or entry.get("application_urls", [])),
         "current_state": safe,
         "is_complete": _status in _TERMINAL_STATUSES,
     }
@@ -1205,7 +1210,7 @@ def run_phase0_and_phase1(thread_id: str, requirement: str):
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-        from agents.phase0_selector.selector_agent import search_projects, slugify
+        from agents.phase0_selector.selector_agent import search_projects, slugify, _infer_repo_kind
 
         # ── Phase 0: route to existing project or create new ────────────
         pipeline_store[thread_id]["phase"] = 0
@@ -1260,16 +1265,20 @@ def run_phase0_and_phase1(thread_id: str, requirement: str):
                 slug = slugify(requirement)
                 selected = {"id": f"new-{slug}", "name": requirement[:60],
                             "description": requirement}
+                # B-FIX: ONE repo for greenfield (was hardcoded backend+frontend).
+                # Phase 3/4 generate a single repo's code and Phase 6 pushes one
+                # target, so the second repo was created empty. Type inferred
+                # from the requirement to match what codegen produces.
+                _rt, _lang = _infer_repo_kind(requirement)
+                _rname = f"{slug}-{_rt}" if _rt != "service" else slug
                 selected_repos = [
-                    {"name": f"{slug}-backend", "type": "backend",
-                     "url": f"https://github.com/{github_owner}/{slug}-backend.git",
-                     "exists": False},
-                    {"name": f"{slug}-frontend", "type": "frontend",
-                     "url": f"https://github.com/{github_owner}/{slug}-frontend.git",
+                    {"name": _rname, "type": _rt, "language": _lang,
+                     "url": f"https://github.com/{github_owner}/{_rname}.git",
                      "exists": False},
                 ]
                 is_new = True
-                print(f"[Phase 0] ✅ User chose NEW project: {slug}")
+                print(f"[Phase 0] ✅ User chose NEW project: {slug} "
+                      f"(1 repo: {_rname}, type={_rt})")
 
             else:
                 raise ValueError(f"Unknown routing mode: {mode}")
@@ -1302,16 +1311,17 @@ def run_phase0_and_phase1(thread_id: str, requirement: str):
                 slug = slugify(requirement)
                 selected = {"id": f"new-{slug}", "name": requirement[:60],
                             "description": requirement}
+                # B-FIX: ONE repo for greenfield (was hardcoded backend+frontend).
+                _rt, _lang = _infer_repo_kind(requirement)
+                _rname = f"{slug}-{_rt}" if _rt != "service" else slug
                 selected_repos = [
-                    {"name": f"{slug}-backend", "type": "backend",
-                     "url": f"https://github.com/{github_owner}/{slug}-backend.git",
-                     "exists": False},
-                    {"name": f"{slug}-frontend", "type": "frontend",
-                     "url": f"https://github.com/{github_owner}/{slug}-frontend.git",
+                    {"name": _rname, "type": _rt, "language": _lang,
+                     "url": f"https://github.com/{github_owner}/{_rname}.git",
                      "exists": False},
                 ]
                 is_new = True
-                print(f"[Phase 0] 🆕 No match (best score < {THRESHOLD}) — creating NEW project: {slug}")
+                print(f"[Phase 0] 🆕 No match (best score < {THRESHOLD}) — "
+                      f"creating NEW project: {slug} (1 repo: {_rname}, type={_rt})")
 
         # ── Persist Phase 0 result ──────────────────────────────────────
         pipeline_store[thread_id]["selected_project"] = selected
@@ -1376,6 +1386,9 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
                                                       not bool(selected_repos)))
 
         print(f"[Phase 1] selected_repos={[r.get('name') if isinstance(r,dict) else r for r in selected_repos]}, is_new={is_new_project}")
+        print(f"[DEPLOY-TRACE][P1] resolved is_new_project={is_new_project} (mode={mode!r}, "
+              f"prev_state.is_new={prev_state.get('is_new_project','<absent>')}, "
+              f"entry.is_new={entry.get('is_new_project','<absent>')})")
 
         initial_state = DiscoveryState(
             requirement=requirement,
@@ -1409,6 +1422,9 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
                 save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(current))
 
         pipeline_store[thread_id].update({"status": "WAITING_PHASE_1_APPROVAL", "graph": graph, "config": config})
+        _cs = pipeline_store[thread_id]["current_state"]
+        print(f"[DEPLOY-TRACE][P1-save] current_state.is_new_project = {_cs.get('is_new_project','<ABSENT ❌>')}")
+        print(f"[DEPLOY-TRACE][P1-save] current_state.selected_repos = {[r.get('name') if isinstance(r,dict) else r for r in _cs.get('selected_repos',[])]}")
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
 
     except Exception as e:
@@ -1477,11 +1493,15 @@ def run_phase3(thread_id: str, feedback: str = ""):
 
         graph = get_graph()
         config = {"configurable": {"thread_id": f"{thread_id}-p3"}}
+        _p3_isnew = bool(prev_state.get("is_new_project", False))
+        print(f"[DEPLOY-TRACE][P3-entry] prev_state.is_new_project = {prev_state.get('is_new_project','<ABSENT ❌>')}")
+        print(f"[DEPLOY-TRACE][P3-entry] selected_repos = {[r.get('name') if isinstance(r,dict) else r for r in prev_state.get('selected_repos',[])]}")
         initial = {
             "requirement": entry["requirement"],
             "prd": prev_state.get("prd", {}),                   # NEW
             "selected_repos": prev_state.get("selected_repos", []),   # NEW
             "scope_contract": prev_state.get("scope_contract", {}),   # NEW
+            "is_new_project": _p3_isnew,                        # so impact can skip greenfield
             "impact_report": {},
             "human_approved": False,
             "human_feedback": feedback,
@@ -1492,6 +1512,11 @@ def run_phase3(thread_id: str, feedback: str = ""):
         merged = {**prev_state}
         if "impact_report" in result:
             merged["impact_report"] = result["impact_report"]
+        _ir = result.get("impact_report", {}) or {}
+        _af = _ir.get("affected_files", [])
+        print(f"[DEPLOY-TRACE][P3-exit] impact_report.affected_files (count={len(_af)}) = "
+              f"{[ (f.get('file_path') if isinstance(f,dict) else f) for f in _af][:10]}")
+        print(f"[DEPLOY-TRACE][P3-exit] merged.is_new_project = {merged.get('is_new_project','<ABSENT ❌>')}")
 
         pipeline_store[thread_id].update({
             "graph": graph,
@@ -1529,10 +1554,31 @@ def run_phase4(thread_id: str):
         pipeline_store[thread_id]["phase"] = 4
 
         impact = state.get("impact_report", {})
-        if state.get("is_new_project", False) and not impact.get("affected_files"):
+        _is_new = bool(state.get("is_new_project", False))
+        _affected = impact.get("affected_files", [])
+        print(f"\n[DEPLOY-TRACE][P4-entry] thread={thread_id}")
+        print(f"[DEPLOY-TRACE][P4-entry]   state.is_new_project = {_is_new}")
+        print(f"[DEPLOY-TRACE][P4-entry]   impact_report.affected_files (count={len(_affected)}) = {[ (f.get('file_path') if isinstance(f,dict) else f) for f in _affected][:10]}")
+        print(f"[DEPLOY-TRACE][P4-entry]   selected_repos = {[r.get('name') for r in state.get('selected_repos', [])]}")
+        print(f"[DEPLOY-TRACE][P4-entry]   state keys present = {sorted(list(state.keys()))}")
+        if _is_new and not impact.get("affected_files"):
             impact = {"requirement": entry["requirement"], "affected_files": [], "affected_repos": [r["name"] for r in state.get("selected_repos", [])], "architecture": state.get("architecture", {}), "risk_assessment": {"risk_level": "low", "breaking_changes": [], "recommendation": "proceed"}}
+            print(f"[DEPLOY-TRACE][P4-entry]   → greenfield empty-impact branch TAKEN (affected_files forced to [])")
+        else:
+            print(f"[DEPLOY-TRACE][P4-entry]   → greenfield empty-impact branch NOT taken "
+                  f"(is_new={_is_new}, had_affected={bool(impact.get('affected_files'))})")
 
-        result4 = run_codegen(requirement=entry["requirement"], impact_report=impact, workspace_path="/repos", thread_id=f"{thread_id}-p4", adr=state.get("adr", {}), scope_contract=state.get("scope_contract", {}))
+        print(f"[DEPLOY-TRACE][P4-entry]   calling run_codegen(is_new_project={_is_new})")
+        result4 = run_codegen(requirement=entry["requirement"], impact_report=impact, workspace_path="/repos", thread_id=f"{thread_id}-p4", adr=state.get("adr", {}), scope_contract=state.get("scope_contract", {}), is_new_project=_is_new)
+
+        # Trace what codegen returned re: deploy files
+        _gen = result4.get("generated_changes", []) or []
+        _deploy_files = [ (c.get('file_path') if isinstance(c,dict) else c) for c in _gen
+                          if isinstance(c,dict) and any(k in (c.get('file_path') or '') for k in ('Dockerfile','.deploy.yaml','ci-cd.yml','workflows/')) ]
+        print(f"[DEPLOY-TRACE][P4-exit]   codegen status = {result4.get('status')}")
+        print(f"[DEPLOY-TRACE][P4-exit]   total generated files = {len(_gen)}")
+        print(f"[DEPLOY-TRACE][P4-exit]   DEPLOY files among them = {_deploy_files or 'NONE ❌'}")
+        print(f"[DEPLOY-TRACE][P4-exit]   cicd_decision = {result4.get('cicd_decision')}")
 
         # Accept multiple success statuses from codegen
         SUCCESS_STATUSES = {
@@ -1817,7 +1863,7 @@ def run_phase6(thread_id: str, feedback: str = ""):
             try:
                 from knowledge_layer.project_registry import register_project
                 proj_info = state.get("selected_project", {})
-                
+
                 register_project(
                     project_id=proj_info.get("id", f"new-{thread_id}"),
                     project_name=proj_info.get("name", "New Project"),
@@ -1833,15 +1879,15 @@ def run_phase6(thread_id: str, feedback: str = ""):
 
         # 2. Index the EXACT feature branch we just pushed (Background Thread)
         import threading
-        import subprocess        
+        import subprocess
         def _bg_index(r_name, target_branch):
             print(f"  [Phase 6] Pulling {r_name} (Branch: {target_branch}) for indexing...")
             try:
                 repo_dir = os.path.join(os.getcwd(), "repos", r_name)
-                r_url = f"https://github.com/{github_owner}/{r_name}.git" 
-                
+                r_url = f"https://github.com/{github_owner}/{r_name}.git"
+
                 os.makedirs(os.path.join(os.getcwd(), "repos"), exist_ok=True)
-                
+
                 # Fetch and checkout the specific branch we just pushed
                 if os.path.isdir(repo_dir):
                     subprocess.run(["git", "fetch", "origin", target_branch], cwd=repo_dir, check=False)
@@ -1964,7 +2010,7 @@ def run_phase7(thread_id: str, feedback: str = ""):
 
         result = graph.invoke(initial, config)
         merged = {**state}
-        for k in ("deploy_sequence", "feature_flags", "deploy_results", "monitoring_results", "rollback_triggered"):
+        for k in ("deploy_sequence", "feature_flags", "deploy_results", "monitoring_results", "rollback_triggered", "deploy_endpoints"):
             if k in result: merged[k] = result[k]
 
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "status": "WAITING_PHASE_7_APPROVAL", "sub_stage": "Deployment plan ready — Awaiting production approval"})
@@ -2036,9 +2082,31 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
         state = entry.get("current_state", {})
         merged = {**state}
         for k in ("deploy_sequence", "feature_flags", "deploy_results",
-                  "monitoring_results", "rollback_triggered"):
+                  "monitoring_results", "rollback_triggered",
+                  "deploy_endpoints"):
             if k in result:
                 merged[k] = result[k]
+
+        # B-FIX: surface the deployed application URL(s) so the UI can show a
+        # clickable link. Phase 7 generates them (ALB DNS) into deploy_endpoints,
+        # but they were never copied out of the graph result before — so the
+        # link never reached the dashboard. Expose both in merged state and as a
+        # top-level field on the pipeline record.
+        app_endpoints = result.get("deploy_endpoints", []) or []
+        # Persist endpoints into current_state (which IS persisted via safe_keys)
+        # — NOT only the top-level application_urls field, which save_pipeline
+        # does NOT write to the DB and is therefore lost on any reload/restart.
+        # This was why the UI link vanished: the top-level field lived only in
+        # memory. Writing into merged (current_state) makes it durable.
+        merged["deploy_endpoints"] = app_endpoints
+        if app_endpoints:
+            pipeline_store[thread_id]["application_urls"] = app_endpoints
+            print(f"[resume_phase7] 🌐 application URL(s): "
+                  f"{[e.get('url') for e in app_endpoints]}")
+        else:
+            print(f"[resume_phase7] ⚠ no deploy_endpoints in result — "
+                  f"UI link will be empty. result has deploy_results="
+                  f"{len(result.get('deploy_results', []))}")
 
         deploy_results = result.get("deploy_results", [])
         print(f"[resume_phase7] deploy_results count={len(deploy_results)} "
@@ -2088,7 +2156,7 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
 
 
 def _safe_state(state: dict) -> dict:
-    safe_keys = ["selected_project", "selected_repos", "is_new_project", "candidates", "scope_contract", "classifier_output", "brd", "prd", "adr", "architecture", "sprint_plan", "runbook", "jira_tickets", "impact_report", "generated_changes", "test_files", "pr_urls", "target_repo", "deploy_results", "monitoring_results", "deploy_sequence", "feature_flags", "rollback_triggered", "status", "requirement", "merged_shas", "merge_errors", "phase6_final_status","depth_level"]
+    safe_keys = ["selected_project", "selected_repos", "is_new_project", "candidates", "scope_contract", "classifier_output", "brd", "prd", "adr", "architecture", "sprint_plan", "runbook", "jira_tickets", "impact_report", "generated_changes", "test_files", "pr_urls", "target_repo", "deploy_results", "monitoring_results", "deploy_sequence", "feature_flags", "rollback_triggered", "status", "requirement", "merged_shas", "merge_errors", "phase6_final_status","depth_level", "deploy_endpoints"]
     result = {}
     for k in safe_keys:
         if k in state:

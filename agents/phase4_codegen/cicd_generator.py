@@ -173,7 +173,7 @@ def _detect_existing(generated_changes: list, existing_files_in_repo: set[str]) 
         if len(parts) > 1:
             normalized.add(parts[1])
     all_paths = normalized | existing_files_in_repo
-    
+
     has_dockerfile = any(p == "Dockerfile" or p.endswith("/Dockerfile") for p in all_paths)
     has_deploy_yaml = any(p == ".deploy.yaml" or p.endswith("/.deploy.yaml") for p in all_paths)
     has_workflow = any(
@@ -359,14 +359,12 @@ STATIC_DOCKERFILE = """\
 # "deployed" on its own, so we wrap it in a tiny nginx web server.
 FROM nginx:1.27-alpine
 
-# nginx listens on {port}
-RUN sed -i 's/listen\\s*80;/listen {port};/' /etc/nginx/conf.d/default.conf || true
-
-# Copy the site into nginx's web root. Works whether the static files are at the
-# repo root or under common build/output dirs.
+# Serve on nginx's native port 80; do NOT rewrite the config. The old sed-based
+# port rewrite silently failed on newer nginx images, leaving nginx on 80 while
+# the target group expected another port -> failed ELB health checks -> 502.
 COPY . /usr/share/nginx/html
 
-EXPOSE {port}
+EXPOSE 80
 
 CMD ["nginx", "-g", "daemon off;"]
 """
@@ -459,6 +457,13 @@ deploy_target: {deploy_target}
 
 # Service identifier — also used as the ECR repo name and ECS service name
 service_name: {service_name}
+
+# Port the container listens on, and the path the ALB health-checks.
+# Phase 7 uses these for the ALB target group. For a static (nginx) site these
+# MUST be 80 and "/" — nginx serves on 80 and has no /health route, so wrong
+# values cause the ALB health check to fail → 0 healthy targets → 502.
+container_port: {container_port}
+health_check_path: {health_check_path}
 
 # Repo classification — Phase 7 sorts the deploy sequence by these
 type: backend                 # backend | frontend | library | batch
@@ -683,6 +688,8 @@ def _render_deploy_yaml(decision: dict) -> str:
     return DEPLOY_YAML.format(
         deploy_target=decision.get("deploy_target") or "ecs-prod",
         service_name=decision.get("service_name") or "service",
+        container_port=int(decision.get("container_port") or 8000),
+        health_check_path=decision.get("health_check_path") or "/health",
     )
 
 
@@ -789,6 +796,17 @@ def generate_cicd_artifacts(
             decision["needs_dockerfile"] = True
         if is_static_site:
             decision["language"] = "static"
+            # STATIC-SITE 502 FIX: nginx serves on port 80 by default, and a
+            # static site has NO /health route — only "/". The old defaults
+            # (port 8000, health path /health) caused the ALB health check to
+            # hit a port nginx wasn't listening on / a 404 path → 0 healthy
+            # targets → ECS killed the task ("failed ELB health checks") → 502.
+            # Pin the values that actually match an nginx static container so
+            # the target goes healthy.
+            decision["container_port"] = 80
+            decision["health_check_path"] = "/"
+            print(f"  [cicd] static site → forcing container_port=80, "
+                  f"health_check_path=/ (nginx defaults; avoids ELB 502)")
         print(f"  [cicd] greenfield guarantee applied "
               f"(static_site={is_static_site}, target={decision['deploy_target']})")
 

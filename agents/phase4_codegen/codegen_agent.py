@@ -48,6 +48,7 @@ class CodegenState(TypedDict, total=False):
     status: str
     workspace_path: str
     thread_id: str
+    is_new_project: bool       # authoritative greenfield flag from Phase 0
 
 
 # -----------------------------------------
@@ -276,10 +277,24 @@ def load_existing_code(state: CodegenState) -> CodegenState:
 
     impact = state.get("impact_report", {})
     affected_files = impact.get("affected_files", [])
+    print(f"[DEPLOY-TRACE][CG-load] received is_new_project = {state.get('is_new_project','<ABSENT ❌>')}")
+    print(f"[DEPLOY-TRACE][CG-load] received affected_files count = {len(affected_files)}")
 
-    if not affected_files:
-        print("  [Phase 4] No existing files — NEW PROJECT, generating fresh")
+    # Greenfield routing must key off the authoritative is_new_project flag from
+    # Phase 0 — NOT merely the emptiness of affected_files. If Phase 0 says this
+    # is a new project, treat it as greenfield even if Phase 3 left stray
+    # affected_files behind. Relying on affected_files alone was the cascade
+    # bug: an unreliable greenfield signal upstream caused new projects to be
+    # routed to the brownfield generator, which in turn made the CI/CD step
+    # treat them as brownfield and SKIP generating Dockerfile/.deploy.yaml/
+    # workflow. One flag, threaded through, fixes the whole chain.
+    if state.get("is_new_project") or not affected_files:
+        why = "is_new_project=True" if state.get("is_new_project") else "no affected files"
+        print(f"  [Phase 4] NEW PROJECT ({why}) — generating fresh")
+        print(f"[DEPLOY-TRACE][CG-load] → ROUTING GREENFIELD (status=NEW_PROJECT_NO_CODE) ✅")
         return {**state, "existing_code": {}, "status": "NEW_PROJECT_NO_CODE"}
+    print(f"[DEPLOY-TRACE][CG-load] → ROUTING BROWNFIELD (will read existing code) "
+          f"— is_new={state.get('is_new_project')}, affected={len(affected_files)}")
 
     # Group affected files by repo so we clone each repo at most once
     repos_seen = set()
@@ -797,8 +812,13 @@ def generate_cicd_node(state: CodegenState) -> CodegenState:
     from agents.repo_workspace import get_repo_local_path
 
     changes = state.get("generated_changes", [])
+    print(f"\n[DEPLOY-TRACE][CG-cicd] entered generate_cicd_node")
+    print(f"[DEPLOY-TRACE][CG-cicd]   generated_changes count = {len(changes)}")
+    print(f"[DEPLOY-TRACE][CG-cicd]   is_new_project in state = {'is_new_project' in state} "
+          f"value = {state.get('is_new_project','<ABSENT>')}")
     if not changes:
         print("\n[Phase 4] No code generated — skipping CI/CD artifact generation")
+        print(f"[DEPLOY-TRACE][CG-cicd]   → SKIPPED (no generated_changes) — NO DEPLOY FILES ❌")
         return state
 
     print("\n[Phase 4] Generating CI/CD + deployment artifacts...")
@@ -808,9 +828,24 @@ def generate_cicd_node(state: CodegenState) -> CodegenState:
     # came in as NEW_PROJECT_NO_CODE, it's greenfield. We need both pieces:
     #   - is_brownfield: whether to apply the "be conservative" policy
     #   - existing_files: what's actually present on disk so we don't clobber
+    # ── Determine greenfield vs brownfield ────────────────────────────────
+    # IMPORTANT: we must NOT infer greenfield from state["status"] here — by the
+    # time this node runs, the generator node has already overwritten the status
+    # from "NEW_PROJECT_NO_CODE" to "CODE_GENERATED", so that check is always
+    # false and greenfield projects were wrongly treated as brownfield (which
+    # skips the greenfield "generate full deploy stack" guarantee — the bug
+    # where a new HTML site got NO Dockerfile/.deploy.yaml/workflow).
+    #
+    # The authoritative signal is Phase 0's is_new_project flag, now threaded
+    # into codegen state. Fall back to the old heuristic only if it's absent.
     impact = state.get("impact_report") or {}
     affected_files = impact.get("affected_files", [])
-    is_brownfield = bool(affected_files) and state.get("status") != "NEW_PROJECT_NO_CODE"
+    if "is_new_project" in state:
+        is_brownfield = not bool(state.get("is_new_project"))
+    else:
+        is_brownfield = bool(affected_files) and state.get("status") != "NEW_PROJECT_NO_CODE"
+    print(f"[DEPLOY-TRACE][CG-cicd]   COMPUTED is_brownfield = {is_brownfield} "
+          f"→ {'BROWNFIELD (conservative, may skip files)' if is_brownfield else 'GREENFIELD (will generate full stack) ✅'}")
 
     existing_files: set = set()
     if is_brownfield:
@@ -867,15 +902,19 @@ def generate_cicd_node(state: CodegenState) -> CodegenState:
     )
 
     new_files = result.get("new_files", [])
+    print(f"[DEPLOY-TRACE][CG-cicd]   generate_cicd_artifacts returned {len(new_files)} new file(s): "
+          f"{[ (f.get('file_path') if isinstance(f,dict) else f) for f in new_files] or 'NONE ❌'}")
     if new_files:
         # Append, don't replace — keep all the regular files Phase 4 generated.
         combined = list(changes) + new_files
+        print(f"[DEPLOY-TRACE][CG-cicd]   → appended deploy files; total generated_changes now {len(combined)} ✅")
         return {
             **state,
             "generated_changes": combined,
             "cicd_decision": result.get("decision"),
         }
 
+    print(f"[DEPLOY-TRACE][CG-cicd]   → NO deploy files appended (generate_cicd_artifacts returned empty) ❌")
     return {**state, "cicd_decision": result.get("decision")}
 
 
@@ -998,7 +1037,7 @@ def build_codegen_graph():
 # Run
 # -----------------------------------------
 
-def run_codegen(requirement: str, impact_report: dict, workspace_path: str, thread_id: str = "thread-codegen", adr: dict = None, scope_contract: dict = None):
+def run_codegen(requirement: str, impact_report: dict, workspace_path: str, thread_id: str = "thread-codegen", adr: dict = None, scope_contract: dict = None, is_new_project: bool = False):
     graph = build_codegen_graph()
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -1012,7 +1051,8 @@ def run_codegen(requirement: str, impact_report: dict, workspace_path: str, thre
         validation_errors=[],
         status="STARTED",
         workspace_path=workspace_path,
-        thread_id=thread_id
+        thread_id=thread_id,
+        is_new_project=is_new_project,
     )
 
     print("\n" + "="*50)

@@ -55,7 +55,8 @@ defaults:
   dockerfile: Dockerfile
   docker_context: .
   registry: ecr-prod                      # default registry name
-  deploy_target: ecs-prod                 # default deploy target name
+  deploy_target: ecs-prod-alb             # default deploy target name
+  # (ALB-enabled → returns a stable URL)
   image_tag: ${BUILD_TAG:-latest}
   deploy_contract_path: .deploy.yaml      # where to look in each repo
 
