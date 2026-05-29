@@ -31,7 +31,7 @@ and a snapshot of the generated files; it returns a JSON decision packet:
       "needs_deploy_yaml": bool,
       "language": "python|node|java|...",
       "framework": "fastapi|express|spring|...",
-      "deploy_target": "ecs-prod|lambda-prod|...",
+      "deploy_target": "ecs-prod-alb|lambda-prod|...",
       "service_name": "...",
       "container_port": 8000,
       "rationale": "..."
@@ -100,7 +100,7 @@ Return ONLY a JSON object with these fields, nothing else:
   "needs_deploy_yaml": true|false,
   "language": "python|node|typescript|java|go|csharp|other",
   "framework": "fastapi|flask|express|spring|gin|aspnet|other|unknown",
-  "deploy_target": "ecs-prod|lambda-prod|compose-prod|k8s-prod",
+  "deploy_target": "ecs-prod-alb|lambda-prod|compose-prod|k8s-prod",
   "service_name": "<kebab-case short name, e.g. 'leave-mgmt-backend'>",
   "container_port": 8000,
   "build_command": "<shell command if non-default, else empty string>",
@@ -110,9 +110,10 @@ Return ONLY a JSON object with these fields, nothing else:
 
 If existing files already cover an artifact (has_dockerfile: true), set the
 corresponding needs_* to false — never overwrite hand-tuned infra. Prefer
-ecs-prod for typical web APIs. Use lambda-prod only for explicit event-driven
-or scheduled functions. Use compose-prod only for local-dev-style multi-
-container setups. Use k8s-prod only if the ADR mentions Kubernetes."""
+ecs-prod-alb for typical web APIs (provisions an ALB so the deploy returns a
+stable URL the user can open in a browser). Use lambda-prod only for explicit
+event-driven or scheduled functions. Use compose-prod only for local-dev-style
+multi-container setups. Use k8s-prod only if the ADR mentions Kubernetes."""
 
 
 def _summarize_for_decision(generated_changes: list) -> str:
@@ -232,7 +233,7 @@ def _ask_llm_for_decision(
             "needs_deploy_yaml": is_python_service and not existing["has_deploy_yaml"],
             "language": "python" if is_python_service else "other",
             "framework": "fastapi",
-            "deploy_target": "ecs-prod",
+            "deploy_target": "ecs-prod-alb",
             "service_name": "service",
             "container_port": 8000,
             "build_command": "",
@@ -686,7 +687,7 @@ def _render_dockerfile(decision: dict) -> str:
 
 def _render_deploy_yaml(decision: dict) -> str:
     return DEPLOY_YAML.format(
-        deploy_target=decision.get("deploy_target") or "ecs-prod",
+        deploy_target=decision.get("deploy_target") or "ecs-prod-alb",
         service_name=decision.get("service_name") or "service",
         container_port=int(decision.get("container_port") or 8000),
         health_check_path=decision.get("health_check_path") or "/health",
@@ -779,8 +780,12 @@ def generate_cicd_artifacts(
         if not decision.get("deploy_target"):
             # Everything deploys as a container to ECS now — including static
             # sites, which ship as an nginx container. (No separate static-site
-            # target needs to exist.)
-            decision["deploy_target"] = "ecs-prod"
+            # target needs to exist.) Use the ALB-enabled target so the deploy
+            # provisions an Application Load Balancer and returns a stable URL
+            # for the dashboard — the whole point of the recent ALB work. The
+            # plain `ecs-prod` would skip ALB provisioning and leave the UI
+            # link empty (exactly the bug observed in the deploy log).
+            decision["deploy_target"] = "ecs-prod-alb"
         if not decision.get("service_name"):
             decision["service_name"] = "service"
         # Force-fill any missing infra slot (sanitizer below still won't clobber
@@ -915,7 +920,7 @@ def _brownfield_decision(
         "needs_deploy_yaml": False,
         "language": "unknown",
         "framework": "unknown",
-        "deploy_target": "ecs-prod",
+        "deploy_target": "ecs-prod-alb",
         "service_name": "service",
         "container_port": 0,
         "build_command": "",

@@ -352,7 +352,7 @@
         <div style="font-size:10px;color:#666;margin-top:2px">${(c.description || '').slice(0, 100)}</div>
       </label>
     `).join('') : '<div style="color:#888;font-size:11px;padding:10px">No semantic matches found.</div>';
-    
+
     const reposHtml = allRepos.map(r => `
     <label style="display:inline-block;padding:5px 10px;margin:3px;border:1px solid #2a3a4a;border-radius:14px;font-size:10px;cursor:pointer;color:#ccc">
       <input type="checkbox" name="manual_repo" value="${r}" /> ${r}
@@ -1668,6 +1668,29 @@
           <div style="font-size:12px;color:var(--accent);font-weight:700">Deployment completed successfully</div>
         </div>
       </div>`;
+        // Show the live application URL(s) so the user can open the deployed app.
+        // main.py returns these as `application_urls` (with a fallback to
+        // current_state.deploy_endpoints). Each entry is {repo, url, ...}.
+        const appUrls = (p.application_urls && p.application_urls.length)
+                ? p.application_urls
+                : (state.deploy_endpoints || []);
+        if (appUrls.length) {
+          html += subHeader('Live Application');
+          appUrls.forEach(e => {
+            const url = (typeof e === 'string') ? e : (e.url || '');
+            if (!url) return;
+            const label = (e && e.repo) ? e.repo : 'Open application';
+            html += `<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--surface2);border-radius:6px;margin-bottom:6px">
+              <span style="font-size:16px">🌐</span>
+              <div style="min-width:0">
+                <div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px">${label}</div>
+                <a href="${url}" target="_blank" rel="noopener noreferrer"
+                   style="font-size:12px;color:var(--accent);font-weight:700;word-break:break-all;text-decoration:none">${url} ↗</a>
+              </div>
+            </div>`;
+          });
+          html += `<div style="font-size:9px;color:var(--text3);margin:2px 0 12px">It may take up to a minute after deploy for the URL to start serving.</div>`;
+        }
       } else if (deployFailed) {
         html += `<div style="background:rgba(255,77,79,0.06);border:1px solid var(--danger);border-radius:8px;padding:14px;margin-bottom:14px">
         <div style="display:flex;align-items:center;gap:10px">
@@ -1723,9 +1746,9 @@
     // Also preserve which feedback field has focus and the cursor position
     const activeEl = document.activeElement;
     const activeFeedbackId = (activeEl && activeEl.id && activeEl.id.startsWith('feedback-'))
-      ? activeEl.id : null;
+            ? activeEl.id : null;
     const activeCursorPos = activeFeedbackId
-      ? (activeEl.selectionStart || 0) : 0;
+            ? (activeEl.selectionStart || 0) : 0;
     el.innerHTML = html;
     // B17 fix: restore feedback values after innerHTML replacement
     Object.entries(savedFeedback).forEach(([id, val]) => {
@@ -1780,11 +1803,11 @@
                   .replace(/(\]|\))\s+([A-Z_][A-Z_0-9]*\s*(\[|\(|--))/g, '$1\n  $2');
         }
         rawCode = rawCode.replace(/\|([^|]+)\|/g, (match, label) => {
-              const cleaned = label
-              .replace(/[()[\]{}"`'\\]/g, ' ')
-              .replace(/\s+/g, ' ')
-              .trim();
-            return `|${cleaned}|`;
+          const cleaned = label
+                  .replace(/[()[\]{}"`'\\]/g, ' ')
+                  .replace(/\s+/g, ' ')
+                  .trim();
+          return `|${cleaned}|`;
         });
         try {
           const id = 'mermaid-svg-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
