@@ -951,6 +951,28 @@ def _ensure_ecs_infra(repo: RepoConfig, target: DeployTarget,
             env=env, dry_run=dry)
         if sg_json and sg_json.get("SecurityGroups"):
             sg_id = sg_json["SecurityGroups"][0]["GroupId"]
+            # SG-PORT-DRIFT FIX: a same-named SG from an EARLIER deploy may have
+            # only opened the OLD container_port (e.g. 8000) and never opened the
+            # current one (e.g. 80 for nginx static sites). Reusing it as-is then
+            # leaves the ALB unable to reach the new port → "Request timed out"
+            # → health checks fail forever → ECS crash-loops the task. So:
+            # check whether an ingress rule for the CURRENT container_port
+            # already exists, and add it if missing.
+            existing = sg_json["SecurityGroups"][0]
+            has_rule = any(
+                p.get("IpProtocol") == "tcp"
+                and p.get("FromPort") == container_port
+                and p.get("ToPort") == container_port
+                and any(r.get("CidrIp") == "0.0.0.0/0" for r in p.get("IpRanges", []))
+                for p in existing.get("IpPermissions", [])
+            )
+            if not has_rule:
+                print(f"  [ecs-provision] adding missing ingress rule on "
+                      f"port {container_port} to existing SG {sg_id}")
+                _run(["aws", "ec2", "authorize-security-group-ingress",
+                      "--group-id", sg_id, "--protocol", "tcp",
+                      "--port", str(container_port), "--cidr", "0.0.0.0/0",
+                      *region_args], env=env, dry_run=dry, check=False, timeout=60)
         else:
             created = _ecs_describe_json(
                 ["aws", "ec2", "create-security-group", "--group-name", sg_name,
