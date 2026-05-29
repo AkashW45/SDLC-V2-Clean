@@ -179,8 +179,8 @@ def ensure_alb_stack(service: str, vpc_id: str, subnets: List[str],
     """
     from core.deployment_executor import _run, _ecs_describe_json, _fail
 
-    alb_name = f"sdlc-{service}-alb"[:32]        # ELBv2 name limit = 32 chars
-    tg_name = f"sdlc-{service}-tg"[:32]
+    alb_name = f"sdlc-{service}-alb"[:32].rstrip("-")  # ELBv2 name limit = 32 chars; names cannot end with '-'
+    tg_name = f"sdlc-{service}-tg"[:32].rstrip("-")
     sg_name = f"sdlc-{service}-alb-sg"
     tag_args = ["--tags", f"Key=sdlc:service,Value={service}",
                 "Key=sdlc:managed,Value=true"]
