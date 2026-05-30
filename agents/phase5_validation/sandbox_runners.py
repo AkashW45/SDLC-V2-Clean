@@ -79,6 +79,40 @@ def detect_language(generated_files: list) -> str:
 
     return "unknown"
 
+def detect_java_build_system(generated_files: list, target_repo: str = None) -> str:
+    """
+    Determine whether a Java project uses Maven or Gradle by checking:
+    1. The generated_files for pom.xml / build.gradle hints
+    2. The actual cloned repo at ./repos/<target_repo>/ if available
+
+    Returns: 'maven' | 'gradle' | 'maven' (default fallback)
+    """
+    # Check generated files first
+    paths = [
+        (f.get("file_path") or f.get("test_file_path") or "").lower()
+        for f in (generated_files or []) if isinstance(f, dict)
+    ]
+    for p in paths:
+        if p.endswith("pom.xml") or "/pom.xml" in p:
+            return "maven"
+        if p.endswith("build.gradle") or p.endswith("build.gradle.kts"):
+            return "gradle"
+
+    # Check actual repo on disk
+    if target_repo:
+        for base in [
+            os.path.join(os.getcwd(), "repos", target_repo),
+            os.path.join(os.path.dirname(os.getcwd()), "repos", target_repo),
+        ]:
+            if os.path.isdir(base):
+                if os.path.exists(os.path.join(base, "pom.xml")):
+                    return "maven"
+                if os.path.exists(os.path.join(base, "build.gradle")) or \
+                   os.path.exists(os.path.join(base, "build.gradle.kts")):
+                    return "gradle"
+
+    # Default to Maven (more common in enterprise Java)
+    return "maven"
 
 # ─────────────────────────────────────────────────────────────────────────
 # Docker Sandbox Helper
@@ -130,20 +164,32 @@ class DockerSandbox:
             }
 
         if not self._image_exists():
-            print(f"  [sandbox] Pulling {self.image} (first run, may take 1-3 min)...")
-            pull = subprocess.run(
-                ["docker", "pull", self.image],
-                capture_output=True, text=True, timeout=600,
-            )
-            if pull.returncode != 0:
+            print(f"  [sandbox] Image {self.image} not local — attempting pull...")
+            try:
+                pull = subprocess.run(
+                    ["docker", "pull", self.image],
+                    capture_output=True, text=True, timeout=600,
+                )
+                if pull.returncode != 0:
+                    print(f"  [sandbox] ⚠️  Pull failed: {pull.stderr[:300]}")
+                    return {
+                        "returncode": -1,
+                        "stdout": "",
+                        "stderr": f"Image '{self.image}' unavailable on Docker Hub or pull failed. "
+                                f"Possible cause: image name doesn't exist (try a different JDK version), "
+                                f"or network/auth issue.\n{pull.stderr[:500]}",
+                        "duration_ms": 0,
+                        "error": "IMAGE_PULL_FAILED",
+                    }
+                print(f"  [sandbox] ✅ Pulled {self.image}")
+            except subprocess.TimeoutExpired:
                 return {
                     "returncode": -1,
                     "stdout": "",
-                    "stderr": f"Image pull failed: {pull.stderr[:500]}",
+                    "stderr": f"Image pull for '{self.image}' timed out after 10 minutes",
                     "duration_ms": 0,
-                    "error": "IMAGE_PULL_FAILED",
+                    "error": "IMAGE_PULL_TIMEOUT",
                 }
-
         # Normalize Windows paths to Docker-friendly format
         # On Windows Git Bash: /c/Users/... → C:/Users/... for docker
         mount_path = code_dir
@@ -311,33 +357,47 @@ class NodeRunner:
         )
 
 
-class JavaRunner:
-    """Java: mvn test (or gradle) in a maven:3.9-eclipse-temurin-17 container."""
+class MavenRunner:
+    """
+    Java/Maven: dynamically picks the right maven+JDK image based on the
+    project's pom.xml java.version / maven.compiler.source setting.
+    """
 
-    image = "maven:3.9-eclipse-temurin-17"
+    image = "maven:3.9-eclipse-temurin-17"  # default, overridden per-run
+
+    def __init__(self, target_repo: str = None):
+        self.target_repo = target_repo
 
     def run(self, code_dir: str) -> ValidationResult:
-        sandbox = DockerSandbox(self.image, timeout_seconds=600)
+        # Detect required JDK from pom.xml
+        jdk_version = detect_jdk_version(
+            target_repo=self.target_repo,
+            code_dir=code_dir,
+            build_tool="maven",
+        )
+        runtime_image = maven_image_for_jdk(jdk_version)
+        print(f"  [sandbox] Using Maven image for JDK {jdk_version}: {runtime_image}")
 
-        # Prefer Maven when pom.xml exists. Only fall back to Gradle if there's
-        # NO pom.xml but there IS a build.gradle (or .kts). This handles repos
-        # that may have leftover gradle wrappers from build tool migrations.
-        has_pom = os.path.exists(os.path.join(code_dir, "pom.xml"))
-        has_gradle = os.path.exists(os.path.join(code_dir, "build.gradle")) or \
-                    os.path.exists(os.path.join(code_dir, "build.gradle.kts"))
-        is_gradle = has_gradle and not has_pom
+        sandbox = DockerSandbox(runtime_image, timeout_seconds=600)
 
-        if is_gradle:
-            shell_cmd = "chmod +x ./gradlew 2>/dev/null; (./gradlew test --no-daemon 2>&1 || gradle test --no-daemon 2>&1) || true"
-        else:
-            # Maven offline mode if dependencies are cached, otherwise online
-            shell_cmd = "mvn test --batch-mode --no-transfer-progress 2>&1 || true"
+        shell_cmd = (
+            "if [ ! -f pom.xml ]; then "
+            "  echo 'NO_POM_XML: No pom.xml found in workspace.'; "
+            "  exit 0; "
+            "fi; "
+            "mvn test --batch-mode --no-transfer-progress 2>&1 || true"
+        )
 
         result = sandbox.run(code_dir, ["bash", "-c", shell_cmd])
         output = result["stdout"] + "\n" + result["stderr"]
 
-        # Maven Surefire: "Tests run: X, Failures: Y, Errors: Z, Skipped: W"
-        # Gradle similar
+        if "NO_POM_XML" in output:
+            return ValidationResult(
+                language="java", status="SKIPPED",
+                duration_ms=result["duration_ms"],
+                notes="No pom.xml in workspace",
+            )
+
         import re
         passed_n = failed_n = error_n = 0
         m = re.search(r"Tests run:\s+(\d+),\s+Failures:\s+(\d+),\s+Errors:\s+(\d+)", output)
@@ -346,13 +406,12 @@ class JavaRunner:
             failed_n = int(m.group(2))
             error_n = int(m.group(3))
             passed_n = total - failed_n - error_n
-        else:
-            # Gradle format: "X tests completed, Y failed"
-            m = re.search(r"(\d+)\s+tests? completed,\s+(\d+)\s+failed", output)
-            if m:
-                total = int(m.group(1))
-                failed_n = int(m.group(2))
-                passed_n = total - failed_n
+
+        # BUILD SUCCESSFUL with no test summary → at least compilation passed
+        if "BUILD SUCCESS" in output and passed_n == 0 and failed_n == 0:
+            passed_n = 1
+        if "BUILD FAILURE" in output:
+            failed_n = max(failed_n, 1)
 
         status = "PASS" if (failed_n == 0 and error_n == 0 and passed_n > 0) else (
             "FAIL" if failed_n > 0 else "ERROR"
@@ -368,10 +427,272 @@ class JavaRunner:
             errors=error_n,
             duration_ms=result["duration_ms"],
             test_output=output[-3000:],
-            notes=f"{'gradle' if is_gradle else 'maven'} test in {self.image}",
+            notes=f"maven test in {runtime_image} (jdk={jdk_version})",
         )
 
+def detect_gradle_version(target_repo: str = None, code_dir: str = None) -> str:
+    """
+    Detect which Gradle major version a repo uses by reading its wrapper config.
 
+    Returns major version string: "4" | "5" | "6" | "7" | "8". Defaults to "8".
+    """
+    import re
+
+    candidates = []
+    if code_dir:
+        candidates.append(os.path.join(code_dir, "gradle", "wrapper", "gradle-wrapper.properties"))
+    if target_repo:
+        for base in [
+            os.path.join(os.getcwd(), "repos", target_repo),
+            os.path.join(os.path.dirname(os.getcwd()), "repos", target_repo),
+        ]:
+            candidates.append(os.path.join(base, "gradle", "wrapper", "gradle-wrapper.properties"))
+
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            m = re.search(r"gradle-(\d+)\.\d+", content)
+            if m:
+                major = m.group(1)
+                print(f"  [sandbox] Detected Gradle version {major} from wrapper.properties")
+                return major
+        except Exception as e:
+            print(f"  [sandbox] Could not read {path}: {e}")
+            continue
+
+    print(f"  [sandbox] No gradle-wrapper.properties found — defaulting to Gradle 8")
+    return "8"
+
+
+def detect_jdk_version(target_repo: str = None, code_dir: str = None, build_tool: str = "maven") -> str:
+    """
+    Detect required JDK version from project config files.
+
+    For Maven: reads pom.xml for
+      <maven.compiler.source>11</maven.compiler.source>  OR
+      <maven.compiler.target>11</maven.compiler.target>  OR
+      <java.version>11</java.version>  OR
+      <source>11</source> inside <configuration>
+
+    For Gradle: reads build.gradle for
+      sourceCompatibility = '11'  OR
+      sourceCompatibility = JavaVersion.VERSION_11  OR
+      targetCompatibility = '11'  OR
+      languageVersion = JavaLanguageVersion.of(11)
+
+    Returns: "8" | "11" | "17" | "21". Defaults: 17 for Maven, matches Gradle major for Gradle.
+    """
+    import re
+
+    candidates = []
+    config_file = "pom.xml" if build_tool == "maven" else "build.gradle"
+
+    if code_dir:
+        candidates.append(os.path.join(code_dir, config_file))
+        # Also check .kts variant for gradle
+        if build_tool == "gradle":
+            candidates.append(os.path.join(code_dir, "build.gradle.kts"))
+
+    if target_repo:
+        for base in [
+            os.path.join(os.getcwd(), "repos", target_repo),
+            os.path.join(os.path.dirname(os.getcwd()), "repos", target_repo),
+        ]:
+            candidates.append(os.path.join(base, config_file))
+            if build_tool == "gradle":
+                candidates.append(os.path.join(base, "build.gradle.kts"))
+
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            if build_tool == "maven":
+                # Try multiple Maven JDK indicators
+                patterns = [
+                    r"<maven\.compiler\.source>(\d+)(?:\.\d+)?</maven\.compiler\.source>",
+                    r"<maven\.compiler\.target>(\d+)(?:\.\d+)?</maven\.compiler\.target>",
+                    r"<java\.version>(\d+)(?:\.\d+)?</java\.version>",
+                    r"<source>(\d+)(?:\.\d+)?</source>",
+                    r"<target>(\d+)(?:\.\d+)?</target>",
+                ]
+            else:
+                # Gradle patterns
+                patterns = [
+                    r"sourceCompatibility\s*=\s*['\"](\d+)(?:\.\d+)?['\"]",
+                    r"sourceCompatibility\s*=\s*JavaVersion\.VERSION_(\d+)",
+                    r"targetCompatibility\s*=\s*['\"](\d+)(?:\.\d+)?['\"]",
+                    r"targetCompatibility\s*=\s*JavaVersion\.VERSION_(\d+)",
+                    r"languageVersion\s*=\s*JavaLanguageVersion\.of\((\d+)\)",
+                    r"jvmTarget\s*=\s*['\"](\d+)['\"]",  # Kotlin DSL
+                ]
+
+            for pat in patterns:
+                m = re.search(pat, content)
+                if m:
+                    version = m.group(1)
+                    # Normalize "1.8" notation (treat as 8)
+                    if version == "1":
+                        version = "8"
+                    # Snap to nearest supported LTS
+                    supported = {"8", "11", "17", "21"}
+                    if version in supported:
+                        print(f"  [sandbox] Detected JDK version {version} from {os.path.basename(path)}")
+                        return version
+                    # Map known minor variants
+                    if version in ("9", "10"):
+                        return "11"  # snap up to nearest LTS
+                    if version in ("12", "13", "14", "15", "16"):
+                        return "17"
+                    if version in ("18", "19", "20"):
+                        return "21"
+        except Exception as e:
+            print(f"  [sandbox] Could not read {path}: {e}")
+            continue
+
+    # Sensible defaults if no version found
+    default = "17"
+    print(f"  [sandbox] No JDK version found in config — defaulting to {default}")
+    return default
+
+
+# (gradle_version, jdk_version) -> docker image
+# Covers Gradle 4-8 × JDK 8/11/17/21 combinations that actually exist on Docker Hub.
+# When an exact combo doesn't exist, falls back via gradle_image_for_combo logic.
+GRADLE_VERSION_IMAGES = {
+    ("4", "8"):   "gradle:4-jdk8",
+    ("5", "8"):   "gradle:5-jdk8",
+    ("5", "11"):  "gradle:5-jdk11",
+    ("6", "8"):   "gradle:6-jdk8",
+    ("6", "11"):  "gradle:6-jdk11",
+    ("7", "11"):  "gradle:7-jdk11",
+    ("7", "17"):  "gradle:7-jdk17",
+    ("8", "17"):  "gradle:8-jdk17",
+    ("8", "21"):  "gradle:8-jdk21",
+}
+
+
+# Maven generally supports any JDK with a matching image. Single Maven version (3.9)
+# pairs cleanly with all common JDKs via Eclipse Temurin.
+MAVEN_VERSION_IMAGES = {
+    "8":   "maven:3.9-eclipse-temurin-8",
+    "11":  "maven:3.9-eclipse-temurin-11",
+    "17":  "maven:3.9-eclipse-temurin-17",
+    "21":  "maven:3.9-eclipse-temurin-21",
+}
+
+
+def gradle_image_for_combo(gradle_version: str, jdk_version: str) -> str:
+    """Pick the right gradle image for a (gradle, jdk) version combo.
+
+    Falls back to nearest compatible combo if exact match doesn't exist.
+    """
+    # Exact match first
+    if (gradle_version, jdk_version) in GRADLE_VERSION_IMAGES:
+        return GRADLE_VERSION_IMAGES[(gradle_version, jdk_version)]
+
+    # Try lower JDK for same Gradle version
+    fallback_order = {
+        "21": ["21", "17", "11", "8"],
+        "17": ["17", "11", "8"],
+        "11": ["11", "8", "17"],
+        "8":  ["8", "11"],
+    }
+    for jdk in fallback_order.get(jdk_version, ["17", "11", "8"]):
+        if (gradle_version, jdk) in GRADLE_VERSION_IMAGES:
+            print(f"  [sandbox] Exact gradle:{gradle_version}-jdk{jdk_version} not mapped — "
+                  f"using gradle:{gradle_version}-jdk{jdk}")
+            return GRADLE_VERSION_IMAGES[(gradle_version, jdk)]
+
+    # Last resort
+    return "gradle:8-jdk17"
+
+
+def maven_image_for_jdk(jdk_version: str) -> str:
+    """Pick the right Maven image for a given JDK version."""
+    return MAVEN_VERSION_IMAGES.get(jdk_version, "maven:3.9-eclipse-temurin-17")
+
+class GradleRunner:
+    """
+    Java/Gradle: dynamically picks the right gradle+JDK image combo based on
+    the repo's gradle-wrapper.properties version AND build.gradle JDK setting.
+    """
+
+    image = "gradle:8-jdk17"  # default, overridden per-run
+
+    def __init__(self, target_repo: str = None):
+        self.target_repo = target_repo
+
+    def run(self, code_dir: str) -> ValidationResult:
+        gradle_major = detect_gradle_version(target_repo=self.target_repo, code_dir=code_dir)
+        jdk_version = detect_jdk_version(
+            target_repo=self.target_repo,
+            code_dir=code_dir,
+            build_tool="gradle",
+        )
+        runtime_image = gradle_image_for_combo(gradle_major, jdk_version)
+        print(f"  [sandbox] Using Gradle image for Gradle {gradle_major} + JDK {jdk_version}: {runtime_image}")
+
+        sandbox = DockerSandbox(runtime_image, timeout_seconds=600)
+
+        shell_cmd = (
+            "if [ ! -f build.gradle ] && [ ! -f build.gradle.kts ]; then "
+            "  echo 'NO_BUILD_GRADLE: No build.gradle in workspace.'; "
+            "  exit 0; "
+            "fi; "
+            "gradle test --no-daemon --console=plain --warning-mode=summary 2>&1 || true"
+        )
+
+        result = sandbox.run(code_dir, ["bash", "-c", shell_cmd])
+        output = result["stdout"] + "\n" + result["stderr"]
+
+        if "NO_BUILD_GRADLE" in output:
+            return ValidationResult(
+                language="java", status="SKIPPED",
+                duration_ms=result["duration_ms"],
+                notes="No build.gradle in workspace",
+            )
+
+        import re
+        passed_n = failed_n = error_n = 0
+
+        m = re.search(r"(\d+)\s+tests?\s+completed[,]?\s+(\d+)\s+failed", output)
+        if m:
+            total = int(m.group(1))
+            failed_n = int(m.group(2))
+            passed_n = total - failed_n
+
+        if passed_n == 0 and failed_n == 0:
+            passed_n = output.count("PASSED")
+            failed_n = output.count("FAILED")
+
+        if "BUILD SUCCESSFUL" in output and passed_n == 0 and failed_n == 0:
+            passed_n = 1
+        if "BUILD FAILED" in output:
+            failed_n = max(failed_n, 1)
+
+        status = "PASS" if (failed_n == 0 and passed_n > 0) else (
+            "FAIL" if failed_n > 0 else "ERROR"
+        )
+        if result.get("error") == "DOCKER_UNAVAILABLE":
+            status = "SKIPPED"
+
+        return ValidationResult(
+            language="java",
+            status=status,
+            passed=passed_n,
+            failed=failed_n,
+            errors=error_n,
+            duration_ms=result["duration_ms"],
+            test_output=output[-3000:],
+            notes=f"gradle test in {runtime_image} (gradle={gradle_major}, jdk={jdk_version})",
+        )
+    
 class DotnetRunner:
     """C# / .NET: dotnet test in a mcr.microsoft.com/dotnet/sdk:8.0 container."""
 
@@ -417,11 +738,16 @@ class DotnetRunner:
 # Dispatch
 # ─────────────────────────────────────────────────────────────────────────
 
+# For Java we have two runners — Maven and Gradle. The dispatcher in
+# run_sandbox_validation picks the right one based on detect_java_build_system().
+# All other languages map directly.
 LANGUAGE_RUNNERS = {
-    "python": PythonRunner,
-    "node":   NodeRunner,
-    "java":   JavaRunner,
-    "dotnet": DotnetRunner,
+    "python":       PythonRunner,
+    "node":         NodeRunner,
+    "java":         MavenRunner,   # default — overridden for Gradle in dispatcher
+    "java_maven":   MavenRunner,
+    "java_gradle":  GradleRunner,
+    "dotnet":       DotnetRunner,
 }
 
 
@@ -461,7 +787,14 @@ def run_sandbox_validation(
             notes="Could not detect project language",
         )
 
-    runner_cls = LANGUAGE_RUNNERS.get(language)
+    # Java: differentiate Maven vs Gradle
+    runner_key = language
+    if language == "java":
+        build_system = detect_java_build_system(generated_files, target_repo)
+        runner_key = f"java_{build_system}"
+        print(f"  [sandbox] Java build system: {build_system}")
+
+    runner_cls = LANGUAGE_RUNNERS.get(runner_key) or LANGUAGE_RUNNERS.get(language)
     if not runner_cls:
         return ValidationResult(
             language=language, status="SKIPPED",
@@ -527,7 +860,10 @@ def run_sandbox_validation(
                 notes="No files written to sandbox",
             )
 
-        runner = runner_cls()
+        if runner_key in ("java_maven", "java_gradle"):
+            runner = runner_cls(target_repo=target_repo)
+        else:
+            runner = runner_cls()
         overlay_kind = "full repo + patches" if repo_src else "patches only"
         print(f"  [sandbox] Running {language} validation in {runner.image} ({overlay_kind}, {files_written} files patched)...")
         return runner.run(code_dir)
