@@ -1208,6 +1208,7 @@ def list_repo_overrides(api_key: str = Depends(verify_api_key)):
 def run_phase0_and_phase1(thread_id: str, requirement: str):
     """Phase 0 (project/repo routing) + Phase 1 (Discovery) runner."""
     try:
+        _phase_t0 = time.perf_counter()
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agents.phase0_selector.selector_agent import search_projects, slugify, _infer_repo_kind
@@ -1338,6 +1339,9 @@ def run_phase0_and_phase1(thread_id: str, requirement: str):
                "repos": [r["name"] for r in selected_repos]})
         save_pipeline(thread_id, pipeline_store[thread_id],
                       _safe_state(pipeline_store[thread_id]["current_state"]))
+        _elapsed = int((time.perf_counter() - _phase_t0) * 1000)
+        pipeline_store[thread_id].setdefault("timings", {})["phase_1"] = _elapsed
+        print(f"[timing] {thread_id} phase_1: {_elapsed}ms ({_elapsed/1000:.2f}s)")
 
         # ── Phase 1: Discovery (BRD/PRD/ADR/Architecture) ───────────────
         run_phase1(thread_id, requirement, "")
@@ -1352,6 +1356,7 @@ def run_phase0_and_phase1(thread_id: str, requirement: str):
 
 def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
     try:
+        _t0 = time.perf_counter()
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agents.phase1_discovery.discovery_agent import build_discovery_graph, DiscoveryState
@@ -1426,7 +1431,10 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
         print(f"[DEPLOY-TRACE][P1-save] current_state.is_new_project = {_cs.get('is_new_project','<ABSENT ❌>')}")
         print(f"[DEPLOY-TRACE][P1-save] current_state.selected_repos = {[r.get('name') if isinstance(r,dict) else r for r in _cs.get('selected_repos',[])]}")
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
-
+        _elapsed = int((time.perf_counter() - _t0) * 1000)
+        pipeline_store[thread_id].setdefault("current_state", {}).setdefault("timings", {})["phase_0"] = _elapsed
+        print(f"[timing] {thread_id} phase_0: {_elapsed}ms ({_elapsed/1000:.2f}s)")
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
     except Exception as e:
         # GraphInterrupt is how LangGraph signals a pause for human approval — it is NOT an error.
         from langgraph.errors import GraphInterrupt
@@ -1452,6 +1460,7 @@ def run_phase1(thread_id: str, requirement: str, feedback: str = ""):
 
 def run_phase2(thread_id: str, feedback: str = ""):
     try:
+        _t0 = time.perf_counter()
         from agents.phase2_planning.planning_agent import build_planning_graph, PlanningState
         entry = pipeline_store[thread_id]
         p1_state = entry["current_state"]
@@ -1469,6 +1478,10 @@ def run_phase2(thread_id: str, feedback: str = ""):
 
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "status": "WAITING_PHASE_2_APPROVAL", "sub_stage": "Sprint plan ready — Awaiting approval"})
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+        _elapsed = int((time.perf_counter() - _t0) * 1000)
+        pipeline_store[thread_id].setdefault("current_state", {}).setdefault("timings", {})["phase_2"] = _elapsed
+        print(f"[timing] {thread_id} phase_2: {_elapsed}ms ({_elapsed/1000:.2f}s)")
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
     except Exception as e:
         import traceback
         traceback.print_exc()   # so the real error shows in the uvicorn log
@@ -1481,6 +1494,7 @@ def run_phase2(thread_id: str, feedback: str = ""):
 
 def run_phase3(thread_id: str, feedback: str = ""):
     try:
+        _t0 = time.perf_counter()
         from agents.phase3_impact.graph import get_graph
         entry = pipeline_store[thread_id]
         prev_state = entry["current_state"]
@@ -1526,6 +1540,10 @@ def run_phase3(thread_id: str, feedback: str = ""):
             "sub_stage": "Impact report ready — Awaiting approval"
         })
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+        _elapsed = int((time.perf_counter() - _t0) * 1000)
+        pipeline_store[thread_id].setdefault("current_state", {}).setdefault("timings", {})["phase_3"] = _elapsed
+        print(f"[timing] {thread_id} phase_3: {_elapsed}ms ({_elapsed/1000:.2f}s)")
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1535,6 +1553,7 @@ def run_phase3(thread_id: str, feedback: str = ""):
 
 def run_phase4(thread_id: str):
     try:
+        _t0 = time.perf_counter()
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agents.phase4_codegen.codegen_agent import run_codegen
@@ -1611,9 +1630,12 @@ def run_phase4(thread_id: str):
         if result4.get("warning"):
             pipeline_store[thread_id]["warning"] = result4["warning"]
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
-
+        _elapsed = int((time.perf_counter() - _t0) * 1000)
+        pipeline_store[thread_id].setdefault("current_state", {}).setdefault("timings", {})["phase_4"] = _elapsed
+        print(f"[timing] {thread_id} phase_4: {_elapsed}ms ({_elapsed/1000:.2f}s)")
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
         print(f"[Phase 4] ✅ Saved {len(generated_changes)} generated files to DB")
-
+        
 
         # Route directly to Phase 5
         run_phase5(thread_id)
@@ -1632,6 +1654,7 @@ def run_phase4(thread_id: str):
         )
 def run_phase5(thread_id: str):
     try:
+        _t0 = time.perf_counter()
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
         from agents.phase5_validation.validation_agent import run_validation_phase
@@ -1699,6 +1722,11 @@ def run_phase5(thread_id: str):
 
         pipeline_store[thread_id]["sub_stage"] = f"Budget check passed! Cost: {decision.get('recomputed_units')} units. Moving to Delivery."
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+        _elapsed = int((time.perf_counter() - _t0) * 1000)
+        pipeline_store[thread_id].setdefault("current_state", {}).setdefault("timings", {})["phase_5"] = _elapsed
+        print(f"[timing] {thread_id} phase_5: {_elapsed}ms ({_elapsed/1000:.2f}s)")
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
+
         # ─────────────────────────────────────────────────────────
 
         run_phase6(thread_id, "")
@@ -1729,6 +1757,7 @@ def _find_available_repo_name(owner, base_name, headers, req_lib, max_tries=50):
 
 def run_phase6(thread_id: str, feedback: str = ""):
     try:
+        _t0 = time.perf_counter()
         from agents.phase6_delivery.delivery_agent import build_delivery_graph, DeliveryState
         import requests as req_lib
 
@@ -1848,12 +1877,24 @@ def run_phase6(thread_id: str, feedback: str = ""):
         if delivery_status in ("PUSH_FAILED", "PR_SKIPPED", "PR_FAILED"):
             err = result.get("error") or f"Phase 6 delivery failed with status {delivery_status}"
             print(f"  ❌ Phase 6 push/PR failed: {err}")
-            merged = {**state, "pr_urls": pr_urls, "target_repo": target_repo_name}
+            merged = {
+                **state,
+                "pr_urls": pr_urls,
+                "target_repo": target_repo_name,
+                "per_repo_push_status": result.get("per_repo_push_status", {}),
+                "per_repo_pr": result.get("per_repo_pr", {}),
+            }
             pipeline_store[thread_id].update({"current_state": merged, "status": "ERROR", "error": err, "sub_stage": f"Delivery failed: {delivery_status}"})
             save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
             return
 
-        merged = {**state, "pr_urls": pr_urls, "target_repo": target_repo_name}
+        merged = {
+            **state,
+            "pr_urls": pr_urls,
+            "target_repo": target_repo_name,
+            "per_repo_push_status": result.get("per_repo_push_status", {}),
+            "per_repo_pr": result.get("per_repo_pr", {}),
+        }
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "pr_urls": pr_urls, "status": "WAITING_PHASE_6_APPROVAL", "sub_stage": f"Pushed to {target_repo_name} — Awaiting PR approval"})
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
         # ── FINAL FIX: REGISTER AND INDEX IMMEDIATELY IN PHASE 6 ──
@@ -1910,6 +1951,11 @@ def run_phase6(thread_id: str, feedback: str = ""):
             rname = repo.get("name") if isinstance(repo, dict) else repo
             if rname:
                 threading.Thread(target=_bg_index, args=(rname, branch_name)).start()
+        _elapsed = int((time.perf_counter() - _t0) * 1000)
+        pipeline_store[thread_id].setdefault("current_state", {}).setdefault("timings", {})["phase_6"] = _elapsed
+        print(f"[timing] {thread_id} phase_6: {_elapsed}ms ({_elapsed/1000:.2f}s)")
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
+
         # ──────────────────────────────────────────────────────────
     except Exception as e:
         import traceback
@@ -1924,6 +1970,7 @@ def run_phase6(thread_id: str, feedback: str = ""):
 
 def run_phase7(thread_id: str, feedback: str = ""):
     try:
+        _t0 = time.perf_counter()
         from agents.phase7_deployment.deployment_agent import build_deployment_graph, DeploymentState
         entry = pipeline_store[thread_id]
         state = entry["current_state"]
@@ -2015,6 +2062,10 @@ def run_phase7(thread_id: str, feedback: str = ""):
 
         pipeline_store[thread_id].update({"graph": graph, "config": config, "current_state": merged, "status": "WAITING_PHASE_7_APPROVAL", "sub_stage": "Deployment plan ready — Awaiting production approval"})
         save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(merged))
+        _elapsed = int((time.perf_counter() - _t0) * 1000)
+        pipeline_store[thread_id].setdefault("current_state", {}).setdefault("timings", {})["phase_7"] = _elapsed
+        print(f"[timing] {thread_id} phase_7: {_elapsed}ms ({_elapsed/1000:.2f}s)")
+        save_pipeline(thread_id, pipeline_store[thread_id], _safe_state(pipeline_store[thread_id]["current_state"]))
     except Exception as e:
         import traceback
         traceback.print_exc()   # so the real error shows in the uvicorn log
@@ -2156,7 +2207,9 @@ def resume_phase7(thread_id: str, approved: bool = True, feedback: str = ""):
 
 
 def _safe_state(state: dict) -> dict:
-    safe_keys = ["selected_project", "selected_repos", "is_new_project", "candidates", "scope_contract", "classifier_output", "brd", "prd", "adr", "architecture", "sprint_plan", "runbook", "jira_tickets", "impact_report", "generated_changes", "test_files", "pr_urls", "target_repo", "deploy_results", "monitoring_results", "deploy_sequence", "feature_flags", "rollback_triggered", "status", "requirement", "merged_shas", "merge_errors", "phase6_final_status","depth_level", "deploy_endpoints"]
+    safe_keys = ["selected_project", "selected_repos", "is_new_project", "candidates", "scope_contract", "classifier_output", "brd", "prd", "adr", "architecture", "sprint_plan", "runbook", "jira_tickets", "impact_report", "generated_changes", "test_files", "pr_urls", "target_repo", "deploy_results", "monitoring_results", "deploy_sequence", "feature_flags", "rollback_triggered", "status", "requirement", "merged_shas", "merge_errors", "phase6_final_status","depth_level", "deploy_endpoints","timings","per_repo_push_status",
+"per_repo_pr",
+"per_repo_status"]
     result = {}
     for k in safe_keys:
         if k in state:

@@ -531,6 +531,173 @@ def build_context_packet(state: CodegenState) -> dict:
 
     return context
 
+def generate_code_changes_per_repo(state: CodegenState) -> CodegenState:
+    """
+    Production-grade cross-repo codegen for 10-15 repo scale.
+
+    Groups affected files by repo, generates code IN PARALLEL per repo with
+    language-isolated context, applies applicability filter, and tolerates
+    partial failure.
+
+    Concurrency capped at MAX_PARALLEL_REPOS (default 6) to respect LLM
+    rate limits. Override via env var.
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    impact = state.get("impact_report", {})
+    affected_files = impact.get("affected_files", [])
+
+    # ─── Group affected files by repo ───
+    by_repo = {}
+    for af in affected_files:
+        repo = af.get("repo_name", "")
+        if not repo:
+            continue
+        by_repo.setdefault(repo, []).append(af)
+
+    # ─── Single-repo case: use existing sequential path ───
+    # Single-repo case: use existing path, but tag target_repo so Phase 6
+    # always knows where to push (even when only 1 repo is affected, Phase 6's
+    # cross-repo fan-out logic needs the tag to find the right repo URL).
+    if len(by_repo) <= 1:
+        result = generate_code_changes(state)
+        # Tag changes with the single target repo
+        target = list(by_repo.keys())[0] if by_repo else None
+        if target:
+            for c in result.get("generated_changes", []):
+                if isinstance(c, dict) and not c.get("target_repo"):
+                    c["target_repo"] = target
+            for t in result.get("test_files", []):
+                if isinstance(t, dict) and not t.get("target_repo"):
+                    t["target_repo"] = target
+        return result
+    # ─── Applicability filter: skip repos where the change doesn't apply ───
+    # Phase 3's risk assessment may have flagged "applicable_repos". If not,
+    # we include all affected repos by default (current behavior).
+    risk = impact.get("risk_assessment", {})
+    applicable = set(risk.get("applicable_repos") or by_repo.keys())
+    skipped_inapplicable = [r for r in by_repo if r not in applicable]
+    target_repos = {r: f for r, f in by_repo.items() if r in applicable}
+
+    if skipped_inapplicable:
+        print(f"[Phase 4] Skipping inapplicable repos: {skipped_inapplicable}")
+
+    n = len(target_repos)
+    if n == 0:
+        return {
+            **state,
+            "generated_changes": [],
+            "validation_errors": ["No applicable repos for this requirement"],
+            "status": "CODE_GENERATION_FAILED",
+        }
+
+    max_parallel = int(os.getenv("MAX_PARALLEL_REPOS", "6"))
+    concurrency = min(n, max_parallel)
+
+    print(f"\n[Phase 4] Cross-repo codegen: {n} repos, "
+          f"concurrency={concurrency}, target_repos={list(target_repos.keys())}")
+
+    # ─── Build a per-repo sub-state with language-isolated context ───
+    def build_sub_state(repo_name, repo_files):
+        repo_impact = {
+            **impact,
+            "affected_files": repo_files,
+            "affected_repos": [
+                r for r in impact.get("affected_repos", [])
+                if (r.get("name") if isinstance(r, dict) else r) == repo_name
+            ],
+            "affected_symbols": [
+                s for s in impact.get("affected_symbols", [])
+                if s.get("repo_name") == repo_name
+            ],
+        }
+        repo_existing = {
+            k: v for k, v in state.get("existing_code", {}).items()
+            if k.startswith(f"{repo_name}:")
+        }
+        return {
+            **state,
+            "impact_report": repo_impact,
+            "existing_code": repo_existing,
+            "target_repo": repo_name,
+        }
+
+    # ─── Run codegen per repo in parallel ───
+    def run_one(repo_name, repo_files):
+        try:
+            print(f"[Phase 4]   → starting codegen for {repo_name}")
+            sub_state = build_sub_state(repo_name, repo_files)
+            result = generate_code_changes(sub_state)
+            changes = result.get("generated_changes", [])
+            # Tag changes with target_repo for Phase 6 routing
+            for c in changes:
+                if isinstance(c, dict):
+                    c["target_repo"] = repo_name
+            return repo_name, {
+                "status": result.get("status", "UNKNOWN"),
+                "changes": changes,
+                "errors": result.get("validation_errors", []),
+            }
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return repo_name, {
+                "status": "FAILED",
+                "changes": [],
+                "errors": [f"codegen exception: {e}"],
+            }
+
+    all_changes = []
+    all_errors = []
+    per_repo_status = {}
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(run_one, repo, files): repo
+            for repo, files in target_repos.items()
+        }
+        for future in as_completed(futures):
+            repo_name, result = future.result()
+            per_repo_status[repo_name] = {
+                "status": result["status"],
+                "files_generated": len(result["changes"]),
+                "errors": result["errors"],
+            }
+            all_changes.extend(result["changes"])
+            all_errors.extend(result["errors"])
+
+            status_icon = "✅" if result["status"] in (
+                "VALIDATED", "CODE_GENERATED", "CODE_GENERATED_WITH_WARNINGS"
+            ) else "❌"
+            print(f"[Phase 4]   {status_icon} {repo_name}: "
+                  f"{result['status']} ({len(result['changes'])} files)")
+
+    # ─── Determine overall status ───
+    SUCCESS = {"VALIDATED", "CODE_GENERATED", "CODE_GENERATED_WITH_WARNINGS"}
+    succeeded = sum(1 for s in per_repo_status.values() if s["status"] in SUCCESS)
+    total = len(per_repo_status)
+    success_rate = succeeded / total if total else 0
+
+    if success_rate == 1.0:
+        overall_status = "CODE_GENERATED"
+    elif success_rate >= 0.7:
+        overall_status = "CODE_GENERATED_WITH_WARNINGS"
+    elif success_rate >= 0.3:
+        overall_status = "PARTIAL_SUCCESS_BELOW_THRESHOLD"
+    else:
+        overall_status = "CODE_GENERATION_FAILED"
+
+    print(f"\n[Phase 4] Cross-repo summary: {succeeded}/{total} repos succeeded "
+          f"({success_rate*100:.0f}%), overall status: {overall_status}")
+
+    return {
+        **state,
+        "generated_changes": all_changes,
+        "validation_errors": all_errors,
+        "per_repo_status": per_repo_status,
+        "skipped_inapplicable_repos": skipped_inapplicable,
+        "status": overall_status,
+    }
 
 def generate_code_changes(state: CodegenState) -> CodegenState:
     print("\n[Phase 4] Generating Diff-Based Polyglot Code Changes...")
@@ -995,7 +1162,7 @@ def build_codegen_graph():
     builder.add_node("eval_first_check", eval_first_check)
     builder.add_node("load_existing_code", load_existing_code)
     builder.add_node("generate_fresh_project", generate_fresh_project)
-    builder.add_node("generate_code_changes", generate_code_changes)
+    builder.add_node("generate_code_changes", generate_code_changes_per_repo)  # ← UPDATED
     builder.add_node("generate_cicd", generate_cicd_node)         # ← NEW
     builder.add_node("validate_cicd", validate_cicd_node)         # ← NEW
     builder.add_node("validate_changes", validate_changes)

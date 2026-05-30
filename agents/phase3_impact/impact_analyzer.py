@@ -241,6 +241,10 @@ Assess the risk and return ONLY valid JSON:
   "risk_reasons": ["reason 1", "reason 2"],
   "breaking_changes": ["change 1", "change 2"],
   "recommendation": "proceed|proceed_with_caution|requires_architect_review"
+  "applicable_repos": [list of repo names from the affected_repos where this
+specific requirement actually makes sense. For example, "add /health endpoint"
+applies to API/service repos but NOT to pure frontend or library repos.
+If unsure, include the repo.]
 }}
 """
 
@@ -301,10 +305,24 @@ def run_impact_analysis(requirement: str, prd: dict = None, adr: dict = None,
         for r in (selected_repos or [])
         if (r if isinstance(r, str) else r.get("name"))
     ]
-    hits = semantic_search(requirement, top_k=8, repo_names=selected_repo_names or None)
-    print(f"  Scoped to repos: {selected_repo_names or 'ALL'}")
-    print(f"  Found {len(hits)} relevant symbols")
+    # Cross-repo: search EACH repo independently so one repo's code doesn't crowd
+# out others in the top-k. Without this, the most-indexed repo wins all slots
+# and Phase 4 only generates code for that repo.
+    hits = []
+    if selected_repo_names:
+        per_repo_k = max(3, 8 // max(len(selected_repo_names), 1))
+        for repo_name in selected_repo_names:
+            repo_hits = semantic_search(requirement, top_k=per_repo_k, repo_names=[repo_name])
+            if repo_hits:
+                hits.extend(repo_hits)
+                print(f"  {repo_name}: {len(repo_hits)} relevant symbols")
+            else:
+                print(f"  {repo_name}: 0 relevant symbols")
+    else:
+        hits = semantic_search(requirement, top_k=8)
 
+    print(f"  Scoped to repos: {selected_repo_names or 'ALL'}")
+    print(f"  Total hits: {len(hits)} across {len(set(h['repo_name'] for h in hits))} repos")
     if not hits:
         print("  No affected files found — aborting analysis.")
         return {

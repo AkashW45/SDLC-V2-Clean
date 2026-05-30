@@ -55,23 +55,18 @@ def _pg():
     return PooledConn()
 
 
-def _openai_for_embeddings() -> OpenAI:
-    """Uses the embedding endpoint — keep cheap & fast (text-embedding-3-small)."""
-    return OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_BASE_URL"),  # None = openai.com default
-    )
-
-
 def _embed(text: str) -> List[float]:
-    """Embed a single query string. Returns [] on failure (graceful degrade)."""
+    """
+    Embed query text using the project-wide local sentence-transformer.
+    No OpenAI key needed — same embedder used by Phase 0 routing and Phase 3
+    semantic search, so query vectors are in the same space as code_embeddings
+    chunks (which were also indexed with this embedder).
+
+    Returns [] on failure (graceful degrade).
+    """
     try:
-        client = _openai_for_embeddings()
-        resp = client.embeddings.create(
-            model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
-            input=text[:8000],  # cap query length
-        )
-        return resp.data[0].embedding
+        from core.embeddings import encode
+        return encode(text[:8000])
     except Exception as e:
         logger.warning(f"_embed failed: {e}")
         return []

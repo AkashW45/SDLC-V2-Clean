@@ -1563,6 +1563,26 @@
 
       html += sectionClose();
     }
+    // ── Phase Timings Panel ─────────────────────────────────────
+    if (state.timings && Object.keys(state.timings).length > 0) {
+      html += `
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:16px">
+        <div style="font-size:9px;color:var(--text3);letter-spacing:2px;text-transform:uppercase;margin-bottom:10px">⏱ Phase Timings</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px">
+          ${Object.entries(state.timings).sort().map(([phase, ms]) => `
+            <div style="background:var(--surface2);border-radius:6px;padding:8px 10px">
+              <div style="font-size:9px;color:var(--text3);text-transform:uppercase;margin-bottom:4px">${phase.replace('_',' ')}</div>
+              <div style="font-size:15px;font-weight:700;color:${ms > 60000 ? '#ff6b6b' : ms > 30000 ? '#ffd93d' : 'var(--accent)'}">
+                ${ms >= 60000 ? (ms/60000).toFixed(1)+'m' : (ms/1000).toFixed(1)+'s'}
+              </div>
+            </div>
+          `).join('')}
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:8px;text-align:right;border-top:1px solid var(--border);padding-top:8px">
+          Total pipeline time: <strong style="color:var(--text)">${(Object.values(state.timings).reduce((a,b)=>a+b,0)/1000).toFixed(1)}s</strong>
+        </div>
+      </div>`;
+    }
 
     // ── PHASE 6 — Delivery ──────────────────────────────────────
     // Render when phase is 6, when PRs exist, or when waiting for approval

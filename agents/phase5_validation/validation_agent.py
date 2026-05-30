@@ -393,6 +393,11 @@ Now generate the test file using the delimited format above.
 
         if not test_content or len(test_content) < 30:
             print(f"  [Phase 5] ⚠️  Generated test content too short for {file_path}")
+            print(f"  [Phase 5]     Length: {len(test_content)} chars (need >= 30)")
+            print(f"  [Phase 5]     LLM response (first 800 chars):")
+            print(f"  [Phase 5]     ─── {response[:800]} ───")
+            print(f"  [Phase 5]     Parsed test_content (first 500 chars):")
+            print(f"  [Phase 5]     ─── {test_content[:500]!r} ───")
             return None
 
         test_file = {
@@ -475,7 +480,8 @@ def generate_tests(state: ValidationState) -> ValidationState:
                     framework = result[0].get("framework", "?") if result else "?"
                     print(f"  [Phase 5] ({completed}/{len(changes)}) ✅ {framework}: {test_count} tests for {file_path}")
                 else:
-                    print(f"  [Phase 5] ({completed}/{len(changes)}) ⏭️  Skipped: {file_path}")
+                    print(f"  [Phase 5] ({completed}/{len(changes)}) ❌ FAILED to generate test for: {file_path}")
+                    print(f"  [Phase 5]     Reason: _process_single_test returned None (see LLM output above)")
             except Exception as e:
                 print(f"  [Phase 5] ({completed}/{len(changes)}) ❌ Worker exception for {file_path}: {e}")
 
@@ -506,120 +512,163 @@ def run_semgrep_gate(workspace_path: str) -> dict:
 
 def run_pytest_sandbox(generated_changes: list, test_files: list, timeout: int = 120) -> dict:
     """
-    Concurrent Pytest Sandbox:
-    1. Materialize generated code + test files into a temp directory
-    2. Install minimal deps (pytest itself; project deps optional via requirements.txt if generated)
-    3. Run pytest with --json-report-like flags, parse results
-    4. Return summary {passed, failed, errors, total, output, sandbox_path}
+    Polyglot validation dispatcher.
 
-    Tests that import the generated code resolve correctly because the temp dir
-    is added to PYTHONPATH for the subprocess.
+    Cross-repo: groups generated_changes + test_files by target_repo and runs
+    ONE sandbox per repo with that repo's detected language. Aggregates results.
+
+    Single-repo: detects language across all files and runs a single sandbox.
+
+    Backward-compatible signature — kept name `run_pytest_sandbox` so existing
+    callers don't need to change. Despite the legacy name, it now handles all
+    supported languages AND multiple repos.
     """
-    import sys as _sys
+    from agents.phase5_validation.sandbox_runners import (
+        run_sandbox_validation, detect_language
+    )
 
-    # No Python files to test — nothing to do, but don't fail the phase
-    py_tests = [t for t in (test_files or []) if (t.get("test_file_path") or "").endswith(".py")]
-    if not py_tests:
-        return {"status": "SKIPPED", "reason": "No Python test files to execute",
-                "passed": 0, "failed": 0, "total": 0}
+    all_files = list(generated_changes or []) + list(test_files or [])
 
-    sandbox = tempfile.mkdtemp(prefix="sdlc_v2_pytest_")
-    try:
-        # 1. Write generated source files
-        for change in (generated_changes or []):
-            fpath = change.get("file_path", "")
-            content = change.get("content", "")
-            if not fpath or not content:
-                continue
-            full = os.path.join(sandbox, fpath.replace("\\", "/"))
-            os.makedirs(os.path.dirname(full) or sandbox, exist_ok=True)
-            with open(full, "w", encoding="utf-8") as f:
-                f.write(content)
-            current_dir = os.path.dirname(full)
-            while current_dir and current_dir != sandbox:
-                init_file = os.path.join(current_dir, "__init__.py")
-
-                if not os.path.exists(init_file):
-                    with open(init_file, "w") as f:
-                        f.write("")
-                current_dir = os.path.dirname(current_dir)
-        # 2. Write test files
-        for test in py_tests:
-            tpath = test.get("test_file_path", "")
-            tcontent = test.get("content", "")
-            if not tpath or not tcontent:
-                continue
-            full = os.path.join(sandbox, tpath.replace("\\", "/"))
-            os.makedirs(os.path.dirname(full) or sandbox, exist_ok=True)
-            with open(full, "w", encoding="utf-8") as f:
-                f.write(tcontent)
-            current_dir = os.path.dirname(full)
-
-            while current_dir and current_dir != sandbox:
-                init_file = os.path.join(current_dir, "__init__.py")
-
-                if not os.path.exists(init_file):
-                    with open(init_file, "w") as f:
-                        f.write("")
-
-                current_dir = os.path.dirname(current_dir)
-
-        # 3. Run pytest. Sandbox is on PYTHONPATH so tests can import generated code.
-        env = os.environ.copy()
-        env["PYTHONPATH"] = sandbox + os.pathsep + env.get("PYTHONPATH", "")
-
-        cmd = [_sys.executable, "-m", "pytest", sandbox, "-q",
-               "--tb=short", "--maxfail=50", "--no-header", "--disable-warnings"]
-
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True, text=True,
-                cwd=sandbox, env=env, timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            return {"status": "TIMEOUT", "reason": f"pytest exceeded {timeout}s",
-                    "passed": 0, "failed": 0, "total": 0,
-                    "sandbox_path": sandbox, "output": ""}
-        except FileNotFoundError:
-            return {"status": "SKIPPED", "reason": "pytest not installed in this Python",
-                    "passed": 0, "failed": 0, "total": 0,
-                    "sandbox_path": sandbox, "output": ""}
-
-        stdout = (proc.stdout or "") + "\n" + (proc.stderr or "")
-
-        # 4. Parse pytest's summary line — works across pytest versions.
-        passed = failed = errors = 0
-        m = re.search(r"(\d+)\s+passed", stdout)
-        if m: passed = int(m.group(1))
-        m = re.search(r"(\d+)\s+failed", stdout)
-        if m: failed = int(m.group(1))
-        m = re.search(r"(\d+)\s+error", stdout)
-        if m: errors = int(m.group(1))
-        total = passed + failed + errors
-
-        # pytest exit codes: 0=ok, 1=tests failed, 2=interrupted, 5=no tests collected
-        if proc.returncode == 0:
-            status = "PASS"
-        elif proc.returncode == 5:
-            status = "NO_TESTS_COLLECTED"
-        else:
-            status = "FAIL"
-
+    if not all_files:
         return {
-            "status": status,
-            "passed": passed,
-            "failed": failed,
-            "errors": errors,
-            "total": total,
-            "exit_code": proc.returncode,
-            "output": stdout[-4000:],   # cap so it doesn't bloat the state
-            "sandbox_path": sandbox,
+            "status": "SKIPPED",
+            "reason": "No files to validate",
+            "passed": 0, "failed": 0, "errors": 0, "total": 0,
+            "output": "", "sandbox_path": "",
         }
-    except Exception as e:
-        return {"status": "ERROR", "reason": str(e),
-                "passed": 0, "failed": 0, "total": 0,
-                "sandbox_path": sandbox, "output": ""}
+
+    # ─── Group files by target_repo ───
+    by_repo = {}
+    for f in all_files:
+        if not isinstance(f, dict):
+            continue
+        target = f.get("target_repo")
+        if not target:
+            target = "_default"  # single-repo path
+        by_repo.setdefault(target, []).append(f)
+
+    n_repos = len([k for k in by_repo if k != "_default"]) or 1
+
+    # ─── Single-repo path ───
+    if n_repos <= 1:
+        target_repo = next((k for k in by_repo if k != "_default"), None)
+        language = detect_language(all_files)
+        print(f"  [Phase 5] Detected language: {language}, target_repo: {target_repo or 'N/A'}")
+
+        if language == "unknown":
+            return {
+                "status": "SKIPPED",
+                "reason": "Could not detect project language",
+                "passed": 0, "failed": 0, "errors": 0, "total": 0,
+                "output": "", "sandbox_path": "",
+            }
+
+        vresult = run_sandbox_validation(all_files, language_hint=language, target_repo=target_repo)
+        return {
+            "status": vresult.status,
+            "language": vresult.language,
+            "passed": vresult.passed,
+            "failed": vresult.failed,
+            "errors": vresult.errors,
+            "total": vresult.passed + vresult.failed + vresult.errors,
+            "duration_ms": vresult.duration_ms,
+            "output": vresult.test_output,
+            "sandbox_path": "",
+            "notes": vresult.notes,
+        }
+
+    # ─── Cross-repo path: one sandbox per repo, in parallel ───
+    print(f"\n  [Phase 5] Cross-repo validation: {n_repos} repos")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def run_one(repo_name, files):
+        language = detect_language(files)
+        print(f"  [Phase 5]   → {repo_name}: detected language={language}, {len(files)} files")
+        if language == "unknown":
+            return repo_name, {
+                "status": "SKIPPED",
+                "language": "unknown",
+                "passed": 0, "failed": 0, "errors": 0,
+                "duration_ms": 0,
+                "output": "",
+                "notes": "Could not detect language",
+            }
+        vresult = run_sandbox_validation(files, language_hint=language, target_repo=repo_name)
+        return repo_name, {
+            "status": vresult.status,
+            "language": vresult.language,
+            "passed": vresult.passed,
+            "failed": vresult.failed,
+            "errors": vresult.errors,
+            "duration_ms": vresult.duration_ms,
+            "output": vresult.test_output[-2000:],
+            "notes": vresult.notes,
+        }
+
+    per_repo_results = {}
+    with ThreadPoolExecutor(max_workers=min(n_repos, 3)) as ex:
+        futures = {ex.submit(run_one, r, f): r for r, f in by_repo.items() if r != "_default"}
+        for fut in as_completed(futures):
+            try:
+                repo_name, result = fut.result()
+                per_repo_results[repo_name] = result
+                icon = "✅" if result["status"] == "PASS" else "❌" if result["status"] == "FAIL" else "⚠️"
+                print(f"  [Phase 5]   {icon} {repo_name}: {result['status']} "
+                      f"({result['passed']} passed, {result['failed']} failed, "
+                      f"{result['duration_ms']}ms)")
+            except Exception as e:
+                repo_name = futures[fut]
+                print(f"  [Phase 5]   ❌ {repo_name}: sandbox exception: {e}")
+                per_repo_results[repo_name] = {
+                    "status": "ERROR",
+                    "language": "unknown",
+                    "passed": 0, "failed": 0, "errors": 1,
+                    "duration_ms": 0,
+                    "output": str(e),
+                    "notes": "Sandbox exception",
+                }
+
+    # ─── Aggregate ───
+    total_passed = sum(r["passed"] for r in per_repo_results.values())
+    total_failed = sum(r["failed"] for r in per_repo_results.values())
+    total_errors = sum(r["errors"] for r in per_repo_results.values())
+    total_duration = sum(r.get("duration_ms", 0) for r in per_repo_results.values())
+
+    succeeded = sum(1 for r in per_repo_results.values() if r["status"] == "PASS")
+    failed_repos = sum(1 for r in per_repo_results.values() if r["status"] == "FAIL")
+
+    if succeeded == n_repos:
+        overall = "PASS"
+    elif failed_repos > 0:
+        overall = "FAIL"
+    elif succeeded > 0:
+        overall = "PARTIAL_PASS"
+    else:
+        overall = "SKIPPED"
+
+    print(f"\n  [Phase 5] Cross-repo summary: {succeeded}/{n_repos} repos PASS, "
+          f"{total_passed} tests passed, {total_failed} failed")
+
+    # Combine output strings for the legacy `output` field
+    combined_output = "\n\n".join(
+        f"=== {r} ({d['language']}, {d['status']}) ===\n{d['output']}"
+        for r, d in per_repo_results.items()
+    )
+
+    return {
+        "status": overall,
+        "language": "polyglot",
+        "passed": total_passed,
+        "failed": total_failed,
+        "errors": total_errors,
+        "total": total_passed + total_failed + total_errors,
+        "duration_ms": total_duration,
+        "output": combined_output,
+        "sandbox_path": "",
+        "notes": f"Cross-repo: {succeeded}/{n_repos} PASS",
+        "per_repo_results": per_repo_results,
+    }
+
 
 def run_validation(state: ValidationState) -> ValidationState:
     """Run all validation checks on generated code and tests."""

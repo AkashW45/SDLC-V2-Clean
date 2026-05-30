@@ -51,6 +51,9 @@ class DeliveryState(TypedDict, total=False):
     branch_name: str
     repo_url: str
     pr_urls: list
+    # Cross-repo additions:
+    per_repo_push_status: dict
+    per_repo_pr: dict
 
     # ── PR merge bookkeeping (populated by merge_prs node) ───────────────
     # After the human approves Phase 6, the merge_prs node merges each PR
@@ -255,10 +258,23 @@ def create_github_pr(
         "Accept": "application/vnd.github+json"
     }
 
+    # Auto-detect the repo's default branch instead of hardcoding "main".
+    # Older repos use "master", newer ones use "main". GitHub rejects PRs
+    # with status 422 "field:base invalid" when base doesn't exist.
+    try:
+        repo_info_url = f"https://api.github.com/repos/{EFFECTIVE_OWNER}/{repo_name}"
+        info_resp = requests.get(repo_info_url, headers=headers)
+        if info_resp.status_code == 200:
+            base_branch = info_resp.json().get("default_branch", "main")
+        else:
+            base_branch = "main"  # fallback
+    except Exception:
+        base_branch = "main"
+
     payload = {
         "title": title,
         "head": branch_name,
-        "base": "main",
+        "base": base_branch,
         "body": body
     }
 
@@ -281,43 +297,35 @@ def create_github_pr(
 # -----------------------------------------
 # Nodes
 # -----------------------------------------
+def _push_single_repo(state: DeliveryState, repo_name: str, payload: dict) -> dict:
+    """
+    Push to a single repo. Used by both single-repo path and cross-repo
+    parallel path (called once per repo).
 
-def push_code(state: DeliveryState) -> DeliveryState:
-    """Push all generated changes to GitHub branch."""
-    print("\n[Phase 6] Pushing code to GitHub...")
-
+    Returns: {"status": "CODE_PUSHED" | "PUSH_FAILED", "repo_name": ..., "error": ...}
+    """
     branch_name = state["branch_name"]
     repo_url = state["repo_url"]
 
     github_token = os.getenv("GITHUB_TOKEN")
-
     if not github_token:
         raise Exception("GITHUB_TOKEN is missing")
 
-    # Inject auth into GitHub HTTPS URL
+    # Inject auth into clone URL
     if repo_url.startswith("https://github.com/"):
         repo_url = repo_url.replace(
             "https://github.com/",
             f"https://x-access-token:{github_token}@github.com/"
         )
 
-    # -----------------------------------------
-    # Greenfield repo creation
-    # -----------------------------------------
-
-    # Extract repo name
-    repo_name = repo_url.split("/")[-1].replace(".git", "")
-
-    # Check if repo exists
+    # Check if repo exists on GitHub
     repo_check_url = f"https://api.github.com/repos/{EFFECTIVE_OWNER}/{repo_name}"
-
     headers = {
         "Authorization": f"Bearer {github_token}",
-        "Accept": "application/vnd.github+json"
+        "Accept": "application/vnd.github+json",
     }
-
     repo_check = requests.get(repo_check_url, headers=headers)
-    # Repo does not exist → create it (and wait for auto_init commit inside).
+
     newly_created = False
     if repo_check.status_code == 404:
         print(f"  ℹ️  Repo '{repo_name}' does not exist. Creating...")
@@ -327,117 +335,216 @@ def push_code(state: DeliveryState) -> DeliveryState:
             newly_created = True
         except Exception as e:
             print(f"  ❌ Repo creation failed: {e}")
-            return {**state, "status": "PUSH_FAILED", "error": str(e)}
+            return {"status": "PUSH_FAILED", "error": str(e), "repo_name": repo_name}
+
+        # Early-register so Phase 0 can find it on the next pipeline
+        if _REGISTRY_AVAILABLE:
+            try:
+                print(f"  [Phase 6] Registering '{repo_name}' in knowledge layer...")
+                register_project(
+                    project_id=repo_name,
+                    project_name=repo_name.replace("-", " ").title(),
+                    description=(state.get("requirement", "")[:300]
+                                 or "Auto-created by SDLC-V2 pipeline"),
+                    domain="generated",
+                    tech_stack=[],
+                    repos=[repo_name],
+                    owner_team="SDLC-V2",
+                )
+                print(f"  [Phase 6] ✅ Registered '{repo_name}' in Postgres + Qdrant")
+            except Exception as e:
+                print(f"  [Phase 6] ⚠️  Early registration failed: {e}")
     elif repo_check.status_code not in (200, 301):
-        # 401/403 here almost always means the token lacks repo scope. Fail
-        # loudly instead of silently sailing into a push that can't work.
         msg = (f"Cannot access repo '{EFFECTIVE_OWNER}/{repo_name}': "
                f"HTTP {repo_check.status_code} - {repo_check.text[:200]}")
         print(f"  ❌ {msg}")
-        return {**state, "status": "PUSH_FAILED", "error": msg}
+        return {"status": "PUSH_FAILED", "error": msg, "repo_name": repo_name}
 
-    # Prepare all files to push
+    # Build the file list — code changes + test files for THIS repo
     all_files = []
-
-    # Generated code changes
-    for change in state.get("generated_changes", []):
-        all_files.append({
-            "file_path": change["file_path"],
-            "content": change["content"]
-        })
-
-    # Generated test files
-    for test_file in state.get("test_files", []):
-        if test_file.get("content"):
+    for change in payload.get("changes", []):
+        if isinstance(change, dict) and change.get("file_path") and change.get("content"):
             all_files.append({
-                "file_path": test_file["test_file_path"],
-                "content": test_file["content"]
+                "file_path": change["file_path"],
+                "content": change["content"],
             })
 
-    # Nothing to push is itself a failure for a greenfield project — an empty
-    # repo is exactly the symptom we're trying to eliminate.
-    if not all_files:
-        msg = "No files to push (generated_changes and test_files are empty)"
-        print(f"  ❌ {msg}")
-        return {**state, "status": "PUSH_FAILED", "error": msg}
+    for test_file in payload.get("tests", []):
+        if isinstance(test_file, dict) and test_file.get("content"):
+            all_files.append({
+                "file_path": test_file.get("test_file_path", ""),
+                "content": test_file["content"],
+            })
 
-    print(f"  Pushing {len(all_files)} files to branch: {branch_name}")
+    if not all_files:
+        return {
+            "status": "PUSH_FAILED",
+            "error": f"No files to push for {repo_name}",
+            "repo_name": repo_name,
+        }
+
+    print(f"  Pushing {len(all_files)} files to {repo_name} branch: {branch_name}")
 
     push_result = push_files_to_branch(
         repo_url=repo_url,
         branch_name=branch_name,
         files=all_files,
-        commit_message=f"feat: AI-generated changes — {state['requirement'][:60]}"
+        commit_message=f"feat: AI-generated changes — {state.get('requirement', '')[:60]}"
     )
-    print(f"  Push result: {push_result['status']}")
 
-    # Only PUSH_SUCCESS counts. NO_CHANGES and PUSH_FAILED must NOT advance the
-    # pipeline as if code landed — that was the bug that hid empty repos.
-    if push_result["status"] == "PUSH_SUCCESS":
-        print(f"  ✅ Pushed {push_result.get('files_pushed', 0)} files")
+    # PUSH_SUCCESS or NO_CHANGES (resume scenario) both count as success
+    if (push_result["status"] == "PUSH_SUCCESS" or
+            (push_result["status"] == "NO_CHANGES" and len(all_files) > 0)):
+        print(f"  ✅ Pushed {push_result.get('files_pushed', 0)} files to {repo_name}")
 
-        # ─── Auto-register newly-created repos into the knowledge layer ───
-        # Without this, Phase 0 routing and the manual repo picker won't see
-        # the new repo on subsequent pipeline runs. The repo exists on GitHub
-        # but is invisible to the platform's knowledge layer.
+        # Enqueue indexer for code symbol/embedding extraction (async, best-effort)
         if newly_created and _REGISTRY_AVAILABLE:
             try:
-                print(f"  [Phase 6] Auto-registering '{repo_name}' into knowledge layer...")
-                register_project(
-                    project_id=repo_name,
-                    project_name=repo_name.replace("-", " ").title(),
-                    description=(state.get("requirement", "")[:300]
-                                 or f"Auto-created by SDLC-V2 pipeline"),
-                    domain="generated",
-                    tech_stack=[],   # detected later by indexer
-                    repos=[repo_name],
-                    owner_team="SDLC-V2",
+                queue = get_queue()
+                repo_url_for_index = f"https://github.com/{EFFECTIVE_OWNER}/{repo_name}.git"
+                job_id = queue.enqueue(
+                    repo_name=repo_name,
+                    repo_url=repo_url_for_index,
+                    branch="main",
+                    force=False,
                 )
-                print(f"  [Phase 6] ✅ Registered '{repo_name}' in projects table + Qdrant")
-                # Queue the indexer so symbols/code embeddings get populated too.
-                try:
-                    queue = get_queue()
-                    repo_url_for_index = f"https://github.com/{EFFECTIVE_OWNER}/{repo_name}.git"
-                    job_id = queue.enqueue(
-                        repo_name=repo_name,
-                        repo_url=repo_url_for_index,
-                        branch="main",
-                        force=False,
-                    )
-                    print(f"  [Phase 6] ✅ Queued indexer job {job_id} for '{repo_name}'")
-                except Exception as queue_err:
-                    print(f"  [Phase 6] ⚠️  Indexer queue unavailable: {queue_err} "
-                          f"(repo registered but symbols not indexed)")
-            except Exception as e:
-                # Non-fatal — pipeline must continue even if registration fails.
-                print(f"  [Phase 6] ⚠️  Auto-register failed: {e} — pipeline continues. "
-                      f"Run /knowledge/projects/sync to register manually.")
+                print(f"  [Phase 6] ✅ Queued indexer job {job_id} for '{repo_name}'")
+            except Exception as queue_err:
+                print(f"  [Phase 6] ⚠️  Indexer queue: {queue_err}")
 
-        return {**state, "status": "CODE_PUSHED"}
+        return {"status": "CODE_PUSHED", "repo_name": repo_name}
 
+    # Push failed
     err = push_result.get("error") or push_result["status"]
-    print(f"  ❌ Push did not succeed: {err}")
-    return {**state, "status": "PUSH_FAILED", "error": err}
+    print(f"  ❌ Push did not succeed for {repo_name}: {err}")
+    return {"status": "PUSH_FAILED", "error": err, "repo_name": repo_name}
+
+def push_code(state: DeliveryState) -> DeliveryState:
+    """
+    Production-grade cross-repo push for 10-15 repo scale.
+
+    Groups changes by target_repo, pushes IN PARALLEL with per-repo PR
+    creation. Concurrency capped at MAX_PARALLEL_PUSHES (default 4) to
+    respect GitHub API rate limits.
+
+    Falls through to single-repo path when only 1 target.
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print("\n[Phase 6] Pushing code to GitHub...")
+
+    all_changes = state.get("generated_changes", [])
+    test_files = state.get("test_files", [])
+
+    # Group by target_repo
+    by_repo = {}
+    fallback_repo = None
+    if state.get("repo_url"):
+        fallback_repo = state["repo_url"].split("/")[-1].replace(".git", "")
+
+    for c in all_changes:
+        if isinstance(c, dict):
+            target = c.get("target_repo") or fallback_repo
+            by_repo.setdefault(target, {"changes": [], "tests": []})
+            by_repo[target]["changes"].append(c)
+        else:
+            by_repo.setdefault(fallback_repo, {"changes": [], "tests": []})
+            by_repo[fallback_repo]["changes"].append(c)
+
+    for t in test_files:
+        if isinstance(t, dict):
+            target = t.get("target_repo") or fallback_repo
+            by_repo.setdefault(target, {"changes": [], "tests": []})
+            by_repo[target]["tests"].append(t)
+
+    if not by_repo:
+        return {**state, "status": "PUSH_FAILED", "error": "No changes to push"}
+
+    # Single-repo: unchanged behavior
+    if len(by_repo) == 1:
+        return _push_single_repo(state, list(by_repo.keys())[0], next(iter(by_repo.values())))
+
+    # Cross-repo: parallel fan-out
+    n = len(by_repo)
+    max_parallel = int(os.getenv("MAX_PARALLEL_PUSHES", "4"))
+    concurrency = min(n, max_parallel)
+
+    print(f"[Phase 6] Cross-repo delivery: {n} repos, concurrency={concurrency}")
+
+    def run_push(repo_name, payload):
+        if not repo_name:
+            return repo_name, {"status": "SKIPPED", "error": "no target_repo"}
+        try:
+            print(f"[Phase 6]   → pushing to {repo_name}")
+            sub_state = dict(state)
+            sub_state["repo_url"] = f"https://github.com/{EFFECTIVE_OWNER}/{repo_name}.git"
+            sub_state["generated_changes"] = payload["changes"]
+            sub_state["test_files"] = payload["tests"]
+            return repo_name, _push_single_repo(sub_state, repo_name, payload)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return repo_name, {"status": "FAILED", "error": str(e)}
+
+    per_repo_results = {}
+    pr_urls = []
+    merged_shas = {}
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(run_push, repo, payload): repo
+            for repo, payload in by_repo.items()
+        }
+        for future in as_completed(futures):
+            repo_name, result = future.result()
+            per_repo_results[repo_name] = result.get("status", "UNKNOWN")
+            if result.get("pr_url"):
+                pr_urls.append(result["pr_url"])
+            if result.get("merged_sha"):
+                merged_shas[repo_name] = result["merged_sha"]
+
+            icon = "✅" if result.get("status") in ("CODE_PUSHED", "PR_OPENED") else "❌"
+            print(f"[Phase 6]   {icon} {repo_name}: {result.get('status')}")
+
+    SUCCESS = {"CODE_PUSHED", "PR_OPENED"}
+    succeeded = sum(1 for s in per_repo_results.values() if s in SUCCESS)
+    total = len(per_repo_results)
+    success_rate = succeeded / total if total else 0
+
+    if success_rate == 1.0:
+        overall_status = "CODE_PUSHED"
+    elif success_rate >= 0.5:
+        overall_status = "PARTIAL_PUSH"
+    else:
+        overall_status = "PUSH_FAILED"
+
+    print(f"\n[Phase 6] Cross-repo summary: {succeeded}/{total} pushed "
+          f"({success_rate*100:.0f}%), overall: {overall_status}")
+
+    return {
+        **state,
+        "status": overall_status,
+        "per_repo_push_status": per_repo_results,
+        "pr_urls": pr_urls,
+        "merged_shas": merged_shas,
+    }
 
 
 
 def create_pr(state: DeliveryState) -> DeliveryState:
-    """Create GitHub PR for the changes."""
-    print("\n[Phase 6] Creating GitHub PR...")
+    """
+    Create GitHub PR(s) for the changes.
 
-    if state["status"] == "PUSH_FAILED":
+    Cross-repo: iterates over per_repo_push_status (set by parallel push_code)
+    and opens one PR per repo. Single-repo: original behavior preserved.
+    """
+    print("\n[Phase 6] Creating GitHub PR(s)...")
+
+    if state.get("status") in ("PUSH_FAILED", "PARTIAL_PUSH") and not state.get("per_repo_push_status"):
         return {**state, "status": "PR_SKIPPED"}
 
     branch_name = state["branch_name"]
-    repo_url = state["repo_url"]
 
-    # Extract repo name from URL
-    repo_name = repo_url.split("/")[-1].replace(".git", "")
-
-    # Guard: we should never be on main/master here anymore — both greenfield
-    # and brownfield push to a feature branch and open a PR into main. If a
-    # caller still passes main/master, that's a misconfiguration: fail loudly
-    # rather than silently pushing to the default branch with no review.
     if branch_name in ("main", "master"):
         msg = (f"Refusing to open a PR from '{branch_name}' into itself. "
                f"Delivery must use a feature branch (feature/<thread>). "
@@ -445,21 +552,67 @@ def create_pr(state: DeliveryState) -> DeliveryState:
         print(f"  ❌ {msg}")
         return {**state, "status": "PR_FAILED", "error": msg}
 
-    # Build PR body
-    changes_summary = "\n".join([
-        f"- `{c['file_path']}`: {c.get('change_summary', '')[:80]}"
-        for c in state["generated_changes"]
-    ])
+    # Determine target repos. Cross-repo case: read from per_repo_push_status
+    # (populated by parallel push_code). Single-repo: fall back to state["repo_url"].
+    per_repo_status = state.get("per_repo_push_status") or {}
 
-    pr_body = f"""## AI-Generated Changes
+    if per_repo_status:
+        # Cross-repo path — only open PRs for repos that successfully pushed
+        target_repos = [
+            repo_name for repo_name, status in per_repo_status.items()
+            if status in ("CODE_PUSHED", "PR_OPENED")
+        ]
+        print(f"[Phase 6] Cross-repo PR creation for {len(target_repos)} repos")
+    else:
+        # Single-repo legacy path
+        repo_url = state.get("repo_url", "")
+        if not repo_url:
+            return {**state, "status": "PR_FAILED", "error": "No repo_url and no per_repo_push_status"}
+        target_repos = [repo_url.split("/")[-1].replace(".git", "")]
+
+    if not target_repos:
+        return {**state, "status": "PR_SKIPPED", "error": "No successfully-pushed repos to open PRs for"}
+
+    # Group generated changes by target_repo for the PR body
+    changes_by_repo = {}
+    for c in state.get("generated_changes", []):
+        if not isinstance(c, dict):
+            continue
+        repo = c.get("target_repo") or target_repos[0]
+        changes_by_repo.setdefault(repo, []).append(c)
+
+    tests_by_repo = {}
+    for t in state.get("test_files", []):
+        if not isinstance(t, dict):
+            continue
+        repo = t.get("target_repo") or target_repos[0]
+        tests_by_repo.setdefault(repo, []).append(t)
+
+    # Open one PR per repo
+    pr_urls = []
+    per_repo_pr = {}
+    failed_repos = []
+
+    for repo_name in target_repos:
+        repo_changes = changes_by_repo.get(repo_name, [])
+        repo_tests = tests_by_repo.get(repo_name, [])
+
+        changes_summary = "\n".join([
+            f"- `{c['file_path']}`: {c.get('change_summary', '')[:80]}"
+            for c in repo_changes
+        ]) or "_(no per-repo change list available)_"
+
+        pr_body = f"""## AI-Generated Changes
 
 **Requirement:** {state['requirement']}
+
+**Target Repo:** `{repo_name}`
 
 ## Files Changed
 {changes_summary}
 
 ## Tests Added
-{len(state.get('test_files', []))} test file(s) generated
+{len(repo_tests)} test file(s) generated
 
 ## Generated by
 SDLC Automation Platform V2 — LangGraph Pipeline
@@ -468,27 +621,39 @@ SDLC Automation Platform V2 — LangGraph Pipeline
 *This PR was automatically generated. Please review carefully before merging.*
 """
 
-    try:
-        pr = create_github_pr(
-            repo_name=repo_name,
-            branch_name=branch_name,
-            title=f"feat: {state['requirement'][:60]}",
-            body=pr_body
-        )
+        try:
+            pr = create_github_pr(
+                repo_name=repo_name,
+                branch_name=branch_name,
+                title=f"feat: {state['requirement'][:60]}",
+                body=pr_body,
+            )
+            pr_url = pr.get("html_url", "")
+            print(f"  ✅ PR created for {repo_name}: {pr_url}")
+            pr_urls.append(pr_url)
+            per_repo_pr[repo_name] = pr_url
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"  ❌ PR creation failed for {repo_name}: {e}")
+            failed_repos.append(repo_name)
+            per_repo_pr[repo_name] = f"FAILED: {e}"
 
-        pr_url = pr.get("html_url", "")
-        print(f"  ✅ PR created: {pr_url}")
+    # Determine overall status
+    if pr_urls and not failed_repos:
+        overall_status = "PR_CREATED"
+    elif pr_urls and failed_repos:
+        overall_status = "PR_PARTIAL"
+    else:
+        overall_status = "PR_FAILED"
 
-        return {
-            **state,
-            "pr_urls": [pr_url],
-            "status": "PR_CREATED"
-        }
+    print(f"\n[Phase 6] PR creation summary: {len(pr_urls)}/{len(target_repos)} succeeded, overall: {overall_status}")
 
-    except Exception as e:
-        print(f"  ❌ PR creation failed: {e}")
-        return {**state, "status": "PR_FAILED"}
-
+    return {
+        **state,
+        "pr_urls": pr_urls,
+        "per_repo_pr": per_repo_pr,
+        "status": overall_status,
+    }
 
 def human_approval_gate(state: DeliveryState) -> DeliveryState:
     """Human reviews the PR before merge is approved."""
